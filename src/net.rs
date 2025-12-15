@@ -1,8 +1,8 @@
 use crate::cli::{Config, SupportedProtocol};
 use crate::stats::Stats;
-use bytemuck::{must_cast_ref, pod_align_to};
+use bytemuck::{must_cast_ref, pod_align_to, pod_read_unaligned};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use wide::{u16x16, u32x16};
+use wide::u32x16;
 
 use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -16,17 +16,93 @@ const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
 #[cfg(windows)]
 const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
 
+const WORD_LO_U32: u32 = 0x0000_FFFF;
+const SWAP_LO_U32: u32 = 0xFF00_FF00;
+const SWAP_HI_U32: u32 = 0x00FF_00FF;
+const SWAP_LO_U64: u64 = 0xFF00_FF00_FF00_FF00;
+const SWAP_HI_U64: u64 = 0x00FF_00FF_00FF_00FF;
+
 static REQUEST_ICMP_SEQ: AtomicU16 = AtomicU16::new(0);
 static REPLY_ICMP_SEQ: AtomicU16 = AtomicU16::new(0);
 
 #[inline(always)]
 const fn be16_16(b0: u8, b1: u8) -> u16 {
-    ((b0 as u16) << 8) | (b1 as u16)
+    b1 as u16 | ((b0 as u16) << 8)
 }
 
 #[inline(always)]
 const fn be16_32(b0: u8, b1: u8) -> u32 {
-    ((b0 as u32) << 8) | (b1 as u32)
+    b1 as u32 | ((b0 as u32) << 8)
+}
+
+#[inline(always)]
+fn be16_32_sum2(bytes: &[u8; 4]) -> u32 {
+    // `x` is read in native endianness from bytes [b0,b1,b2,b3].
+    // Little-endian: swap bytes within each halfword; big-endian: halves already match wire order.
+    let mut x = pod_read_unaligned::<u32>(bytes);
+    #[cfg(target_endian = "little")]
+    {
+        let swapped = ((x << 8) & SWAP_LO_U32) | ((x >> 8) & SWAP_HI_U32);
+        x = swapped;
+    }
+    (x & WORD_LO_U32) + (x >> 16)
+}
+
+#[inline(always)]
+fn be16_32_sum4(bytes: &[u8; 8]) -> u32 {
+    // Same idea as `be16_32_sum2`, but over 8 bytes (four 16-bit words).
+    let mut x = pod_read_unaligned::<u64>(bytes);
+    #[cfg(target_endian = "little")]
+    {
+        let swapped = ((x << 8) & SWAP_LO_U64) | ((x >> 8) & SWAP_HI_U64);
+        x = swapped;
+    }
+    (x as u32 & WORD_LO_U32)
+        + (x as u32 >> 16)
+        + ((x >> 32) as u32 & WORD_LO_U32)
+        + ((x >> 48) as u32)
+}
+
+#[inline(always)]
+fn csum_icmp_echo_hdr(hdr: &[u8; 8]) -> u32 {
+    // Header: type,code ; checksum(0) ; ident ; seq
+    // checksum field (hdr[2..4]) is treated as zero.
+    let mut sum = be16_32(hdr[0], hdr[1]);
+    sum += be16_32_sum2((&hdr[4..8]).try_into().unwrap());
+    sum
+}
+
+#[inline(always)]
+fn csum_bytes(bytes: &[u8]) -> u32 {
+    // Sum the byte stream as RFC1071 16-bit big-endian words.
+    // Pairing starts at bytes[0]. Odd tail byte contributes as the high byte of the final word.
+    let mut sum = 0;
+
+    // Fast path: 8 bytes (64 bits) at a time.
+    let (chunks8, rem8) = bytes.as_chunks::<8>();
+    for c in chunks8 {
+        sum += be16_32_sum4(c);
+    }
+
+    // Next: 2 bytes (one word).
+    let (chunks2, rem2) = rem8.as_chunks::<2>();
+    for c in chunks2 {
+        sum += be16_32(c[0], c[1]);
+    }
+
+    // Odd tail: last byte is the high byte of the final 16-bit word.
+    if let [last] = rem2 {
+        sum += (*last as u32) << 8;
+    }
+    sum
+}
+
+#[inline(always)]
+const fn fold32_16(mut sum: u32) -> u16 {
+    // End-around carry fold down to 16 bits.
+    sum = (sum & WORD_LO_U32) + (sum >> 16);
+    sum = (sum & WORD_LO_U32) + (sum >> 16);
+    sum as u16
 }
 
 /// Create a socket (UDP datagram or ICMP) bound to `bind_addr`.
@@ -604,80 +680,81 @@ pub fn udp_disconnect(_sock: &Socket) -> io::Result<()> {
     ))
 }
 
-/// Compute the Internet Checksum (RFC 1071) for ICMPv4 header+payload.
+/// Compute the Internet Checksum (RFC 1071) for ICMPv4 Echo header+payload.
 ///
-/// Uses a scalar fast path for small payloads and a wide SIMD path for
-/// medium/large payloads. All casting is size-preserving and safe.
+/// The Internet checksum is a 1's-complement sum of 16-bit words in network byte
+/// order (big-endian), with end-around carry, and then bitwise complemented.
+///
+/// Implementation notes:
+///   * We use `wide::u32x16` to process 64-byte chunks as 16 lanes of `u32` (4 bytes per lane).
+///     For a lane containing bytes `[b0,b1,b2,b3]` in memory, the RFC1071 contribution is:
+///       `(b0<<8)+b1 + (b2<<8)+b3`
+///   * On little-endian, the `u32` value is `v = b0 + (b1<<8) + (b2<<16) + (b3<<24)`.
+///     Swapping bytes within each 16-bit halfword yields `[b1,b0,b3,b2]`, so the low 16 bits
+///     become `(b0<<8)+b1` and the high 16 bits become `(b2<<8)+b3`. The per-lane contribution is:
+///       `(swapped & 0xFFFF) + (swapped >> 16)`
+///   * Big-endian hosts already match wire order, so we can split the 16-bit halves directly.
+///
+/// Uses a scalar fast path for small payloads and a wide SIMD path for medium/large payloads.
+/// All casting is size-preserving and safe.
 #[inline]
 fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
-    // Shared scalar path: fold 16-bit words into a 32-bit accumulator.
-    let process_scalar = |bytes: &[u8], acc: &mut u32| {
-        let (pairs, tail) = bytes.as_chunks::<2>();
-        for p in pairs {
-            *acc += be16_32(p[0], p[1]);
-        }
-        // Odd tail: last byte is the high byte of the final 16-bit word
-        if let [last] = tail {
-            *acc += (*last as u32) << 8;
-        }
-    };
-
-    // Use a wide-enough scalar accumulator for MAX_WIRE_PAYLOAD so we never rely on overflow before folding.
-    let mut sum = 0u32;
-
-    // Header: type,code ; checksum(0) ; ident ; seq
-    // checksum field (hdr[2..4]) is treated as zero.
-    sum += be16_32(hdr[0], hdr[1]) + be16_32(hdr[4], hdr[5]) + be16_32(hdr[6], hdr[7]);
+    // Use a u32 scalar accumulator for MAX_WIRE_PAYLOAD so we never rely on overflow before folding.
+    let mut sum = csum_icmp_echo_hdr(hdr);
 
     // Only pay the SIMD setup cost when the payload is large enough to amortize it.
     const SIMD_MIN_LEN: usize = 256;
     if data.len() < SIMD_MIN_LEN {
-        // Small/latency path: tight scalar pair loop over the whole payload.
-        process_scalar(data, &mut sum);
+        // Small/latency path: tight scalar loop over the whole payload.
+        sum += csum_bytes(data);
     } else {
-        // Throughput path: SIMD over 32-byte chunks (16 words per iteration).
-        let (head, aligned, tail) = pod_align_to::<u8, u16x16>(data);
+        // Throughput path: SIMD over 64-byte chunks (16 u32 lanes per iteration).
+        let (head, aligned, tail) = pod_align_to::<u8, u32x16>(data);
 
-        // Vector accumulator: 16 lanes of u32, one partial sum per lane.
-        let mut vsum = u32x16::splat(0);
+        // Masks are loop-invariant; keep them as constants.
+        const WORD_LO: u32x16 = u32x16::splat(WORD_LO_U32);
+        const SWAP_LO: u32x16 = u32x16::splat(SWAP_LO_U32);
+        const SWAP_HI: u32x16 = u32x16::splat(SWAP_HI_U32);
+
+        // SIMD accumulation over 64-byte chunks (16 lanes of u32). Each lane produces the RFC1071
+        // contribution of its two 16-bit words; end-around carry is folded later via `fold32_16()`.
+        let mut vsum = u32x16::ZERO;
 
         for chunk in aligned {
-            // `pod_align_to` guarantees alignment; reinterpret directly.
-            let mut words_be = *chunk;
+            let v = *chunk;
 
-            // Byte-swap only on little-endian; big-endian layouts already match the wire.
             #[cfg(target_endian = "little")]
             {
-                const MASK: u16x16 = u16x16::splat(0x00FF);
-                let lo = words_be & MASK;
-                let hi = words_be >> 8;
-                words_be = (lo << 8) | hi;
+                // Swap bytes within each 16-bit halfword: [b0,b1,b2,b3] -> [b1,b0,b3,b2] in each lane.
+                // Then sum the two 16-bit halves to get the RFC1071 contribution for the lane.
+                let swapped = ((v << 8) & SWAP_LO) | ((v >> 8) & SWAP_HI);
+                vsum += (swapped & WORD_LO) + (swapped >> 16);
             }
 
-            // Widen lanes to u32x16 (numeric widening, not a bit cast)
-            let words32 = u32x16::from(words_be);
-
-            // Accumulate in the vector accumulator
-            vsum += words32;
+            #[cfg(target_endian = "big")]
+            {
+                // Big-endian: lane already matches wire order; split into two u16 halves directly.
+                vsum += (v & WORD_LO) + (v >> 16);
+            }
         }
 
-        // Horizontal reduction: collapse the 16 u32 lanes into the scalar sum
-        // without bouncing through the stack more than once.
-        sum += must_cast_ref::<u32x16, [u32; 16]>(&vsum)
-            .iter()
-            .sum::<u32>();
+        // Horizontally reduce 16 u32 lanes using 8 packed pairs.
+        // We accumulate low and high halves separately to avoid carry mixing.
+        let pairs = must_cast_ref::<u32x16, [u64; 8]>(&vsum);
+        let mut lo = 0;
+        let mut hi = 0;
+        for &p in pairs {
+            lo += p as u32;
+            hi += (p >> 32) as u32;
+        }
+        sum += lo + hi;
 
         // Handle the remaining bytes (both prefix and suffix) scalarly.
-        process_scalar(head, &mut sum);
-        process_scalar(tail, &mut sum);
+        sum += csum_bytes(head) + csum_bytes(tail);
     }
 
     // Final 1’s-complement fold down to 16 bits.
-    // Keep folding carries from the upper 16 bits back into the lower 16.
-    sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = (sum & 0xFFFF) + (sum >> 16); // second fold in case the previous add carried
-
-    !(sum as u16)
+    !(fold32_16(sum))
 }
 
 #[cfg(test)]
@@ -686,23 +763,9 @@ mod tests {
     use crate::params::MAX_WIRE_PAYLOAD;
 
     fn reference_checksum(hdr: &[u8; 8], data: &[u8]) -> u16 {
-        // Use u64 to avoid accidental overflow in the oracle.
-        let mut sum = u64::from(be16_32(hdr[0], hdr[1]))
-            + u64::from(be16_32(hdr[4], hdr[5]))
-            + u64::from(be16_32(hdr[6], hdr[7]));
-
-        let mut pairs = data.chunks_exact(2);
-        for pair in &mut pairs {
-            sum += u64::from(be16_32(pair[0], pair[1]));
-        }
-
-        if let Some(&last) = pairs.remainder().first() {
-            sum += u64::from(last) << 8;
-        }
-
-        sum = (sum & 0xFFFF) + (sum >> 16);
-        sum = (sum & 0xFFFF) + (sum >> 16);
-        !(sum as u16)
+        let mut sum = csum_icmp_echo_hdr(hdr);
+        sum += csum_bytes(data);
+        !(fold32_16(sum))
     }
 
     #[test]
