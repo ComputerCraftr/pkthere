@@ -702,56 +702,66 @@ fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
     // Use a u32 scalar accumulator for MAX_WIRE_PAYLOAD so we never rely on overflow before folding.
     let mut sum = csum_icmp_echo_hdr(hdr);
 
-    // Only pay the SIMD setup cost when the payload is large enough to amortize it.
-    const SIMD_MIN_LEN: usize = 256;
-    if data.len() < SIMD_MIN_LEN {
-        // Small/latency path: tight scalar loop over the whole payload.
-        sum += csum_bytes(data);
-    } else {
-        // Throughput path: SIMD over 64-byte chunks (16 u32 lanes per iteration).
-        let (head, aligned, tail) = pod_align_to::<u8, u32x16>(data);
+    // SIMD over 64-byte chunks (16 u32 lanes per iteration).
+    let (head, aligned, tail) = pod_align_to::<u8, u32x16>(data);
 
-        // Masks are loop-invariant; keep them as constants.
-        const WORD_LO: u32x16 = u32x16::splat(WORD_LO_U32);
-        const SWAP_LO: u32x16 = u32x16::splat(SWAP_LO_U32);
-        const SWAP_HI: u32x16 = u32x16::splat(SWAP_HI_U32);
+    // Masks are loop-invariant; keep them as constants.
+    const WORD_LO: u32x16 = u32x16::splat(WORD_LO_U32);
+    const SWAP_LO: u32x16 = u32x16::splat(SWAP_LO_U32);
+    const SWAP_HI: u32x16 = u32x16::splat(SWAP_HI_U32);
 
-        // SIMD accumulation over 64-byte chunks (16 lanes of u32). Each lane produces the RFC1071
-        // contribution of its two 16-bit words; end-around carry is folded later via `fold32_16()`.
-        let mut vsum = u32x16::ZERO;
-
-        for chunk in aligned {
-            let v = *chunk;
-
-            #[cfg(target_endian = "little")]
-            {
-                // Swap bytes within each 16-bit halfword: [b0,b1,b2,b3] -> [b1,b0,b3,b2] in each lane.
-                // Then sum the two 16-bit halves to get the RFC1071 contribution for the lane.
-                let swapped = ((v << 8) & SWAP_LO) | ((v >> 8) & SWAP_HI);
-                vsum += (swapped & WORD_LO) + (swapped >> 16);
-            }
-
-            #[cfg(target_endian = "big")]
-            {
-                // Big-endian: lane already matches wire order; split into two u16 halves directly.
-                vsum += (v & WORD_LO) + (v >> 16);
-            }
+    let lane_contribution = |v: u32x16| -> u32x16 {
+        #[cfg(target_endian = "little")]
+        {
+            // Swap bytes within each 16-bit halfword: [b0,b1,b2,b3] -> [b1,b0,b3,b2] in each lane.
+            // Then sum the two 16-bit halves to get the RFC1071 contribution for the lane.
+            let swapped = ((v << 8) & SWAP_LO) | ((v >> 8) & SWAP_HI);
+            (swapped & WORD_LO) + (swapped >> 16)
         }
 
-        // Horizontally reduce 16 u32 lanes using 8 packed pairs.
-        // We accumulate low and high halves separately to avoid carry mixing.
-        let pairs = must_cast_ref::<u32x16, [u64; 8]>(&vsum);
-        let mut lo = 0;
-        let mut hi = 0;
-        for &p in pairs {
-            lo += p as u32;
-            hi += (p >> 32) as u32;
+        #[cfg(target_endian = "big")]
+        {
+            // Big-endian: lane already matches wire order; split into two u16 halves directly.
+            (v & WORD_LO) + (v >> 16)
         }
-        sum += lo + hi;
+    };
 
-        // Handle the remaining bytes (both prefix and suffix) scalarly.
-        sum += csum_bytes(head) + csum_bytes(tail);
+    // SIMD accumulation over 64-byte chunks (16 lanes of u32). Each lane produces the RFC1071
+    // contribution of its two 16-bit words; end-around carry is folded later via `fold32_16()`.
+    let mut vsum = u32x16::ZERO;
+    let mut idx = 0;
+    let len = aligned.len();
+
+    while idx + 3 < len {
+        vsum += lane_contribution(aligned[idx])
+            + lane_contribution(aligned[idx + 1])
+            + lane_contribution(aligned[idx + 2])
+            + lane_contribution(aligned[idx + 3]);
+        idx += 4;
     }
+
+    while idx + 1 < len {
+        vsum += lane_contribution(aligned[idx]) + lane_contribution(aligned[idx + 1]);
+        idx += 2;
+    }
+
+    if idx < len {
+        vsum += lane_contribution(aligned[idx]);
+    }
+
+    // Horizontally reduce 16 u32 lanes using 8 packed pairs.
+    // We accumulate low and high halves separately to avoid carry mixing.
+    let pairs = must_cast_ref::<u32x16, [u64; 8]>(&vsum);
+    let mut lo = 0;
+    let mut hi = 0;
+    for &p in pairs {
+        lo += p as u32;
+        hi += (p >> 32) as u32;
+    }
+    sum += lo + hi;
+
+    // Handle the remaining bytes (both prefix and suffix) scalarly.
+    sum += csum_bytes(head) + csum_bytes(tail);
 
     // Final 1’s-complement fold down to 16 bits.
     !(fold32_16(sum))
