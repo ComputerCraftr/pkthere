@@ -161,8 +161,8 @@ pub fn run_watchdog_thread(
             let now = Instant::now();
             let now_ns = Stats::dur_ns(t_start, now);
             let last_ns = last_seen_ns.load(AtomOrdering::Relaxed);
-            let expired = last_ns != 0 && now_ns.saturating_sub(last_ns) >= timeout_ns;
-            if expired {
+
+            if last_ns != 0 && now_ns.saturating_sub(last_ns) >= timeout_ns {
                 match cfg.on_timeout {
                     TimeoutAction::Drop => {
                         log_warn!(
@@ -325,6 +325,7 @@ pub fn run_client_to_upstream_thread(
             match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
                 Ok(len) => {
                     let t_recv = Instant::now();
+
                     if locked.load(AtomOrdering::Relaxed) {
                         send_payload(
                             C2U,
@@ -358,6 +359,7 @@ pub fn run_client_to_upstream_thread(
             match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
                 Ok((len, src_sa)) => {
                     let t_recv = Instant::now();
+
                     // First lock: publish client and connect the socket for fast path
                     if !locked.load(AtomOrdering::Relaxed) {
                         let Some(src) = src_sa.as_socket() else {

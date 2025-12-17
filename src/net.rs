@@ -293,8 +293,8 @@ pub fn send_payload(
     };
 
     if let Ok(_) = send_res {
+        last_seen.store(Stats::dur_ns(t_start, t_recv), AtomOrdering::Relaxed);
         let t_send = Instant::now();
-        last_seen.store(Stats::dur_ns(t_start, t_send), AtomOrdering::Relaxed);
         stats.send_add(c2u, len as u64, t_recv, t_send);
     } else if sock_connected && is_dest_addr_required(&send_res) {
         dest_addr_okay = false;
@@ -309,8 +309,8 @@ pub fn send_payload(
 
         match retry_res {
             Ok(_) => {
+                last_seen.store(Stats::dur_ns(t_start, t_recv), AtomOrdering::Relaxed);
                 let t_send = Instant::now();
-                last_seen.store(Stats::dur_ns(t_start, t_send), AtomOrdering::Relaxed);
                 stats.send_add(c2u, len as u64, t_recv, t_send);
             }
             Err(e) => {
