@@ -246,6 +246,12 @@ pub fn send_payload(
         // Also, ignore all packets with the wrong identity field.
 
         // Not an error; just ignore replies from the client side.
+        log_debug_dir!(
+            log_drops,
+            worker_id,
+            c2u,
+            "Dropping packet: Wrong direction or identity"
+        );
         return true;
     } else if len > cfg.max_payload {
         log_debug_dir!(
@@ -312,7 +318,7 @@ pub fn send_payload(
                     log_drops,
                     worker_id,
                     c2u,
-                    "Send to '{:?}' error: {}",
+                    "send_to on dest_sa '{:?}' error: {}",
                     dest_sa.as_socket(),
                     e
                 );
@@ -324,7 +330,8 @@ pub fn send_payload(
             log_drops,
             worker_id,
             c2u,
-            "Send to '{:?}' error: {}",
+            "{} on dest_sa '{:?}' error: {}",
+            if sock_connected { "send" } else { "send_to" },
             dest_sa.as_socket(),
             e
         );

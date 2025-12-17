@@ -288,7 +288,7 @@ pub fn run_upstream_to_client_thread(
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
             }
             Err(e) => {
-                log_error!("recv upstream (connected) error: {}", e);
+                log_error_dir!(worker_id, C2U, "recv error: {}", e);
                 stats.drop_err(C2U);
                 thread::sleep(Duration::from_millis(10));
             }
@@ -349,7 +349,7 @@ pub fn run_client_to_upstream_thread(
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut => {}
                 Err(e) => {
-                    log_error!("recv client (connected) error: {}", e);
+                    log_error_dir!(worker_id, C2U, "recv error: {}", e);
                     stats.drop_err(C2U);
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -377,7 +377,7 @@ pub fn run_client_to_upstream_thread(
                         if cfg.debug_no_connect {
                             log_info!("Locked to single client {} (not connected)", src);
                         } else if let Err(e) = handles.client_sock.connect(&src_sa) {
-                            log_error!("connect client_sock to {} failed: {}", src, e);
+                            log_warn!("connect client_sock to {} failed: {}", src, e);
                             log_info!("Locked to single client {} (not connected)", src);
                         } else {
                             handles.client_connected = true;
@@ -467,7 +467,7 @@ pub fn run_client_to_upstream_thread(
                     if e.kind() == io::ErrorKind::WouldBlock
                         || e.kind() == io::ErrorKind::TimedOut => {}
                 Err(e) => {
-                    log_error!("recv_from client error: {}", e);
+                    log_error_dir!(worker_id, C2U, "recv_from error: {}", e);
                     stats.drop_err(C2U);
                     thread::sleep(Duration::from_millis(10));
                 }
