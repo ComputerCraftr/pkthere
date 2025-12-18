@@ -19,10 +19,11 @@ use worker::{
 };
 
 use std::io;
+use std::process;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomOrdering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn print_startup(cfg: &Config, sock_mgr: &SocketManager) {
     let (_, _, client_proto) = sock_mgr.get_client_dest();
@@ -214,18 +215,36 @@ fn main() -> io::Result<()> {
         });
     }
 
-    // Stats thread (report peer info from the first worker)
-    stats.spawn_stats_printer(
-        Arc::clone(&sock_mgrs[0]),
-        Arc::clone(&locked),
-        t_start,
-        u64::from(cfg.stats_interval_mins).saturating_mul(60),
-        Arc::clone(&exit_code_set),
-    );
+    // Stats thread (report peer info from the first worker), unless disabled.
+    let stats_interval_secs = if !cfg.debug_fast_stats {
+        u64::from(cfg.stats_interval_mins).saturating_mul(60)
+    } else {
+        1
+    };
+    if stats_interval_secs != 0 {
+        stats.spawn_stats_printer(
+            Arc::clone(&sock_mgrs[0]),
+            Arc::clone(&locked),
+            t_start,
+            stats_interval_secs,
+            Arc::clone(&exit_code_set),
+        );
 
-    // Keep main alive
-    loop {
-        thread::park();
+        // Keep main alive
+        loop {
+            thread::park();
+        }
+    } else {
+        // Handle exit without final stats print
+        loop {
+            thread::park_timeout(Duration::from_secs(1));
+            let exit_code_local = exit_code_set.load(AtomOrdering::Relaxed);
+            if (exit_code_local & (1 << 31)) != 0 {
+                log_info!("Exiting, uptime {} seconds", t_start.elapsed().as_secs());
+                let exit_code = (exit_code_local & !(1 << 31)) as i32;
+                process::exit(exit_code);
+            }
+        }
     }
 }
 

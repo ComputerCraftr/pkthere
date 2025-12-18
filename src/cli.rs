@@ -80,7 +80,7 @@ pub struct Config {
     pub upstream_str: String,            // FQDN:port or IP:port
     pub timeout_secs: u64,               // idle timeout for single client
     pub on_timeout: TimeoutAction,       // Drop | Exit
-    pub stats_interval_mins: u32,        // JSON stats print interval
+    pub stats_interval_mins: u32,        // JSON stats print interval (0 disables stats thread)
     pub max_payload: usize,              // optional user-specified MTU/payload limit
     pub reresolve_secs: u64,             // 0 = disabled
     pub reresolve_mode: ReresolveMode,   // which side(s) to re-resolve
@@ -91,6 +91,7 @@ pub struct Config {
     pub debug_no_connect: bool,
     pub debug_log_drops: bool,
     pub debug_log_handles: bool,
+    pub debug_fast_stats: bool,
 }
 
 pub fn parse_args() -> Config {
@@ -103,14 +104,14 @@ pub fn parse_args() -> Config {
              Options:\n\
              \t--timeout-secs N         Idle timeout for the single client (default: 10)\n\
              \t--on-timeout drop|exit   What to do on timeout (default: drop)\n\
-             \t--stats-interval-mins N  JSON stats print interval minutes (default: 60)\n\
+             \t--stats-interval-mins N  JSON stats print interval minutes (0=disabled, default: 60)\n\
              \t--workers N              Number of listener/upstream worker pairs (reuse-port, default: 1)\n\
              \t--max-payload N          Payload limit (default: 1500)\n\
              \t--reresolve-secs N       Re-resolve host(s) every N seconds (0=disabled)\n\
              \t--reresolve-mode WHAT    Which sockets to re-resolve: upstream|listen|both|none (default: upstream)\n\
              \t--user NAME              Drop privileges to this user (Unix only)\n\
              \t--group NAME             Drop privileges to this group (Unix only)\n\
-             \t--debug WHAT             Enable debug behavior (repeatable); WHAT = no-connect|log-drops|log-handles\n\
+             \t--debug WHAT             Enable debug behavior (repeatable); WHAT = no-connect|log-drops|log-handles|fast-stats\n\
              \t-h, --help               Show this help and exit"
         );
         process::exit(code)
@@ -204,6 +205,7 @@ pub fn parse_args() -> Config {
     let mut debug_no_connect = false;
     let mut debug_log_drops = false;
     let mut debug_log_handles = false;
+    let mut debug_fast_stats = false;
 
     // Parse flags using an iterator (no manual index math)
     let mut args_iter = env::args().skip(1).peekable();
@@ -297,9 +299,10 @@ pub fn parse_args() -> Config {
                         "no-connect" => debug_no_connect = true,
                         "log-drops" => debug_log_drops = true,
                         "log-handles" => debug_log_handles = true,
+                        "fast-stats" => debug_fast_stats = true,
                         _ => {
                             log_error!(
-                                "--debug expects no-connect, log-drops, or log-handles (got '{flag}')"
+                                "--debug expects no-connect, log-drops, log-handles, or fast-stats (got '{flag}')"
                             );
                             print_usage_and_exit(2)
                         }
@@ -359,5 +362,6 @@ pub fn parse_args() -> Config {
         debug_no_connect,
         debug_log_drops,
         debug_log_handles,
+        debug_fast_stats,
     }
 }

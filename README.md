@@ -23,7 +23,7 @@ Notable CLI options:
 
 - `--max-payload N` – drop packets larger than `N` bytes.
 - `--debug WHAT` – enable debug behavior (`no-connect` and/or `log-drops`).
-- `--stats-interval-mins N` – periodic JSON stats interval (0 prints once per second).
+- `--stats-interval-mins N` – periodic JSON stats interval (0 disables stats thread).
 - `--user/--group NAME` (Unix) – drop privileges after binding low ports.
 
 Build:

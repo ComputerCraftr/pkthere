@@ -57,8 +57,6 @@ fn run_enforce_max_payload(
             .arg(TIMEOUT_SECS.as_secs().to_string())
             .arg("--on-timeout")
             .arg("exit")
-            .arg("--stats-interval-mins")
-            .arg("0")
             .arg("--max-payload")
             .arg(max_payload.to_string())
             .stdout(Stdio::piped())
@@ -81,14 +79,14 @@ fn run_enforce_max_payload(
             .connect(listen_addr)
             .expect("connect to forwarder (max payload)");
 
-        let ok = vec![0u8; max_payload];
+        let ok = vec![255u8; max_payload];
         client_sock.send(&ok).unwrap();
         let mut buf = vec![0u8; recv_buf_len];
         let _ = client_sock
             .recv(&mut buf)
             .expect("recv from forwarder (max payload)");
 
-        let over = vec![0u8; max_payload + 1];
+        let over = vec![255u8; max_payload + 1];
         client_sock.send(&over).unwrap();
         client_sock.set_read_timeout(Some(CLIENT_WAIT_MS)).unwrap();
         let drop_expected = client_sock.recv(&mut buf).is_err();
@@ -182,8 +180,6 @@ fn run_single_client_forwarding(family: IpFamily, protos: &[&str], payload: &[u8
             .arg(TIMEOUT_SECS.as_secs().to_string())
             .arg("--on-timeout")
             .arg("exit")
-            .arg("--stats-interval-mins")
-            .arg("0")
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
@@ -366,8 +362,8 @@ fn relock_after_timeout_drop_ipv4_case(proto: &str, mode: SocketMode) {
         .arg(TIMEOUT_SECS.as_secs().to_string())
         .arg("--on-timeout")
         .arg("drop")
-        .arg("--stats-interval-mins")
-        .arg("0")
+        .arg("--debug")
+        .arg("fast-stats")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
@@ -410,7 +406,7 @@ fn relock_after_timeout_drop_ipv4_case(proto: &str, mode: SocketMode) {
         "forwarder locked to unexpected client A address"
     );
 
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 2048];
     let n = client_a.recv(&mut buf).expect("recv echo A");
     assert_eq!(&buf[..n], payload_a);
 

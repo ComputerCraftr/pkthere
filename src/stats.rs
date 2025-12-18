@@ -66,8 +66,7 @@ impl Stats {
 
     #[inline]
     pub fn dur_ns(start: Instant, end: Instant) -> u64 {
-        let d = end.saturating_duration_since(start);
-        d.as_nanos() as u64
+        end.saturating_duration_since(start).as_nanos() as u64
     }
 
     #[inline]
@@ -97,6 +96,7 @@ impl Stats {
         Self::atomic_fetch_max(atom_lat_max_ns, lat_ns);
         Self::atomic_fetch_max(atom_bytes_max, bytes);
     }
+
     #[inline]
     pub fn drop_err(&self, c2u: bool) {
         let atom_errs = if c2u {
@@ -106,6 +106,7 @@ impl Stats {
         };
         atom_errs.fetch_add(1, AtomOrdering::Relaxed);
     }
+
     #[inline]
     pub fn drop_oversize(&self, c2u: bool) {
         let atom_drops_oversize = if c2u {
