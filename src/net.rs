@@ -45,7 +45,9 @@ fn be16_32_sum2(bytes: &[u8; 4]) -> u32 {
         let swapped = ((x << 8) & SWAP_LO_U32) | ((x >> 8) & SWAP_HI_U32);
         x = swapped;
     }
-    (x & WORD_LO_U32) + (x >> 16)
+    let lo = x & WORD_LO_U32;
+    let hi = x >> 16;
+    lo + hi
 }
 
 #[inline(always)]
@@ -57,19 +59,22 @@ fn be16_32_sum4(bytes: &[u8; 8]) -> u32 {
         let swapped = ((x << 8) & SWAP_LO_U64) | ((x >> 8) & SWAP_HI_U64);
         x = swapped;
     }
-    (x as u32 & WORD_LO_U32)
-        + (x as u32 >> 16)
-        + ((x >> 32) as u32 & WORD_LO_U32)
-        + ((x >> 48) as u32)
+    let a = x as u32 & WORD_LO_U32;
+    let b = x as u32 >> 16;
+    let c = (x >> 32) as u32 & WORD_LO_U32;
+    let d = (x >> 48) as u32;
+    let ab = a + b;
+    let cd = c + d;
+    ab + cd
 }
 
 #[inline(always)]
 fn csum_icmp_echo_hdr(hdr: &[u8; 8]) -> u32 {
     // Header: type,code ; checksum(0) ; ident ; seq
     // checksum field (hdr[2..4]) is treated as zero.
-    let mut sum = be16_32(hdr[0], hdr[1]);
-    sum += be16_32_sum2((&hdr[4..8]).try_into().unwrap());
-    sum
+    let a = be16_32(hdr[0], hdr[1]);
+    let b = be16_32_sum2((&hdr[4..8]).try_into().unwrap());
+    a + b
 }
 
 #[inline(always)]
@@ -744,15 +749,20 @@ fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
     let len = aligned.len();
 
     while idx + 3 < len {
-        vsum += lane_contribution(aligned[idx])
-            + lane_contribution(aligned[idx + 1])
-            + lane_contribution(aligned[idx + 2])
-            + lane_contribution(aligned[idx + 3]);
+        let a = lane_contribution(aligned[idx]);
+        let b = lane_contribution(aligned[idx + 1]);
+        let c = lane_contribution(aligned[idx + 2]);
+        let d = lane_contribution(aligned[idx + 3]);
+        let ab = a + b;
+        let cd = c + d;
+        vsum += ab + cd;
         idx += 4;
     }
 
     while idx + 1 < len {
-        vsum += lane_contribution(aligned[idx]) + lane_contribution(aligned[idx + 1]);
+        let a = lane_contribution(aligned[idx]);
+        let b = lane_contribution(aligned[idx + 1]);
+        vsum += a + b;
         idx += 2;
     }
 
@@ -760,19 +770,31 @@ fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
         vsum += lane_contribution(aligned[idx]);
     }
 
-    // Horizontally reduce 16 u32 lanes using 8 packed pairs.
-    // We accumulate low and high halves separately to avoid carry mixing.
+    // Horizontally reduce 16 u32 lanes.
+    // `u32x16` is 64B-aligned, so this cast is safe and zero-copy.
+    // We sum as 8 packed u64 pairs to keep the reduction short and keep the final
+    // carry/fold behavior equivalent to summing all u16 words then folding.
     let pairs = must_cast_ref::<u32x16, [u64; 8]>(&vsum);
-    let mut lo = 0;
-    let mut hi = 0;
-    for &p in pairs {
-        lo += p as u32;
-        hi += (p >> 32) as u32;
-    }
-    sum += lo + hi;
+
+    // Tree reduction to shorten the dependency chain vs a single long add chain.
+    let a = pairs[0] + pairs[1];
+    let b = pairs[2] + pairs[3];
+    let c = pairs[4] + pairs[5];
+    let d = pairs[6] + pairs[7];
+    let ab = a + b;
+    let cd = c + d;
+    let packed = ab + cd;
+    let lo = packed as u32;
+    let hi = (packed >> 32) as u32;
+    let res = lo + hi;
 
     // Handle the remaining bytes (both prefix and suffix) scalarly.
-    sum += csum_bytes(head) + csum_bytes(tail);
+    let scalar_head = csum_bytes(head);
+    let scalar_tail = csum_bytes(tail);
+    let scalar = scalar_head + scalar_tail;
+
+    // Add low/high 32-bit halves into the scalar sum.
+    sum += res + scalar;
 
     // Final 1’s-complement fold down to 16 bits.
     !(fold32_16(sum))
@@ -784,9 +806,9 @@ mod tests {
     use crate::params::MAX_WIRE_PAYLOAD;
 
     fn reference_checksum(hdr: &[u8; 8], data: &[u8]) -> u16 {
-        let mut sum = csum_icmp_echo_hdr(hdr);
-        sum += csum_bytes(data);
-        !(fold32_16(sum))
+        let a = csum_icmp_echo_hdr(hdr);
+        let b = csum_bytes(data);
+        !(fold32_16(a + b))
     }
 
     #[test]
