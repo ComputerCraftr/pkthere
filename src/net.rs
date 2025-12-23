@@ -8,13 +8,13 @@ use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering as AtomOrdering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU16, Ordering as AtomOrdering};
+use std::time::Duration;
 
 #[cfg(unix)]
-const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
+pub const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
 #[cfg(windows)]
-const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
+pub const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
 
 const WORD_LO_U32: u32 = 0x0000_FFFF;
 const SWAP_LO_U32: u32 = 0xFF00_FF00;
@@ -24,6 +24,14 @@ const SWAP_HI_U64: u64 = 0x00FF_00FF_00FF_00FF;
 
 static REQUEST_ICMP_SEQ: AtomicU16 = AtomicU16::new(0);
 static REPLY_ICMP_SEQ: AtomicU16 = AtomicU16::new(0);
+
+pub struct ValidatedPayload<'a> {
+    src_is_icmp: bool,
+    src_seq: u16,
+    dst_proto: SupportedProtocol,
+    payload: &'a [u8],
+    pub len: usize,
+}
 
 #[inline(always)]
 const fn be16_16(b0: u8, b1: u8) -> u16 {
@@ -199,23 +207,14 @@ fn make_icmp_socket(domain: Domain, proto: Protocol, force_raw: bool) -> io::Res
     }
 }
 
-pub fn send_payload(
+#[inline]
+pub fn validate_payload<'a>(
     c2u: bool,
-    worker_id: usize,
-    t_start: Instant,
-    t_recv: Instant,
     cfg: &Config,
     stats: &Stats,
-    last_seen: &AtomicU64,
-    sock: &Socket,
-    buf: &[u8],
-    sock_connected: bool,
-    sock_type: Type,
-    dest_sa: &SockAddr,
-    dest_port_id: u16,
+    buf: &'a [u8],
     recv_port_id: u16,
-    log_drops: bool,
-) -> bool {
+) -> io::Result<ValidatedPayload<'a>> {
     // Determine source/destination protocol for this direction once.
     let (src_proto, dst_proto) = if c2u {
         (cfg.listen_proto, cfg.upstream_proto)
@@ -232,53 +231,64 @@ pub fn send_payload(
         _ => (false, true, buf, recv_port_id, 0u16, c2u),
     };
 
-    // Size check on the normalized payload.
-    let len = payload.len();
-
-    // Handle forwarding errors
     if !icmp_success {
-        log_debug_dir!(
-            log_drops,
-            worker_id,
-            c2u,
-            "Dropping packet: Invalid or truncated ICMP Echo header"
-        );
+        // Parsed as ICMP but the Echo header is missing or truncated.
         stats.drop_err(c2u);
-        return true;
-    } else if c2u != src_is_req || src_ident != recv_port_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid ICMP Echo header (missing or truncated)",
+        ));
+    }
+
+    if c2u != src_is_req || src_ident != recv_port_id {
         // If this is the client->upstream direction and we received an ICMP Echo *reply* or
         // upstream->client and we received an ICMP Echo *request*, drop it to avoid feedback loops.
         // Also, ignore all packets with the wrong identity field.
+        // This is a validation failure, not an I/O error on the socket.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ICMP Echo direction or identity mismatch",
+        ));
+    }
 
-        // Not an error; just ignore replies from the client side.
-        log_debug_dir!(
-            log_drops,
-            worker_id,
-            c2u,
-            "Dropping packet: Wrong direction or identity"
-        );
-        return true;
-    } else if len > cfg.max_payload {
-        log_debug_dir!(
-            log_drops,
-            worker_id,
-            c2u,
-            "Dropping packet: {} bytes exceeds max {}",
-            len,
-            cfg.max_payload
-        );
+    let len = payload.len();
+    if len == 0 || len > cfg.max_payload {
+        // Payload is well-formed but does not fit within configured bounds.
         stats.drop_oversize(c2u);
-        return true;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "payload length {} is zero or exceeds max {}",
+                len, cfg.max_payload
+            ),
+        ));
     }
 
+    Ok(ValidatedPayload {
+        src_is_icmp,
+        src_seq,
+        dst_proto,
+        payload,
+        len,
+    })
+}
+
+pub fn send_payload(
+    c2u: bool,
+    validated: &ValidatedPayload<'_>,
+    sock: &Socket,
+    sock_connected: bool,
+    sock_type: Type,
+    dest_sa: &SockAddr,
+    dest_port_id: u16,
+) -> io::Result<bool> {
     // Update ICMP reply sequence when we receive a request
-    if src_is_icmp && c2u {
-        REPLY_ICMP_SEQ.store(src_seq, AtomOrdering::Relaxed);
+    if validated.src_is_icmp && c2u {
+        REPLY_ICMP_SEQ.store(validated.src_seq, AtomOrdering::Relaxed);
     }
 
-    // Send according to destination protocol and connection state.
-    let mut dest_addr_okay = true;
-    let send_res = match dst_proto {
+    // Send according to destination protocol and connection state
+    let send_res = match validated.dst_proto {
         SupportedProtocol::ICMP => send_icmp_echo(
             sock,
             sock_connected,
@@ -286,72 +296,42 @@ pub fn send_payload(
             dest_sa,
             dest_port_id,
             !c2u,
-            payload,
+            validated.payload,
         ),
         _ => {
             if sock_connected {
-                sock.send(payload)
+                sock.send(validated.payload)
             } else {
-                sock.send_to(payload, dest_sa)
+                sock.send_to(validated.payload, dest_sa)
             }
         }
     };
 
-    if let Ok(_) = send_res {
-        last_seen.store(Stats::dur_ns(t_start, t_recv), AtomOrdering::Relaxed);
-        if cfg.stats_interval_mins != 0 {
-            let t_send = Instant::now();
-            stats.send_add(c2u, len as u64, t_recv, t_send);
-        }
-    } else if sock_connected && is_dest_addr_required(&send_res) {
-        dest_addr_okay = false;
+    match send_res {
+        Ok(_) => Ok(true),
+        Err(e) if sock_connected && e.raw_os_error() == Some(DEST_ADDR_REQUIRED) => {
+            // Try sending one more time
+            let retry_res = match validated.dst_proto {
+                SupportedProtocol::ICMP => send_icmp_echo(
+                    sock,
+                    false,
+                    sock_type,
+                    dest_sa,
+                    dest_port_id,
+                    !c2u,
+                    validated.payload,
+                ),
+                _ => sock.send_to(validated.payload, dest_sa),
+            };
 
-        // Try sending one more time
-        let retry_res = match dst_proto {
-            SupportedProtocol::ICMP => {
-                send_icmp_echo(sock, false, sock_type, dest_sa, dest_port_id, !c2u, payload)
-            }
-            _ => sock.send_to(payload, dest_sa),
-        };
-
-        match retry_res {
-            Ok(_) => {
-                last_seen.store(Stats::dur_ns(t_start, t_recv), AtomOrdering::Relaxed);
-                if cfg.stats_interval_mins != 0 {
-                    let t_send = Instant::now();
-                    stats.send_add(c2u, len as u64, t_recv, t_send);
-                }
-            }
-            Err(e) => {
-                log_debug_dir!(
-                    log_drops,
-                    worker_id,
-                    c2u,
-                    "send_to on dest_sa '{:?}' error: {}",
-                    dest_sa.as_socket(),
-                    e
-                );
-                stats.drop_err(c2u);
+            match retry_res {
+                // Propagate DEST_ADDR_REQUIRED and dest_addr_okay=false to the handler to update socket connection status
+                Ok(_) => Ok(false),
+                Err(retry_err) => Err(retry_err),
             }
         }
-    } else if let Err(e) = send_res {
-        log_debug_dir!(
-            log_drops,
-            worker_id,
-            c2u,
-            "{} on dest_sa '{:?}' error: {}",
-            if sock_connected { "send" } else { "send_to" },
-            dest_sa.as_socket(),
-            e
-        );
-        stats.drop_err(c2u);
+        Err(e) => Err(e),
     }
-    dest_addr_okay
-}
-
-#[inline]
-fn is_dest_addr_required(res: &io::Result<usize>) -> bool {
-    matches!(res, Err(e) if e.raw_os_error() == Some(DEST_ADDR_REQUIRED))
 }
 
 /// Some OSes (notably Linux for IPv4 raw sockets) deliver the full IP header
