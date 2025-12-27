@@ -163,12 +163,17 @@ pub(crate) fn validate_payload_or_log<'a>(
     stats: &Stats,
     buf: &'a [u8],
     recv_port_id: u16,
-    log_drops: bool,
 ) -> Option<ValidatedPayload<'a>> {
     match validate_payload(c2u, cfg, stats, buf, recv_port_id) {
         Ok(v) => Some(v),
         Err(e) => {
-            log_debug_dir!(log_drops, worker_id, c2u, "validate_payload error: {}", e);
+            log_debug_dir!(
+                cfg.debug_log_drops,
+                worker_id,
+                c2u,
+                "validate_payload error: {}",
+                e
+            );
             None
         }
     }
@@ -186,7 +191,6 @@ pub(crate) fn handle_payload_result(
     send_res: &io::Result<bool>,
     sock_connected: bool,
     dest_sa: &SockAddr,
-    log_drops: bool,
     disconnect_ctx: Option<(&mut SocketHandles, &SocketManager)>,
 ) {
     match send_res {
@@ -233,7 +237,7 @@ pub(crate) fn handle_payload_result(
         }
         Err(e) => {
             log_debug_dir!(
-                log_drops,
+                cfg.debug_log_drops,
                 worker_id,
                 c2u,
                 "send_payload error ({} on dest_sa '{:?}'): {}",

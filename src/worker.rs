@@ -243,7 +243,6 @@ pub fn run_upstream_to_client_thread(
                         stats,
                         &buf.data[..len],
                         cache.recv_port_id,
-                        cfg.debug_log_drops,
                     ) else {
                         continue;
                     };
@@ -268,7 +267,6 @@ pub fn run_upstream_to_client_thread(
                         &send_res,
                         handles.client_connected,
                         &cache.dest_sa,
-                        cfg.debug_log_drops,
                         Some((&mut handles, sock_mgr)),
                     );
                 }
@@ -323,7 +321,6 @@ pub fn run_client_to_upstream_thread(
                             stats,
                             &buf.data[..len],
                             cache.recv_port_id,
-                            cfg.debug_log_drops,
                         ) else {
                             continue;
                         };
@@ -348,7 +345,6 @@ pub fn run_client_to_upstream_thread(
                             &send_res,
                             handles.upstream_connected,
                             &cache.dest_sa,
-                            cfg.debug_log_drops,
                             None,
                         );
                     }
@@ -386,7 +382,6 @@ pub fn run_client_to_upstream_thread(
                             stats,
                             &buf.data[..len],
                             cache.recv_port_id,
-                            cfg.debug_log_drops,
                         ) else {
                             continue;
                         };
@@ -469,7 +464,6 @@ pub fn run_client_to_upstream_thread(
                             &send_res,
                             handles.upstream_connected,
                             &cache.dest_sa,
-                            cfg.debug_log_drops,
                             None,
                         );
                     } else if Some(src_sa) == cache.client_sa {
@@ -481,7 +475,6 @@ pub fn run_client_to_upstream_thread(
                             stats,
                             &buf.data[..len],
                             cache.recv_port_id,
-                            cfg.debug_log_drops,
                         ) else {
                             continue;
                         };
@@ -506,7 +499,6 @@ pub fn run_client_to_upstream_thread(
                             &send_res,
                             handles.upstream_connected,
                             &cache.dest_sa,
-                            cfg.debug_log_drops,
                             None,
                         );
                     }
