@@ -2,16 +2,14 @@
 mod logging;
 mod cli;
 mod net;
-mod params;
-mod sock_mgr;
 mod stats;
 mod worker;
 
 use cli::{Config, SupportedProtocol, parse_args};
-use net::make_socket;
+use net::sock_mgr::SocketManager;
+use net::socket::make_socket;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
-use sock_mgr::SocketManager;
 use stats::Stats;
 use worker::{
     run_client_to_upstream_thread, run_reresolve_thread, run_upstream_to_client_thread,

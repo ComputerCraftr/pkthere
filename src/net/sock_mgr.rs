@@ -1,5 +1,5 @@
 use crate::cli::SupportedProtocol;
-use crate::net::{
+use crate::net::socket::{
     family_changed, make_socket, make_upstream_socket_for, resolve_first, udp_disconnect,
 };
 use socket2::{SockAddr, Socket};

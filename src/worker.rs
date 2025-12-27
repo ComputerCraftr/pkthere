@@ -1,7 +1,7 @@
 use crate::cli::{Config, TimeoutAction};
-use crate::net::{DEST_ADDR_REQUIRED, ValidatedPayload, send_payload, validate_payload};
-use crate::params::MAX_WIRE_PAYLOAD;
-use crate::sock_mgr::{SocketHandles, SocketManager};
+use crate::net::params::MAX_WIRE_PAYLOAD;
+use crate::net::payload::{handle_payload_result, send_payload, validate_payload_or_log};
+use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use crate::stats::Stats;
 use socket2::{SockAddr, Type};
 
@@ -128,82 +128,6 @@ impl CachedClientState {
     }
 }
 
-fn handle_payload_result(
-    c2u: bool,
-    worker_id: usize,
-    t_start: Instant,
-    t_recv: Instant,
-    cfg: &Config,
-    stats: &Stats,
-    last_seen_ns: &AtomicU64,
-    validated: &ValidatedPayload<'_>,
-    send_res: &io::Result<bool>,
-    sock_connected: bool,
-    dest_sa: &SockAddr,
-    log_drops: bool,
-    disconnect_ctx: Option<(&mut SocketHandles, &SocketManager)>,
-) {
-    match send_res {
-        Ok(res) => {
-            last_seen_ns.store(Stats::dur_ns(t_start, t_recv), AtomOrdering::Relaxed);
-            if cfg.stats_interval_mins != 0 {
-                let t_send = Instant::now();
-                stats.send_add(c2u, validated.len as u64, t_recv, t_send);
-            }
-
-            if !*res {
-                if let Some((handles, sock_mgr)) = disconnect_ctx {
-                    if handles.client_connected {
-                        let prev_ver = handles.version;
-                        log_warn_dir!(
-                            worker_id,
-                            c2u,
-                            "send_payload error (EDESTADDRREQ); disconnecting client socket"
-                        );
-                        handles.client_connected = false;
-                        handles.version = match sock_mgr.set_client_sock_disconnected(
-                            handles.client_addr,
-                            false,
-                            prev_ver,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_warn_dir!(worker_id, c2u, "udp_disconnect failed: {}", e);
-                                prev_ver
-                            }
-                        };
-                        log_debug_dir!(
-                            cfg.debug_log_handles,
-                            worker_id,
-                            c2u,
-                            "publish disconnect: addr={:?} ver {}->{}",
-                            handles.client_addr,
-                            prev_ver,
-                            handles.version
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            log_debug_dir!(
-                log_drops,
-                worker_id,
-                c2u,
-                "send_payload error ({} on dest_sa '{:?}'): {}",
-                if sock_connected && e.raw_os_error() != Some(DEST_ADDR_REQUIRED) {
-                    "send"
-                } else {
-                    "send_to"
-                },
-                dest_sa.as_socket(),
-                e
-            );
-            stats.drop_err(c2u);
-        }
-    };
-}
-
 pub fn run_reresolve_thread(
     sock_mgrs: &[Arc<SocketManager>],
     reresolve_secs: u64,
@@ -312,24 +236,16 @@ pub fn run_upstream_to_client_thread(
                 cache.refresh_handles_and_cache(sock_mgr, &mut handles);
 
                 if locked.load(AtomOrdering::Relaxed) {
-                    let validated = match validate_payload(
+                    let Some(validated) = validate_payload_or_log(
                         C2U,
+                        worker_id,
                         cfg,
                         stats,
                         &buf.data[..len],
                         cache.recv_port_id,
-                    ) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            log_debug_dir!(
-                                cfg.debug_log_drops,
-                                worker_id,
-                                C2U,
-                                "validate_payload error: {}",
-                                e
-                            );
-                            continue;
-                        }
+                        cfg.debug_log_drops,
+                    ) else {
+                        continue;
                     };
                     let send_res = send_payload(
                         C2U,
@@ -400,24 +316,16 @@ pub fn run_client_to_upstream_thread(
                     let t_recv = Instant::now();
 
                     if locked.load(AtomOrdering::Relaxed) {
-                        let validated = match validate_payload(
+                        let Some(validated) = validate_payload_or_log(
                             C2U,
+                            worker_id,
                             cfg,
                             stats,
                             &buf.data[..len],
                             cache.recv_port_id,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_debug_dir!(
-                                    cfg.debug_log_drops,
-                                    worker_id,
-                                    C2U,
-                                    "validate_payload error: {}",
-                                    e
-                                );
-                                continue;
-                            }
+                            cfg.debug_log_drops,
+                        ) else {
+                            continue;
                         };
                         let send_res = send_payload(
                             C2U,
@@ -471,24 +379,16 @@ pub fn run_client_to_upstream_thread(
                             continue;
                         };
 
-                        let validated = match validate_payload(
+                        let Some(validated) = validate_payload_or_log(
                             C2U,
+                            worker_id,
                             cfg,
                             stats,
                             &buf.data[..len],
                             cache.recv_port_id,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_debug_dir!(
-                                    cfg.debug_log_drops,
-                                    worker_id,
-                                    C2U,
-                                    "validate_payload error: {}",
-                                    e
-                                );
-                                continue;
-                            }
+                            cfg.debug_log_drops,
+                        ) else {
+                            continue;
                         };
 
                         // Signal to other threads that a client is currently being locked
@@ -574,24 +474,16 @@ pub fn run_client_to_upstream_thread(
                         );
                     } else if Some(src_sa) == cache.client_sa {
                         // Only forward packets from the locked client (recv_from may still deliver before connect succeeds)
-                        let validated = match validate_payload(
+                        let Some(validated) = validate_payload_or_log(
                             C2U,
+                            worker_id,
                             cfg,
                             stats,
                             &buf.data[..len],
                             cache.recv_port_id,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_debug_dir!(
-                                    cfg.debug_log_drops,
-                                    worker_id,
-                                    C2U,
-                                    "validate_payload error: {}",
-                                    e
-                                );
-                                continue;
-                            }
+                            cfg.debug_log_drops,
+                        ) else {
+                            continue;
                         };
                         let send_res = send_payload(
                             C2U,

@@ -1,5 +1,5 @@
-use crate::net::resolve_first;
-use crate::params::MAX_WIRE_PAYLOAD;
+use crate::net::params::MAX_WIRE_PAYLOAD;
+use crate::net::socket::resolve_first;
 
 use std::net::SocketAddr;
 use std::{env, process};
