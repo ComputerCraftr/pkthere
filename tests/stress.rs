@@ -45,7 +45,7 @@ fn stress_test_ipv4(proto: &str) {
         .arg(TIMEOUT_SECS.as_secs().to_string())
         .arg("--on-timeout")
         .arg("exit")
-        .arg("--workers")
+        .arg("--stats-interval-mins")
         .arg("1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
@@ -68,7 +68,7 @@ fn stress_test_ipv4(proto: &str) {
         .connect(listen_addr)
         .expect("connect to forwarder (IPv4)");
 
-    // Load gen for 20 seconds
+    // Stress load gen
     let payload = vec![255u8; 1400];
     client_sock
         .send(&payload)

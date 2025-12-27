@@ -20,15 +20,13 @@ pub const CLIENT_WAIT_MS: Duration = Duration::from_millis(250);
 #[allow(dead_code)]
 pub const JSON_WAIT_MS: Duration = Duration::from_millis(50);
 
-fn strip_log_prefix(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some(idx) = rest.find("] ") {
-            return &rest[idx + 2..];
-        }
-    }
-    trimmed
-}
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[allow(dead_code)]
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP", "ICMP"];
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[allow(dead_code)]
+pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP"];
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,26 +79,6 @@ impl IpFamily {
     }
 }
 
-#[allow(dead_code)]
-pub fn run_cases(protos: &[&str], mut run: impl FnMut(&str, SocketMode) -> bool) -> bool {
-    for &proto in protos {
-        for &mode in &SOCKET_MODES {
-            if !run(proto, mode) {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-#[allow(dead_code)]
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP", "ICMP"];
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-#[allow(dead_code)]
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP"];
-
 /// Ensures the spawned child is terminated on drop (e.g., when a test panics).
 #[allow(dead_code)]
 pub struct ChildGuard(Child);
@@ -138,6 +116,28 @@ impl Drop for ChildGuard {
             }
         }
     }
+}
+
+fn strip_log_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(idx) = rest.find("] ") {
+            return &rest[idx + 2..];
+        }
+    }
+    trimmed
+}
+
+#[allow(dead_code)]
+pub fn run_cases(protos: &[&str], mut run: impl FnMut(&str, SocketMode) -> bool) -> bool {
+    for &proto in protos {
+        for &mode in &SOCKET_MODES {
+            if !run(proto, mode) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn bind_udp_client_impl(addr: SocketAddr) -> io::Result<UdpSocket> {
