@@ -77,3 +77,29 @@ macro_rules! log_debug_dir {
         }
     };
 }
+
+#[macro_export]
+macro_rules! option_or_log_continue {
+    ($opt:expr, $log_macro:ident, $($args:tt)*) => {
+        match $opt {
+            Some(v) => v,
+            None => {
+                $log_macro!($($args)*);
+                continue;
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! result_or_log_continue {
+    ($res:expr, $log_macro:ident, $($args:tt)*) => {
+        match $res {
+            Ok(v) => v,
+            Err(e) => {
+                $log_macro!($($args)*, e);
+                continue;
+            }
+        }
+    };
+}

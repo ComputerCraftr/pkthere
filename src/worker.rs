@@ -1,6 +1,6 @@
 use crate::cli::{Config, TimeoutAction};
 use crate::net::params::MAX_WIRE_PAYLOAD;
-use crate::net::payload::{handle_payload_result, send_payload, validate_payload_or_log};
+use crate::net::payload::{handle_payload_result, send_payload, validate_payload};
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use crate::stats::Stats;
 use socket2::{SockAddr, Type};
@@ -236,16 +236,14 @@ pub fn run_upstream_to_client_thread(
                 cache.refresh_handles_and_cache(sock_mgr, &mut handles);
 
                 if locked.load(AtomOrdering::Relaxed) {
-                    let Some(validated) = validate_payload_or_log(
-                        C2U,
+                    let validated = result_or_log_continue!(
+                        validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                        log_debug_dir,
+                        cfg.debug_log_drops,
                         worker_id,
-                        cfg,
-                        stats,
-                        &buf.data[..len],
-                        cache.recv_port_id,
-                    ) else {
-                        continue;
-                    };
+                        C2U,
+                        "validate_payload error: {}"
+                    );
                     let send_res = send_payload(
                         C2U,
                         &validated,
@@ -314,16 +312,14 @@ pub fn run_client_to_upstream_thread(
                     let t_recv = Instant::now();
 
                     if locked.load(AtomOrdering::Relaxed) {
-                        let Some(validated) = validate_payload_or_log(
-                            C2U,
+                        let validated = result_or_log_continue!(
+                            validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                            log_debug_dir,
+                            cfg.debug_log_drops,
                             worker_id,
-                            cfg,
-                            stats,
-                            &buf.data[..len],
-                            cache.recv_port_id,
-                        ) else {
-                            continue;
-                        };
+                            C2U,
+                            "validate_payload error: {}"
+                        );
                         let send_res = send_payload(
                             C2U,
                             &validated,
@@ -365,26 +361,23 @@ pub fn run_client_to_upstream_thread(
 
                     // First lock: publish client and connect the socket for fast path
                     if !locked.load(AtomOrdering::Relaxed) {
-                        let Some(src) = src_sa.as_socket() else {
-                            log_warn_dir!(
-                                worker_id,
-                                C2U,
-                                "recv_from client non-IP address family (ignored): {:?}",
-                                src_sa
-                            );
-                            continue;
-                        };
-
-                        let Some(validated) = validate_payload_or_log(
-                            C2U,
+                        let src = option_or_log_continue!(
+                            src_sa.as_socket(),
+                            log_warn_dir,
                             worker_id,
-                            cfg,
-                            stats,
-                            &buf.data[..len],
-                            cache.recv_port_id,
-                        ) else {
-                            continue;
-                        };
+                            C2U,
+                            "recv_from client non-IP address family (ignored): {:?}",
+                            src_sa
+                        );
+
+                        let validated = result_or_log_continue!(
+                            validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                            log_debug_dir,
+                            cfg.debug_log_drops,
+                            worker_id,
+                            C2U,
+                            "validate_payload error: {}"
+                        );
 
                         // Signal to other threads that a client is currently being locked
                         locked.store(true, AtomOrdering::Relaxed);
@@ -468,16 +461,14 @@ pub fn run_client_to_upstream_thread(
                         );
                     } else if Some(src_sa) == cache.client_sa {
                         // Only forward packets from the locked client (recv_from may still deliver before connect succeeds)
-                        let Some(validated) = validate_payload_or_log(
-                            C2U,
+                        let validated = result_or_log_continue!(
+                            validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                            log_debug_dir,
+                            cfg.debug_log_drops,
                             worker_id,
-                            cfg,
-                            stats,
-                            &buf.data[..len],
-                            cache.recv_port_id,
-                        ) else {
-                            continue;
-                        };
+                            C2U,
+                            "validate_payload error: {}"
+                        );
                         let send_res = send_payload(
                             C2U,
                             &validated,

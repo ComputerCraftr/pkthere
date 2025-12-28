@@ -30,7 +30,7 @@ const fn be16_16(b0: u8, b1: u8) -> u16 {
 }
 
 #[inline]
-fn validate_payload<'a>(
+pub(crate) fn validate_payload<'a>(
     c2u: bool,
     cfg: &Config,
     stats: &Stats,
@@ -153,29 +153,6 @@ pub(crate) fn send_payload(
             }
         }
         Err(e) => Err(e),
-    }
-}
-
-pub(crate) fn validate_payload_or_log<'a>(
-    c2u: bool,
-    worker_id: usize,
-    cfg: &Config,
-    stats: &Stats,
-    buf: &'a [u8],
-    recv_port_id: u16,
-) -> Option<ValidatedPayload<'a>> {
-    match validate_payload(c2u, cfg, stats, buf, recv_port_id) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            log_debug_dir!(
-                cfg.debug_log_drops,
-                worker_id,
-                c2u,
-                "validate_payload error: {}",
-                e
-            );
-            None
-        }
     }
 }
 
