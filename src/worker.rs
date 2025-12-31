@@ -177,7 +177,7 @@ pub fn run_watchdog_thread(
                                 {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        log_error!("watchdog udp_disconnect failed: {}", e);
+                                        log_error!("watchdog disconnect_socket failed: {}", e);
                                         exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
                                         return;
                                     }

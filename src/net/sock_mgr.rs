@@ -1,6 +1,6 @@
 use crate::cli::SupportedProtocol;
 use crate::net::socket::{
-    family_changed, make_socket, make_upstream_socket_for, resolve_first, udp_disconnect,
+    disconnect_socket, family_changed, make_socket, make_upstream_socket_for, resolve_first,
 };
 use socket2::{SockAddr, Socket};
 
@@ -131,7 +131,7 @@ impl SocketManager {
         self.publish_version(true);
         if !connected {
             // Use a clone because the original may not be marked as connected
-            udp_disconnect(&client_sock_guard.try_clone()?)?;
+            disconnect_socket(&client_sock_guard.try_clone()?)?;
         }
         Ok(prev_ver + 1)
     }

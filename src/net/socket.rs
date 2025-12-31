@@ -147,52 +147,10 @@ pub const fn family_changed(a: SocketAddr, b: SocketAddr) -> bool {
 /// connecting to an invalid address (NULL or AF_UNSPEC). The error
 /// EAFNOSUPPORT may be harmlessly returned; consider it success.
 #[cfg(unix)]
-pub fn udp_disconnect(sock: &Socket) -> io::Result<()> {
+pub fn disconnect_socket(sock: &Socket) -> io::Result<()> {
     let fd = sock.as_raw_fd();
 
-    // Interpret connect() rc correctly per platform.
-    #[inline]
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-    ))]
-    fn ok_or_eafnosupport(rc: i32) -> io::Result<()> {
-        if rc == 0 {
-            Ok(())
-        } else {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
-                // macOS/*BSD man page: harmless when disconnecting UDP
-                Ok(())
-            } else {
-                Err(err)
-            }
-        }
-    }
-
-    // On non-BSD Unix (Linux/Android), do NOT ignore EAFNOSUPPORT.
-    #[inline]
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-    )))]
-    fn ok_or_eafnosupport(rc: i32) -> io::Result<()> {
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    // --- macOS / iOS / *BSD: try AF_UNSPEC first, then NULL ---
+    // --- macOS / iOS / *BSD: AF_UNSPEC is sufficient. ---
     #[cfg(any(
         target_os = "macos",
         target_os = "ios",
@@ -215,13 +173,15 @@ pub fn udp_disconnect(sock: &Socket) -> io::Result<()> {
                 addr.sa_len as libc::socklen_t,
             )
         };
-        if ok_or_eafnosupport(rc).is_ok() {
+        if rc == 0 {
             return Ok(());
         }
-
-        // Fallback: connect(fd, NULL, 0)
-        let rc2 = unsafe { libc::connect(fd, std::ptr::null(), 0) };
-        return ok_or_eafnosupport(rc2);
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
+            // macOS/*BSD man page: harmless when disconnecting UDP
+            return Ok(());
+        }
+        return Err(err);
     }
 
     // --- Linux/Android: AF_UNSPEC is the standard way; no sa_len field. ---
@@ -245,13 +205,16 @@ pub fn udp_disconnect(sock: &Socket) -> io::Result<()> {
                 std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
             )
         };
-        return ok_or_eafnosupport(rc);
+        if rc == 0 {
+            return Ok(());
+        }
+        return Err(io::Error::last_os_error());
     }
 }
 
 /// Windows: disconnect a UDP socket by connecting to INADDR_ANY/IN6ADDR_ANY and port 0.
 #[cfg(windows)]
-pub fn udp_disconnect(sock: &Socket) -> io::Result<()> {
+pub fn disconnect_socket(sock: &Socket) -> io::Result<()> {
     let local = sock.local_addr()?;
     let any_std = match local.as_socket() {
         Some(SocketAddr::V6(_)) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -264,9 +227,9 @@ pub fn udp_disconnect(sock: &Socket) -> io::Result<()> {
 
 /// Fallback: not supported on this platform.
 #[cfg(all(not(unix), not(windows)))]
-pub fn udp_disconnect(_sock: &Socket) -> io::Result<()> {
+pub fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Other,
-        "Function udp_disconnect is not supported on this OS",
+        "Function disconnect_socket is not supported on this OS",
     ))
 }

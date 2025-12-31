@@ -195,7 +195,7 @@ pub(crate) fn handle_payload_result(
                         ) {
                             Ok(v) => v,
                             Err(e) => {
-                                log_warn_dir!(worker_id, c2u, "udp_disconnect failed: {}", e);
+                                log_warn_dir!(worker_id, c2u, "disconnect_socket failed: {}", e);
                                 prev_ver
                             }
                         };
