@@ -1,3 +1,4 @@
+#[path = "common/stress.rs"]
 mod common;
 
 use crate::common::*;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn stress_test_ipv4_all() {
+    let _ = IpFamily::V6;
     for &proto in SUPPORTED_PROTOCOLS {
         stress_test_ipv4(proto);
     }

@@ -1,3 +1,4 @@
+#[path = "common/cli.rs"]
 mod common;
 
 use crate::common::run_cli_args;

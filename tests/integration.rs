@@ -1,3 +1,4 @@
+#[path = "common/integration.rs"]
 mod common;
 
 use crate::common::*;
