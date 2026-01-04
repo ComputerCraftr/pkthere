@@ -169,7 +169,11 @@ fn stress_test_ipv4(proto: &str) {
         stats.to_string()
     );
 
-    let min_pct = 40.0;
+    let min_pct = if proto.eq_ignore_ascii_case("icmp") {
+        40.0
+    } else {
+        60.0
+    };
     let c2u_pct = if sent == 0 {
         0.0
     } else {
