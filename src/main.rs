@@ -102,7 +102,7 @@ fn main() -> io::Result<()> {
 
     // Global application state
     let locked = Arc::new(AtomicBool::new(false));
-    let last_seen_ns = Arc::new(AtomicU64::new(0));
+    let last_seen_s = Arc::new(AtomicU64::new(0));
 
     let stats = Arc::new(Stats::new());
     let exit_code_set = Arc::new(AtomicU32::new(0));
@@ -136,7 +136,7 @@ fn main() -> io::Result<()> {
             let sock_mgrs_a = sock_mgrs.clone();
             let worker_id = worker_base;
             let locked_a = Arc::clone(&locked);
-            let last_seen_a = Arc::clone(&last_seen_ns);
+            let last_seen_a = Arc::clone(&last_seen_s);
             let stats_a = Arc::clone(&stats);
 
             thread::spawn(move || {
@@ -159,7 +159,7 @@ fn main() -> io::Result<()> {
             let sock_mgr_b = Arc::clone(&sock_mgr);
             let worker_id = worker_base + 1;
             let locked_b = Arc::clone(&locked);
-            let last_seen_b = Arc::clone(&last_seen_ns);
+            let last_seen_b = Arc::clone(&last_seen_s);
             let stats_b = Arc::clone(&stats);
 
             thread::spawn(move || {
@@ -181,7 +181,7 @@ fn main() -> io::Result<()> {
         let cfg_w = Arc::clone(&cfg);
         let sock_mgrs_w = sock_mgrs.clone();
         let locked_w = Arc::clone(&locked);
-        let last_seen_w = Arc::clone(&last_seen_ns);
+        let last_seen_w = Arc::clone(&last_seen_s);
         let exit_code_set_w = Arc::clone(&exit_code_set);
 
         thread::spawn(move || {

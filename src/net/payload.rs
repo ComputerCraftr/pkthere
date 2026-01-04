@@ -163,7 +163,7 @@ pub(crate) fn handle_payload_result(
     t_recv: Instant,
     cfg: &Config,
     stats: &Stats,
-    last_seen_ns: &AtomicU64,
+    last_seen_s: &AtomicU64,
     validated: &ValidatedPayload<'_>,
     send_res: &io::Result<bool>,
     sock_connected: bool,
@@ -172,7 +172,8 @@ pub(crate) fn handle_payload_result(
 ) {
     match send_res {
         Ok(res) => {
-            last_seen_ns.store(Stats::dur_ns(t_start, t_recv), AtomOrdering::Relaxed);
+            let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
+            last_seen_s.store(last_seen, AtomOrdering::Relaxed);
             if cfg.stats_interval_mins != 0 {
                 let t_send = Instant::now();
                 stats.send_add(c2u, validated.len as u64, t_recv, t_send);

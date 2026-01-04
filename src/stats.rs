@@ -65,13 +65,8 @@ impl Stats {
     }
 
     #[inline]
-    pub fn dur_ns(start: Instant, end: Instant) -> u64 {
-        end.saturating_duration_since(start).as_nanos() as u64
-    }
-
-    #[inline]
     pub fn send_add(&self, c2u: bool, bytes: u64, start: Instant, end: Instant) {
-        let lat_ns = Self::dur_ns(start, end);
+        let lat_ns = end.saturating_duration_since(start).as_nanos() as u64;
         let (atom_pkts, atom_bytes, atom_lat_sum_ns, atom_lat_max_ns, atom_bytes_max) = if c2u {
             (
                 &self.agg.c2u_pkts,

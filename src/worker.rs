@@ -148,21 +148,18 @@ pub fn run_watchdog_thread(
     cfg: &Config,
     sock_mgrs: &[Arc<SocketManager>],
     locked: &AtomicBool,
-    last_seen_ns: &AtomicU64,
+    last_seen_s: &AtomicU64,
     exit_code_set: &AtomicU32,
 ) {
-    let timeout_ns = Duration::from_secs(cfg.timeout_secs)
-        .as_nanos()
-        .min(u128::from(u64::MAX)) as u64;
     let period = Duration::from_secs(1);
     loop {
         thread::sleep(period);
         if locked.load(AtomOrdering::Relaxed) {
             let now = Instant::now();
-            let now_ns = Stats::dur_ns(t_start, now);
-            let last_ns = last_seen_ns.load(AtomOrdering::Relaxed);
+            let now_s = now.saturating_duration_since(t_start).as_secs();
+            let last_s = last_seen_s.load(AtomOrdering::Relaxed);
 
-            if last_ns != 0 && now_ns.saturating_sub(last_ns) >= timeout_ns {
+            if last_s != 0 && now_s.saturating_sub(last_s) >= cfg.timeout_secs {
                 match cfg.on_timeout {
                     TimeoutAction::Drop => {
                         log_warn!(
@@ -191,7 +188,7 @@ pub fn run_watchdog_thread(
                             }
                         }
                         locked.store(false, AtomOrdering::Relaxed);
-                        last_seen_ns.store(0, AtomOrdering::Relaxed);
+                        last_seen_s.store(0, AtomOrdering::Relaxed);
                     }
                     _ => {
                         log_warn!(
@@ -213,7 +210,7 @@ pub fn run_upstream_to_client_thread(
     sock_mgr: &SocketManager,
     worker_id: usize,
     locked: &AtomicBool,
-    last_seen_ns: &AtomicU64,
+    last_seen_s: &AtomicU64,
     stats: &Stats,
 ) {
     const C2U: bool = false;
@@ -260,7 +257,7 @@ pub fn run_upstream_to_client_thread(
                         t_recv,
                         cfg,
                         stats,
-                        last_seen_ns,
+                        last_seen_s,
                         &validated,
                         &send_res,
                         handles.client_connected,
@@ -288,7 +285,7 @@ pub fn run_client_to_upstream_thread(
     all_sock_mgrs: &[Arc<SocketManager>],
     worker_id: usize,
     locked: &AtomicBool,
-    last_seen_ns: &AtomicU64,
+    last_seen_s: &AtomicU64,
     stats: &Stats,
 ) {
     const C2U: bool = true;
@@ -336,7 +333,7 @@ pub fn run_client_to_upstream_thread(
                             t_recv,
                             cfg,
                             stats,
-                            last_seen_ns,
+                            last_seen_s,
                             &validated,
                             &send_res,
                             handles.upstream_connected,
@@ -452,7 +449,7 @@ pub fn run_client_to_upstream_thread(
                             t_recv,
                             cfg,
                             stats,
-                            last_seen_ns,
+                            last_seen_s,
                             &validated,
                             &send_res,
                             handles.upstream_connected,
@@ -485,7 +482,7 @@ pub fn run_client_to_upstream_thread(
                             t_recv,
                             cfg,
                             stats,
-                            last_seen_ns,
+                            last_seen_s,
                             &validated,
                             &send_res,
                             handles.upstream_connected,
