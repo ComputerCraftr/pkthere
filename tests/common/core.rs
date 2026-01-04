@@ -111,12 +111,25 @@ fn spawn_udp_echo_server_impl(
     let local = sock.local_addr()?;
     let handle = thread::spawn(move || {
         let mut buf = [0u8; 65535];
+        let mut connected = false;
         loop {
-            match sock.recv_from(&mut buf) {
-                Ok((n, src)) => {
-                    let _ = sock.send_to(&buf[..n], src);
+            if !connected {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, src)) => {
+                        if sock.connect(src).is_ok() {
+                            connected = true;
+                            let _ = sock.send(&buf[..n]);
+                        }
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
+            } else {
+                match sock.recv(&mut buf) {
+                    Ok(n) => {
+                        let _ = sock.send(&buf[..n]);
+                    }
+                    Err(_) => {}
+                }
             }
         }
     });
