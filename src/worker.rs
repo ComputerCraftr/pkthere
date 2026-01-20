@@ -1,4 +1,4 @@
-use crate::cli::{Config, TimeoutAction};
+use crate::cli::{Config, SupportedProtocol, TimeoutAction};
 use crate::net::params::MAX_WIRE_PAYLOAD;
 use crate::net::payload::{handle_payload_result, send_payload, validate_payload};
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
@@ -23,6 +23,31 @@ fn as_uninit_mut(buf: &mut [u8]) -> &mut [std::mem::MaybeUninit<u8>] {
     }
 }
 
+#[inline]
+fn normalize_client_sockaddr(
+    src_sa: &SockAddr,
+    listen_proto: SupportedProtocol,
+    listen_port_id: u16,
+) -> Option<SocketAddr> {
+    let src = src_sa.as_socket()?;
+    if listen_proto == SupportedProtocol::ICMP {
+        let normalized = match src {
+            SocketAddr::V4(addr) => {
+                SocketAddr::V4(std::net::SocketAddrV4::new(*addr.ip(), listen_port_id))
+            }
+            SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
+                *addr.ip(),
+                listen_port_id,
+                addr.flowinfo(),
+                addr.scope_id(),
+            )),
+        };
+        Some(normalized)
+    } else {
+        Some(src)
+    }
+}
+
 // Stack-resident, cacheline-aligned buffers
 #[repr(align(64))]
 struct AlignedBuf {
@@ -40,7 +65,6 @@ impl AlignedBuf {
 struct CachedClientState {
     c2u: bool,
     worker_id: usize,
-    client_sa: Option<SockAddr>,
     dest_sock_type: Type,
     dest_sa: SockAddr,
     dest_port_id: u16,
@@ -60,7 +84,6 @@ impl CachedClientState {
             Self {
                 c2u,
                 worker_id,
-                client_sa: handles.client_addr.map(|addr| SockAddr::from(addr)),
                 dest_sock_type: handles.upstream_sock.r#type().unwrap_or(Type::RAW),
                 dest_sa: SockAddr::from(handles.upstream_addr),
                 dest_port_id: handles.upstream_addr.port(),
@@ -80,7 +103,6 @@ impl CachedClientState {
             Self {
                 c2u,
                 worker_id,
-                client_sa: None,
                 dest_sock_type: handles.client_sock.r#type().unwrap_or(Type::RAW),
                 dest_sa,
                 dest_port_id,
@@ -92,7 +114,6 @@ impl CachedClientState {
 
     fn refresh_from_handles(&mut self, handles: &SocketHandles) {
         if self.c2u {
-            self.client_sa = handles.client_addr.map(|addr| SockAddr::from(addr));
             self.dest_sock_type = handles.upstream_sock.r#type().unwrap_or(Type::RAW);
             self.dest_sa = SockAddr::from(handles.upstream_addr);
             self.dest_port_id = handles.upstream_addr.port();
@@ -359,7 +380,11 @@ pub fn run_client_to_upstream_thread(
                     // First lock: publish client and connect the socket for fast path
                     if !locked.load(AtomOrdering::Relaxed) {
                         let src = option_or_log_continue!(
-                            src_sa.as_socket(),
+                            normalize_client_sockaddr(
+                                &src_sa,
+                                cfg.listen_proto,
+                                cfg.listen_port_id
+                            ),
                             log_warn_dir,
                             worker_id,
                             C2U,
@@ -378,13 +403,13 @@ pub fn run_client_to_upstream_thread(
 
                         // Signal to other threads that a client is currently being locked
                         locked.store(true, AtomOrdering::Relaxed);
-                        cache.client_sa = Some(SockAddr::from(src));
+                        let src_sa_clean = SockAddr::from(src);
                         let addr_opt = Some(src);
 
                         handles.client_connected = false;
                         if cfg.debug_no_connect {
                             log_info!("Locked to single client {} (not connected)", src);
-                        } else if let Err(e) = handles.client_sock.connect(&src_sa) {
+                        } else if let Err(e) = handles.client_sock.connect(&src_sa_clean) {
                             log_warn!("connect client_sock to {} failed: {}", src, e);
                             log_info!("Locked to single client {} (not connected)", src);
                         } else {
@@ -416,7 +441,7 @@ pub fn run_client_to_upstream_thread(
                                 let _ = mgr.set_client_sock_connected(
                                     addr_opt,
                                     handles.client_connected,
-                                    &src_sa,
+                                    &src_sa_clean,
                                     0,
                                 );
                             }
@@ -456,7 +481,13 @@ pub fn run_client_to_upstream_thread(
                             &cache.dest_sa,
                             None,
                         );
-                    } else if Some(src_sa) == cache.client_sa {
+                    } else if normalize_client_sockaddr(
+                        &src_sa,
+                        cfg.listen_proto,
+                        cfg.listen_port_id,
+                    ) == handles.client_addr
+                        && handles.client_addr.is_some()
+                    {
                         // Only forward packets from the locked client (recv_from may still deliver before connect succeeds)
                         let validated = result_or_log_continue!(
                             validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
