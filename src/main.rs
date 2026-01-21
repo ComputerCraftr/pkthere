@@ -5,7 +5,7 @@ mod net;
 mod stats;
 mod worker;
 
-use cli::{Config, SupportedProtocol, parse_args};
+use cli::{Config, SupportedProtocol, TimeoutAction, parse_args};
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
 #[cfg(unix)]
@@ -49,7 +49,10 @@ fn main() -> io::Result<()> {
 
     // Disconnect does not work for raw listen sockets and FreeBSD UDP
     // disconnect is unreliable; keep sockets unconnected so we can relock.
-    if user_requested_cfg.listen_proto == SupportedProtocol::ICMP || cfg!(target_os = "freebsd") {
+    if user_requested_cfg.on_timeout == TimeoutAction::Drop
+        && (user_requested_cfg.listen_proto == SupportedProtocol::ICMP
+            || cfg!(target_os = "freebsd"))
+    {
         user_requested_cfg.debug_no_connect = true;
     }
 
