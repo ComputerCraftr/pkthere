@@ -3,7 +3,7 @@
 # Uncomment if you want `cargo build --release` to build both by default
 # target = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
 
-[target.'cfg(any(target_os = "freebsd", target_os = "android", target_os = "macos"))']
+[target.'cfg(any(target_os = "freebsd", target_os = "android", target_os = "macos", target_arch = "riscv64"))']
 rustflags = [
 "-C","target-cpu=native",
 ]
@@ -31,3 +31,4 @@ rustflags = [
 # Explicit sections kept minimal; the musl cfg above handles both triples.
 [target.x86_64-unknown-linux-musl]
 [target.aarch64-unknown-linux-musl]
+[target.riscv64gc-unknown-linux-musl]
