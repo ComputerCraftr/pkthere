@@ -1,464 +1,264 @@
-#[path = "common/integration.rs"]
-mod common;
+#[path = "common/app_bin.rs"]
+mod app_bin;
+#[path = "common/core.rs"]
+mod core;
+#[path = "common/matrix.rs"]
+mod matrix;
+#[path = "common/orchestrator.rs"]
+mod orchestrator;
+#[path = "common/runtime_asserts.rs"]
+mod runtime_asserts;
 
-use crate::common::*;
-#[cfg(unix)]
-use nix::unistd;
+use crate::core::{
+    IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, bind_udp_client,
+    random_unprivileged_port, spawn_udp_echo_server, wait_for_stats_json_from,
+};
+use crate::matrix::{
+    IPV4_ONLY_FAMILIES, MatrixCase, SOCKET_MODES, bind_client_or_skip, run_matrix_cases,
+    spawn_echo_or_skip,
+};
+use crate::orchestrator::{ForwarderConfig, launch_forwarder, wait_for_child_exit_success};
+use crate::runtime_asserts::{
+    CLIENT_WAIT_MS, json_addr, send_until_locked, wait_for_locked_client_from,
+};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::runtime_asserts::{expect_no_echo, wait_for_stats_matching};
 
 use std::io::ErrorKind;
-use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn enforce_max_payload_all() {
-    for &proto in SUPPORTED_PROTOCOLS {
-        let proto_slice = std::slice::from_ref(&proto);
-        let _ = run_enforce_max_payload(IpFamily::V4, proto_slice, 548, 2048);
-        let _ = run_enforce_max_payload(IpFamily::V6, proto_slice, 1232, 4096);
+    for (family, max_payload, recv_buf_len) in [
+        (IpFamily::V4, 548usize, 2048usize),
+        (IpFamily::V6, 1232usize, 4096usize),
+    ] {
+        run_matrix_cases(&[family], SUPPORTED_PROTOCOLS, &SOCKET_MODES, |case| {
+            run_enforce_max_payload(case, max_payload, recv_buf_len);
+        });
     }
 }
 
-fn run_enforce_max_payload(
-    family: IpFamily,
-    protos: &[&str],
-    max_payload: usize,
-    recv_buf_len: usize,
-) -> bool {
-    run_cases(protos, |proto, mode| {
-        let client_sock = match family.bind_client() {
-            Ok(sock) => sock,
-            Err(e) => {
-                if family.is_v6() {
-                    eprintln!("IPv6 loopback not available; skipping IPv6 test: {e}");
-                    return false;
-                }
-                panic!("IPv4 loopback not available: {e}");
-            }
-        };
+fn run_enforce_max_payload(case: MatrixCase<'_>, max_payload: usize, recv_buf_len: usize) {
+    let Some(client_sock) = bind_client_or_skip(case.family) else {
+        return;
+    };
+    let Some((up_addr, _up_thread)) = spawn_echo_or_skip(case.family) else {
+        return;
+    };
 
-        let (up_addr, _up_thread) = match family.spawn_echo() {
-            Ok(pair) => pair,
-            Err(e) => {
-                if family.is_v6() {
-                    eprintln!("IPv6 echo server could not bind; skipping IPv6 test: {e}");
-                    return false;
-                }
-                panic!("IPv4 echo server could not bind: {e}");
-            }
-        };
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: case.mode,
+        here: case.family.listen_arg().to_string(),
+        there: format!("{}:{up_addr}", case.proto),
+        timeout_action: "exit",
+        max_payload: Some(max_payload),
+        fast_stats: false,
+        stats_interval_mins: None,
+    });
 
-        let bin = find_app_bin().expect("could not find app binary");
-        let mut cmd = Command::new(bin);
-        cmd.arg("--here")
-            .arg(family.listen_arg())
-            .arg("--there")
-            .arg(format!("{proto}:{up_addr}"))
-            .arg("--timeout-secs")
-            .arg(TIMEOUT_SECS.as_secs().to_string())
-            .arg("--on-timeout")
-            .arg("exit")
-            .arg("--max-payload")
-            .arg(max_payload.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+    client_sock
+        .connect(session.listen_addr)
+        .expect("connect to forwarder (max payload)");
 
-        mode.apply(&mut cmd);
+    let ok = vec![255u8; max_payload];
+    client_sock.send(&ok).expect("send max payload");
+    let mut buf = vec![0u8; recv_buf_len];
+    let _ = client_sock
+        .recv(&mut buf)
+        .expect("recv from forwarder (max payload)");
 
-        #[cfg(unix)]
-        if unistd::geteuid().is_root() {
-            cmd.arg("--user").arg("nobody");
-        }
+    let over = vec![255u8; max_payload + 1];
+    client_sock.send(&over).expect("send oversize payload");
+    client_sock
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .expect("set read timeout");
+    assert!(
+        client_sock.recv(&mut buf).is_err(),
+        "oversize payload should be dropped"
+    );
 
-        let mut child = ChildGuard::new(cmd.spawn().expect("spawn app binary"));
-        let mut out = take_child_stdout(&mut child).expect("child stdout missing");
-        let listen_addr = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS).expect(&format!(
-            "did not see listening address line within {:?}",
-            MAX_WAIT_SECS
-        ));
-        client_sock
-            .connect(listen_addr)
-            .expect("connect to forwarder (max payload)");
+    wait_for_child_exit_success(&mut session.child, MAX_WAIT_SECS);
 
-        let ok = vec![255u8; max_payload];
-        client_sock.send(&ok).unwrap();
-        let mut buf = vec![0u8; recv_buf_len];
-        let _ = client_sock
-            .recv(&mut buf)
-            .expect("recv from forwarder (max payload)");
-
-        let over = vec![255u8; max_payload + 1];
-        client_sock.send(&over).unwrap();
-        client_sock.set_read_timeout(Some(CLIENT_WAIT_MS)).unwrap();
-        let drop_expected = client_sock.recv(&mut buf).is_err();
-        assert!(drop_expected, "oversize payload should be dropped");
-
-        let start = Instant::now();
-        while start.elapsed() < MAX_WAIT_SECS {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    assert!(status.success(), "forwarder did not exit cleanly: {status}");
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(e) => panic!("wait error: {e}"),
-            }
-        }
-
-        let status_opt = child
-            .try_wait()
-            .expect("wait error while checking forwarder exit status");
-        match status_opt {
-            Some(status) => {
-                assert!(status.success(), "forwarder did not exit cleanly: {status}",);
-            }
-            None => {
-                panic!("forwarder did not exit within {:?}", MAX_WAIT_SECS);
-            }
-        }
-
-        let stats = wait_for_stats_json_from(&mut out, JSON_WAIT_MS).expect(&format!(
-            "did not see stats JSON line within {:?}",
-            JSON_WAIT_MS
-        ));
-        assert_eq!(stats["c2u_drops_oversize"].as_u64().unwrap_or(0), 1);
-        true
-    })
+    let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect(&format!(
+        "did not see stats JSON line within {:?}",
+        JSON_WAIT_MS
+    ));
+    assert_eq!(stats["c2u_drops_oversize"].as_u64().unwrap_or(0), 1);
 }
 
 #[test]
 fn single_client_forwarding_all() {
-    for &proto in SUPPORTED_PROTOCOLS {
-        let proto_slice = std::slice::from_ref(&proto);
-        let _ = run_single_client_forwarding(IpFamily::V4, proto_slice, b"hello-through-forwarder");
-        let _ =
-            run_single_client_forwarding(IpFamily::V6, proto_slice, b"hello-through-forwarder-v6");
+    for (family, payload) in [
+        (IpFamily::V4, b"hello-through-forwarder".as_slice()),
+        (IpFamily::V6, b"hello-through-forwarder-v6".as_slice()),
+    ] {
+        run_matrix_cases(&[family], SUPPORTED_PROTOCOLS, &SOCKET_MODES, |case| {
+            run_single_client_forwarding(case, payload);
+        });
     }
 }
 
-fn run_single_client_forwarding(family: IpFamily, protos: &[&str], payload: &[u8]) -> bool {
+fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
     const COUNT: usize = 5;
-    run_cases(protos, |proto, mode| {
-        let client_sock = match family.bind_client() {
-            Ok(sock) => sock,
-            Err(e) => {
-                if family.is_v6() {
-                    eprintln!("IPv6 loopback not available; skipping IPv6 test: {e}");
-                    return false;
-                }
-                panic!("IPv4 loopback not available: {e}");
-            }
-        };
-        let client_local = match client_sock.local_addr() {
-            Ok(addr) => addr,
-            Err(e) => {
-                if family.is_v6() {
-                    eprintln!("IPv6 loopback address not available; skipping IPv6 test: {e}");
-                    return false;
-                }
-                panic!("IPv4 loopback address not available: {e}");
-            }
-        };
 
-        let (up_addr, _up_thread) = match family.spawn_echo() {
-            Ok(pair) => pair,
-            Err(e) => {
-                if family.is_v6() {
-                    eprintln!("IPv6 echo server could not bind; skipping IPv6 test: {e}");
-                    return false;
-                }
-                panic!("IPv4 echo server could not bind: {e}");
-            }
-        };
+    let Some(client_sock) = bind_client_or_skip(case.family) else {
+        return;
+    };
+    let client_local = client_sock.local_addr().expect("client local addr");
+    let Some((up_addr, _up_thread)) = spawn_echo_or_skip(case.family) else {
+        return;
+    };
 
-        let bin = find_app_bin().expect("could not find app binary");
-        let mut cmd = Command::new(bin);
-        cmd.arg("--here")
-            .arg(family.listen_arg())
-            .arg("--there")
-            .arg(format!("{proto}:{up_addr}"))
-            .arg("--timeout-secs")
-            .arg(TIMEOUT_SECS.as_secs().to_string())
-            .arg("--on-timeout")
-            .arg("exit")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: case.mode,
+        here: case.family.listen_arg().to_string(),
+        there: format!("{}:{up_addr}", case.proto),
+        timeout_action: "exit",
+        max_payload: None,
+        fast_stats: false,
+        stats_interval_mins: None,
+    });
 
-        mode.apply(&mut cmd);
+    client_sock
+        .connect(session.listen_addr)
+        .expect("connect to forwarder (single client)");
 
-        #[cfg(unix)]
-        if unistd::geteuid().is_root() {
-            cmd.arg("--user").arg("nobody");
-        }
-
-        let mut child = ChildGuard::new(cmd.spawn().expect("spawn app binary"));
-        let mut out = take_child_stdout(&mut child).expect("child stdout missing");
-        let listen_addr = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS).expect(&format!(
-            "did not see listening address line within {:?}",
-            MAX_WAIT_SECS
-        ));
+    for _ in 0..COUNT {
         client_sock
-            .connect(listen_addr)
-            .expect("connect to forwarder (single client)");
+            .send(payload)
+            .expect("send to forwarder (single client)");
+        let mut buf = [0u8; 2048];
+        let n = client_sock
+            .recv(&mut buf)
+            .expect("recv from forwarder (single client)");
+        assert_eq!(&buf[..n], payload, "echo payload mismatch");
+    }
 
-        for _ in 0..COUNT {
-            client_sock
-                .send(payload)
-                .expect("send to forwarder (single client)");
-            let mut buf = [0u8; 2048];
-            let n = client_sock
-                .recv(&mut buf)
-                .expect("recv from forwarder (single client)");
-            assert_eq!(&buf[..n], payload, "echo payload mismatch");
-        }
+    wait_for_child_exit_success(&mut session.child, MAX_WAIT_SECS);
 
-        let start = Instant::now();
-        while start.elapsed() < MAX_WAIT_SECS {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    assert!(status.success(), "forwarder did not exit cleanly: {status}");
-                    break;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(50)),
-                Err(e) => panic!("wait error: {e}"),
-            }
-        }
+    let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect(&format!(
+        "did not see stats JSON line within {:?}",
+        JSON_WAIT_MS
+    ));
+    assert!(stats["uptime_s"].is_number());
+    assert!(stats["locked"].as_bool().unwrap_or(false));
+    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), COUNT as u64);
+    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), COUNT as u64);
 
-        let status_opt = child
-            .try_wait()
-            .expect("wait error while checking forwarder exit status");
-        match status_opt {
-            Some(status) => {
-                assert!(status.success(), "forwarder did not exit cleanly: {status}",);
-            }
-            None => {
-                panic!("forwarder did not exit within {:?}", MAX_WAIT_SECS);
-            }
-        }
+    let stats_client = json_addr(&stats["client_addr"]).expect("parse stats client_addr");
+    assert_eq!(stats_client, client_local, "stats client_addr mismatch");
+    let stats_upstream = json_addr(&stats["upstream_addr"]).expect("parse stats upstream_addr");
+    assert_eq!(stats_upstream, up_addr, "stats upstream_addr mismatch");
 
-        let stats = wait_for_stats_json_from(&mut out, JSON_WAIT_MS).expect(&format!(
-            "did not see stats JSON line within {:?}",
-            JSON_WAIT_MS
-        ));
-        assert!(stats["uptime_s"].is_number());
-        assert!(stats["locked"].as_bool().unwrap_or(false));
-        assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), COUNT as u64);
-        assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), COUNT as u64);
-        assert!(stats["client_addr"].is_string());
-        assert!(stats["upstream_addr"].is_string());
+    assert_eq!(
+        stats["c2u_bytes"].as_u64().unwrap_or(0),
+        payload.len() as u64 * COUNT as u64
+    );
+    assert_eq!(
+        stats["u2c_bytes"].as_u64().unwrap_or(0),
+        payload.len() as u64 * COUNT as u64
+    );
+    assert_eq!(
+        stats["c2u_bytes_max"].as_u64().unwrap_or(0),
+        payload.len() as u64
+    );
+    assert_eq!(
+        stats["u2c_bytes_max"].as_u64().unwrap_or(0),
+        payload.len() as u64
+    );
 
-        let stats_client = json_addr(&stats["client_addr"]).expect("parse stats client_addr");
-        assert_eq!(stats_client, client_local, "stats client_addr mismatch");
-        let stats_upstream = json_addr(&stats["upstream_addr"]).expect("parse stats upstream_addr");
-        assert_eq!(stats_upstream, up_addr, "stats upstream_addr mismatch");
+    let c2u_us_max = stats["c2u_us_max"].as_u64().unwrap();
+    let u2c_us_max = stats["u2c_us_max"].as_u64().unwrap();
+    let c2u_us_avg = stats["c2u_us_avg"].as_u64().unwrap();
+    let u2c_us_avg = stats["u2c_us_avg"].as_u64().unwrap();
+    let c2u_us_ewma = stats["c2u_us_ewma"].as_u64().unwrap();
+    let u2c_us_ewma = stats["u2c_us_ewma"].as_u64().unwrap();
 
-        assert_eq!(
-            stats["c2u_bytes"].as_u64().unwrap_or(0),
-            payload.len() as u64 * COUNT as u64
-        );
-        assert_eq!(
-            stats["u2c_bytes"].as_u64().unwrap_or(0),
-            payload.len() as u64 * COUNT as u64
-        );
-        assert_eq!(
-            stats["c2u_bytes_max"].as_u64().unwrap_or(0),
-            payload.len() as u64
-        );
-        assert_eq!(
-            stats["u2c_bytes_max"].as_u64().unwrap_or(0),
-            payload.len() as u64
-        );
-
-        assert!(stats["c2u_us_max"].is_number());
-        assert!(stats["u2c_us_max"].is_number());
-        assert!(stats["c2u_us_avg"].is_number());
-        assert!(stats["u2c_us_avg"].is_number());
-        assert!(stats["c2u_us_ewma"].is_number());
-        assert!(stats["u2c_us_ewma"].is_number());
-
-        let c2u_us_max = stats["c2u_us_max"].as_u64().unwrap();
-        let u2c_us_max = stats["u2c_us_max"].as_u64().unwrap();
-        let c2u_us_avg = stats["c2u_us_avg"].as_u64().unwrap();
-        let u2c_us_avg = stats["u2c_us_avg"].as_u64().unwrap();
-        let c2u_us_ewma = stats["c2u_us_ewma"].as_u64().unwrap();
-        let u2c_us_ewma = stats["u2c_us_ewma"].as_u64().unwrap();
-
-        assert!(
-            c2u_us_avg > 0,
-            "expected c2u_us_avg > 0, got {}",
-            c2u_us_avg
-        );
-        assert!(
-            u2c_us_avg > 0,
-            "expected u2c_us_avg > 0, got {}",
-            u2c_us_avg
-        );
-        assert!(
-            c2u_us_ewma > 0,
-            "expected c2u_us_ewma > 0, got {}",
-            c2u_us_ewma
-        );
-        assert!(
-            u2c_us_ewma > 0,
-            "expected u2c_us_ewma > 0, got {}",
-            u2c_us_ewma
-        );
-
-        assert!(
-            c2u_us_max >= c2u_us_avg,
-            "impossible: c2u_us_avg {} > c2u_us_max {}",
-            c2u_us_avg,
-            c2u_us_max
-        );
-        assert!(
-            u2c_us_max >= u2c_us_avg,
-            "impossible: u2c_us_avg {} > u2c_us_max {}",
-            u2c_us_avg,
-            u2c_us_max
-        );
-        assert!(
-            c2u_us_max >= c2u_us_ewma,
-            "impossible: c2u_us_ewma {} > c2u_us_max {}",
-            c2u_us_ewma,
-            c2u_us_max
-        );
-        assert!(
-            u2c_us_max >= u2c_us_ewma,
-            "impossible: u2c_us_ewma {} > u2c_us_max {}",
-            u2c_us_ewma,
-            u2c_us_max
-        );
-        true
-    })
+    assert!(c2u_us_avg > 0, "expected c2u_us_avg > 0, got {c2u_us_avg}");
+    assert!(u2c_us_avg > 0, "expected u2c_us_avg > 0, got {u2c_us_avg}");
+    assert!(
+        c2u_us_ewma > 0,
+        "expected c2u_us_ewma > 0, got {c2u_us_ewma}"
+    );
+    assert!(
+        u2c_us_ewma > 0,
+        "expected u2c_us_ewma > 0, got {u2c_us_ewma}"
+    );
+    assert!(c2u_us_max >= c2u_us_avg);
+    assert!(u2c_us_max >= u2c_us_avg);
+    assert!(c2u_us_max >= c2u_us_ewma);
+    assert!(u2c_us_max >= u2c_us_ewma);
 }
 
 #[test]
 fn relock_after_timeout_drop_all() {
-    run_cases(SUPPORTED_PROTOCOLS, |proto, mode| {
-        relock_after_timeout_drop_ipv4_case(proto, mode);
-        true
-    });
+    run_matrix_cases(
+        &IPV4_ONLY_FAMILIES,
+        SUPPORTED_PROTOCOLS,
+        &SOCKET_MODES,
+        |case| {
+            relock_after_timeout_drop_ipv4_case(case);
+        },
+    );
 }
 
-fn relock_after_timeout_drop_ipv4_case(proto: &str, mode: SocketMode) {
-    // Two client sockets (different ephemeral ports)
+fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     let client_a = bind_udp_client(IpFamily::V4).expect("client_a IPv4 loopback not available");
     let client_b = bind_udp_client(IpFamily::V4).expect("client_b IPv4 loopback not available");
-
-    // Upstream echo server
     let up_addr = spawn_udp_echo_server(IpFamily::V4)
         .expect("IPv4 echo server could not bind")
         .0;
-
-    // Spawn the app binary
-    let bin = find_app_bin().expect("could not find app binary");
-
     let here_port = random_unprivileged_port(IpFamily::V4).expect("ephemeral listen port");
-    let mut cmd = Command::new(bin);
-    cmd.arg("--here")
-        .arg(format!("UDP:127.0.0.1:{here_port}"))
-        .arg("--there")
-        .arg(format!("{proto}:{up_addr}"))
-        .arg("--timeout-secs")
-        .arg(TIMEOUT_SECS.as_secs().to_string())
-        .arg("--on-timeout")
-        .arg("drop")
-        .arg("--debug")
-        .arg("fast-stats")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
 
-    mode.apply(&mut cmd);
-
-    #[cfg(unix)]
-    if unistd::geteuid().is_root() {
-        cmd.arg("--user").arg("nobody");
-    }
-
-    let mut child = ChildGuard::new(cmd.spawn().expect("spawn app binary"));
-
-    // Read the forwarder's listen address and connect client A
-    let mut out = take_child_stdout(&mut child).expect("child stdout missing");
-
-    let listen_addr = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS).expect(&format!(
-        "did not see listening address line within {:?}",
-        MAX_WAIT_SECS
-    ));
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: case.mode,
+        here: format!("UDP:127.0.0.1:{here_port}"),
+        there: format!("{}:{up_addr}", case.proto),
+        timeout_action: "drop",
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+    });
 
     client_a
-        .connect(listen_addr)
+        .connect(session.listen_addr)
         .expect("connect A -> forwarder");
 
-    // Send a packet from client A; wait for the forwarder to announce the lock, then expect echo
     let payload_a = b"first-client";
     client_a.send(payload_a).expect("send A");
-
-    // Confirm the forwarder locked to client A
-    let a_locked_opt = wait_for_locked_client_from(&mut out, MAX_WAIT_SECS);
-    assert!(
-        a_locked_opt.is_some(),
-        "did not see lock line for client A within {:?}",
-        MAX_WAIT_SECS
-    );
-    let a_locked = a_locked_opt.unwrap();
-    let client_a_local = client_a.local_addr().expect("client A local addr");
+    let a_locked = wait_for_locked_client_from(&mut session.out, MAX_WAIT_SECS)
+        .expect("did not see lock line for client A");
     assert_eq!(
-        a_locked, client_a_local,
-        "forwarder locked to unexpected client A address"
+        a_locked,
+        client_a.local_addr().expect("client A local addr")
     );
 
     let mut buf = [0u8; 2048];
     let n = client_a.recv(&mut buf).expect("recv echo A");
     assert_eq!(&buf[..n], payload_a);
 
-    // Now go idle > timeout so watchdog drops the lock and disconnects
     thread::sleep(MAX_WAIT_SECS);
-
-    // Ensure process did NOT exit under on-timeout=drop
-    if let Ok(Some(status)) = child.try_wait() {
+    if let Ok(Some(status)) = session.child.try_wait() {
         panic!("forwarder exited unexpectedly with status: {status}");
     }
 
-    // Connect client B and send a packet; then wait for the lock line and expect echo
     client_b
-        .connect(listen_addr)
+        .connect(session.listen_addr)
         .expect("connect B -> forwarder");
     let payload_b = b"second-client";
     client_b
         .set_read_timeout(Some(CLIENT_WAIT_MS))
         .expect("set read timeout on client B");
 
-    // Trigger relock by sending a few datagrams, then wait explicitly for the lock line.
-    let mut b_locked_opt = None;
-
-    // Stage 1: send until we see the forwarder announce the new locked client.
-    for _ in 0..40 {
-        let _ = client_b.send(payload_b);
-        if let Some(locked) = wait_for_locked_client_from(&mut out, CLIENT_WAIT_MS) {
-            b_locked_opt = Some(locked);
-            break;
-        }
-        // Socket/forwarder might be busy; brief backoff and retry.
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    assert!(
-        b_locked_opt.is_some(),
-        "did not see lock line for client B within {:?}",
-        CLIENT_WAIT_MS
-    );
-    let b_locked = b_locked_opt.unwrap();
+    let b_locked = send_until_locked(&client_b, payload_b, &mut session.out, 40, CLIENT_WAIT_MS)
+        .expect("did not see lock line for client B");
     let client_b_local = client_b.local_addr().expect("client B local addr");
     assert_eq!(
         b_locked, client_b_local,
         "forwarder locked to unexpected client B address"
     );
-
-    // Stage 2: now that the forwarder is relocked, receive the echo.
-    // Allow brief transient conditions by retrying and re-sending.
-    client_b
-        .set_read_timeout(Some(CLIENT_WAIT_MS))
-        .expect("set read timeout on client B");
 
     let mut got: Option<usize> = None;
     for _ in 0..40 {
@@ -472,10 +272,8 @@ fn relock_after_timeout_drop_ipv4_case(proto: &str, mode: SocketMode) {
                     || e.kind() == ErrorKind::TimedOut
                     || e.kind() == ErrorKind::ConnectionRefused =>
             {
-                // Nudge pipeline and try again
                 let _ = client_b.send(payload_b);
                 thread::sleep(Duration::from_millis(50));
-                continue;
             }
             Err(e) => panic!("recv echo B: {e}"),
         }
@@ -483,77 +281,50 @@ fn relock_after_timeout_drop_ipv4_case(proto: &str, mode: SocketMode) {
     let n = got.expect("did not receive echo from forwarder after re-lock");
     assert_eq!(&buf[..n], payload_b);
 
-    // Give forwarder a moment to print stats, then tear it down for test cleanup
-    let stats = wait_for_stats_json_from(&mut out, JSON_WAIT_MS).expect(&format!(
+    let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect(&format!(
         "did not see stats JSON line within {:?}",
         JSON_WAIT_MS
     ));
-    let _ = child.kill();
+    let _ = session.child.kill();
 
-    // The last locked client should be B (its local addr)
-    let stats_client =
-        json_addr(&stats["client_addr"]).expect("parse stats client_addr after relock");
+    let stats_client = json_addr(&stats["client_addr"]).expect("parse stats client_addr");
     assert_eq!(
         stats_client, client_b_local,
         "forwarder did not relock to client B"
     );
 
-    // Sanity: we sent at least one pkt each direction for A and B (echo path), totals >= 2
     let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap_or(0);
     let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap_or(0);
-    assert!(
-        c2u_pkts >= 2 && u2c_pkts >= 2,
-        "unexpected low packet counts: c2u={c2u_pkts} u2c={u2c_pkts}"
-    );
+    assert!(c2u_pkts >= 2 && u2c_pkts >= 2);
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn timeout_drop_relocks_after_forward_errors_udp() {
-    for &mode in &SOCKET_MODES {
-        timeout_drop_relocks_after_forward_errors_udp_case(mode);
-    }
+    run_matrix_cases(&IPV4_ONLY_FAMILIES, &["UDP"], &SOCKET_MODES, |case| {
+        timeout_drop_relocks_after_forward_errors_udp_case(case);
+    });
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn timeout_drop_relocks_after_forward_errors_udp_case(mode: SocketMode) {
+fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase<'_>) {
     let client_a = bind_udp_client(IpFamily::V4).expect("client_a IPv4 loopback not available");
     let client_b = bind_udp_client(IpFamily::V4).expect("client_b IPv4 loopback not available");
     let dead_upstream_port = random_unprivileged_port(IpFamily::V4).expect("dead upstream port");
-
-    let bin = find_app_bin().expect("could not find app binary");
     let here_port = random_unprivileged_port(IpFamily::V4).expect("ephemeral listen port");
-    let mut cmd = Command::new(bin);
-    cmd.arg("--here")
-        .arg(format!("UDP:127.0.0.1:{here_port}"))
-        .arg("--there")
-        .arg(format!("UDP:127.0.0.1:{dead_upstream_port}"))
-        .arg("--timeout-secs")
-        .arg(TIMEOUT_SECS.as_secs().to_string())
-        .arg("--on-timeout")
-        .arg("drop")
-        .arg("--debug")
-        .arg("fast-stats")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
 
-    mode.apply(&mut cmd);
-
-    #[cfg(unix)]
-    if unistd::geteuid().is_root() {
-        cmd.arg("--user").arg("nobody");
-    }
-
-    let mut child = ChildGuard::new(cmd.spawn().expect("spawn app binary"));
-    let mut out = take_child_stdout(&mut child).expect("child stdout missing");
-
-    let listen_addr = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS).expect(&format!(
-        "did not see listening address line within {:?}",
-        MAX_WAIT_SECS
-    ));
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: case.mode,
+        here: format!("UDP:127.0.0.1:{here_port}"),
+        there: format!("UDP:127.0.0.1:{dead_upstream_port}"),
+        timeout_action: "drop",
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+    });
 
     client_a
-        .connect(listen_addr)
+        .connect(session.listen_addr)
         .expect("connect A -> forwarder");
     client_a
         .set_read_timeout(Some(CLIENT_WAIT_MS))
@@ -561,74 +332,38 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(mode: SocketMode) {
 
     let payload_a = b"forward-error-client-a";
     client_a.send(payload_a).expect("send A");
-
-    let a_locked = wait_for_locked_client_from(&mut out, MAX_WAIT_SECS)
+    let a_locked = wait_for_locked_client_from(&mut session.out, MAX_WAIT_SECS)
         .expect("did not see lock line for client A");
     assert_eq!(
         a_locked,
-        client_a.local_addr().expect("client A local addr"),
-        "forwarder locked to unexpected client A address"
+        client_a.local_addr().expect("client A local addr")
     );
 
-    match client_a.recv(&mut [0u8; 256]) {
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-        Err(e) => panic!("unexpected client A recv error: {e}"),
-        Ok(n) => panic!("unexpected client A payload of {n} bytes"),
-    }
+    expect_no_echo(&client_a, &mut [0u8; 256]);
 
-    // On Linux, UDP to an unused localhost port is legal for unprivileged users.
-    // The initial send may succeed, but the kernel feeds back ICMP port-unreachable.
-    // In practice this shows up as upstream-side recv errors on the connected socket.
-    let mut stats = None;
-    let give_up = Instant::now() + MAX_WAIT_SECS;
-    while Instant::now() < give_up {
-        let _ = client_a.send(payload_a);
-        if let Some(candidate) = wait_for_stats_json_from(&mut out, JSON_WAIT_MS) {
-            let errs = candidate["u2c_errs"].as_u64().unwrap_or(0);
-            let locked = candidate["locked"].as_bool().unwrap_or(false);
-            if locked && errs > 0 {
-                stats = Some(candidate);
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    let stats = stats.expect(&format!(
-        "did not see forwarding errors in stats JSON within {:?}",
-        MAX_WAIT_SECS
-    ));
-    assert!(stats["locked"].as_bool().unwrap_or(false));
+    let stats = wait_for_stats_matching(&mut session.out, MAX_WAIT_SECS, |candidate| {
+        candidate["locked"].as_bool().unwrap_or(false)
+            && candidate["u2c_errs"].as_u64().unwrap_or(0) > 0
+    })
+    .expect("did not see forwarding errors in stats JSON");
     assert_eq!(
         json_addr(&stats["client_addr"]).expect("stats client addr"),
-        client_a.local_addr().expect("client A local addr"),
-        "stats reported unexpected locked client"
+        client_a.local_addr().expect("client A local addr")
     );
-    assert!(stats["u2c_errs"].as_u64().unwrap_or(0) > 0);
 
     thread::sleep(MAX_WAIT_SECS);
-
-    if let Ok(Some(status)) = child.try_wait() {
+    if let Ok(Some(status)) = session.child.try_wait() {
         panic!("forwarder exited unexpectedly with status: {status}");
     }
 
     client_b
-        .connect(listen_addr)
+        .connect(session.listen_addr)
         .expect("connect B -> forwarder");
     let payload_b = b"forward-error-client-b";
-
-    let mut b_locked = None;
-    for _ in 0..40 {
-        let _ = client_b.send(payload_b);
-        if let Some(locked) = wait_for_locked_client_from(&mut out, CLIENT_WAIT_MS) {
-            b_locked = Some(locked);
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
+    let b_locked = send_until_locked(&client_b, payload_b, &mut session.out, 40, CLIENT_WAIT_MS)
+        .expect("did not see lock line for client B");
     assert_eq!(
-        b_locked.expect("did not see lock line for client B"),
-        client_b.local_addr().expect("client B local addr"),
-        "forwarder did not relock to client B after timeout"
+        b_locked,
+        client_b.local_addr().expect("client B local addr")
     );
 }

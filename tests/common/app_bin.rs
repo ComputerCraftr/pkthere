@@ -1,113 +1,203 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 
-/// Try to locate the built forwarder binary across platforms (Linux/macOS/Windows).
-pub fn find_app_bin() -> Option<String> {
-    // Optional explicit override for CI or local runs.
-    // e.g. TEST_APP_BIN=/path/to/bin cargo test
-    if let Ok(override_path) = env::var("TEST_APP_BIN") {
-        if Path::new(&override_path).exists() {
-            return Some(override_path);
-        }
+const APP_BIN_NAME: &str = "pkthere";
+
+fn with_ext(name: &str) -> String {
+    if cfg!(windows) && !name.ends_with(".exe") {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
     }
+}
 
-    // Helper: add .exe on Windows
-    fn with_ext(name: &str) -> String {
-        if cfg!(windows) && !name.ends_with(".exe") {
-            format!("{name}.exe")
-        } else {
-            name.to_string()
-        }
+fn alternate_profile(profile: &str) -> Option<&'static str> {
+    match profile {
+        "debug" => Some("release"),
+        "release" => Some("debug"),
+        _ => None,
     }
+}
 
-    // Helper: return the first existing path from candidates
-    fn first_existing(paths: impl IntoIterator<Item = PathBuf>) -> Option<String> {
-        for p in paths {
-            if p.exists() {
-                return Some(p.to_string_lossy().to_string());
-            }
-        }
-        None
-    }
+fn profile_candidates_from_current_exe(
+    current_exe: &Path,
+    exe_name: &str,
+) -> impl Iterator<Item = PathBuf> {
+    let mut candidates = Vec::new();
 
-    // 1) Prefer Cargo's CARGO_BIN_EXE_* variables. This is the most accurate because it
-    //    contains the actual, resolved path(s) for bin targets built for this package.
-    //    We don't assume the bin name; instead we scan all env vars with that prefix,
-    //    and pick the one that exists on disk.
-    let mut candidates: Vec<(String, String)> = Vec::new();
-    for (k, v) in env::vars() {
-        if k.starts_with("CARGO_BIN_EXE_") && Path::new(&v).exists() {
-            candidates.push((k, v));
-        }
-    }
-
-    // If exactly one candidate exists, use it.
-    if candidates.len() == 1 {
-        return Some(candidates.remove(0).1);
-    }
-
-    // If multiple exist (multi-bin workspace), try to pick the one that matches the package name.
-    if candidates.len() > 1 {
-        if let Ok(pkg) = env::var("CARGO_PKG_NAME") {
-            let want1 = pkg.replace('-', "_");
-            let want2 = pkg.clone();
-            if let Some((_k, v)) = candidates.iter().find(|(k, _)| {
-                k == &format!("CARGO_BIN_EXE_{want1}") || k == &format!("CARGO_BIN_EXE_{want2}")
-            }) {
-                return Some(v.clone());
-            }
-        }
-        // Otherwise, just take the first existing one deterministically (sorted by key).
-        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-        return Some(candidates.remove(0).1);
-    }
-
-    // 2) No CARGO_BIN_EXE_* variables were exported (or they didn't exist on disk).
-    //    Fall back to guessing from the package name and common target locations.
-    let pkg = env::var("CARGO_PKG_NAME").unwrap_or_else(|_| String::from("app"));
-    let exe_name = with_ext(&pkg);
-
-    // Try next to the test executable: prefer release, then debug
-    if let Ok(mut exe) = env::current_exe() {
-        // .../target/{profile}/deps/<test_exe>
-        if exe.pop() && exe.pop() {
-            // Now at .../target/{profile}
-            let target_root = exe.parent().map(Path::to_path_buf);
-            // Check release first, then the current profile dir
-            if let Some(root) = target_root {
-                let candidates = [
-                    root.join("release").join(&exe_name),
-                    exe.join(&exe_name),
-                    root.join("debug").join(&exe_name),
-                ];
-                if let Some(found) = first_existing(candidates.into_iter()) {
-                    return Some(found);
+    if let Some(deps_dir) = current_exe.parent() {
+        if deps_dir.file_name() == Some(std::ffi::OsStr::new("deps")) {
+            if let Some(profile_dir) = deps_dir.parent() {
+                candidates.push(profile_dir.join(exe_name));
+                if let Some(profile) = profile_dir.file_name().and_then(|n| n.to_str()) {
+                    if let Some(other) = alternate_profile(profile) {
+                        if let Some(target_dir) = profile_dir.parent() {
+                            candidates.push(target_dir.join(other).join(exe_name));
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Try under CARGO_TARGET_DIR if set.
-    if let Ok(target_dir) = env::var("CARGO_TARGET_DIR") {
-        let target = PathBuf::from(target_dir);
-        let paths = ["release", "debug"]
-            .into_iter()
-            .map(|p| target.join(p).join(&exe_name));
-        if let Some(p) = first_existing(paths) {
-            return Some(p);
+    candidates.into_iter()
+}
+
+fn resolve_app_bin_with(
+    env_map: &BTreeMap<String, String>,
+    current_exe: Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<String> {
+    if let Some(override_path) = env_map.get("TEST_APP_BIN") {
+        let path = PathBuf::from(override_path);
+        if exists(&path) {
+            return Some(path.to_string_lossy().to_string());
         }
     }
 
-    // Fallback to standard target/<profile>/<exe_name> under the manifest dir.
-    if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
-        let md = PathBuf::from(manifest_dir);
-        let paths = ["release", "debug"]
-            .into_iter()
-            .map(|p| md.join("target").join(p).join(&exe_name));
-        if let Some(p) = first_existing(paths) {
-            return Some(p);
+    let exe_name = with_ext(APP_BIN_NAME);
+    let cargo_bin_key = format!("CARGO_BIN_EXE_{}", APP_BIN_NAME.replace('-', "_"));
+    if let Some(exact_path) = env_map.get(&cargo_bin_key) {
+        let path = PathBuf::from(exact_path);
+        if exists(&path) {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    if let Some(current_exe) = current_exe {
+        for candidate in profile_candidates_from_current_exe(&current_exe, &exe_name) {
+            if exists(&candidate) {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let target_dir = env_map
+        .get("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_map
+                .get("CARGO_MANIFEST_DIR")
+                .map(|dir| PathBuf::from(dir).join("target"))
+        });
+
+    if let Some(target_dir) = target_dir {
+        let current_profile = env_map
+            .get("PROFILE")
+            .map(String::as_str)
+            .filter(|profile| !profile.is_empty())
+            .unwrap_or("debug");
+
+        let mut profiles = vec![current_profile];
+        if let Some(other) = alternate_profile(current_profile) {
+            profiles.push(other);
+        }
+
+        for profile in profiles {
+            let candidate = target_dir.join(profile).join(&exe_name);
+            if exists(&candidate) {
+                return Some(candidate.to_string_lossy().to_string());
+            }
         }
     }
 
     None
+}
+
+/// Locate the pkthere test binary for the current cargo invocation.
+pub fn find_app_bin() -> Option<String> {
+    let env_map = env::vars().collect::<BTreeMap<_, _>>();
+    let current_exe = env::current_exe().ok();
+    resolve_app_bin_with(&env_map, current_exe, |path| path.exists())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_app_bin_with, with_ext};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+
+    fn mock_path(parts: &[&str]) -> String {
+        let mut p = PathBuf::new();
+        for part in parts {
+            p.push(part);
+        }
+        p.to_string_lossy().to_string()
+    }
+
+    fn resolve_with(
+        env_pairs: &[(&str, &str)],
+        current_exe: Option<&str>,
+        existing: &[&str],
+    ) -> Option<String> {
+        let env_map = env_pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let existing = existing.iter().map(PathBuf::from).collect::<BTreeSet<_>>();
+
+        resolve_app_bin_with(&env_map, current_exe.map(PathBuf::from), |path: &Path| {
+            existing.contains(path)
+        })
+    }
+
+    #[test]
+    fn prefers_test_app_bin_override() {
+        let path = mock_path(&["/", "tmp", "custom-pkthere"]);
+        let found = resolve_with(&[("TEST_APP_BIN", &path)], None, &[&path]);
+        assert_eq!(found.as_deref(), Some(path.as_str()));
+    }
+
+    #[test]
+    fn prefers_exact_cargo_bin_exe_for_pkthere() {
+        let path = mock_path(&["/", "tmp", "pkthere"]);
+        let other = mock_path(&["/", "tmp", "other"]);
+        let found = resolve_with(
+            &[
+                ("CARGO_BIN_EXE_other", &other),
+                ("CARGO_BIN_EXE_pkthere", &path),
+            ],
+            None,
+            &[&other, &path],
+        );
+        assert_eq!(found.as_deref(), Some(path.as_str()));
+    }
+
+    #[test]
+    fn prefers_current_profile_over_opposite_profile() {
+        let bin = mock_path(&["/", "repo", "target", "debug", &with_ext("pkthere")]);
+        let alt = mock_path(&["/", "repo", "target", "release", &with_ext("pkthere")]);
+        let current_exe =
+            mock_path(&["/", "repo", "target", "debug", "deps", "integration-abc123"]);
+        let found = resolve_with(&[], Some(&current_exe), &[&alt, &bin]);
+        assert_eq!(found, Some(bin));
+    }
+
+    #[test]
+    fn ignores_non_matching_cargo_bin_candidates() {
+        let bin = mock_path(&["/", "repo", "target", "debug", &with_ext("pkthere")]);
+        let other = mock_path(&["/", "tmp", "other"]);
+        let current_exe =
+            mock_path(&["/", "repo", "target", "debug", "deps", "integration-abc123"]);
+        let found = resolve_with(
+            &[("CARGO_BIN_EXE_other", &other)],
+            Some(&current_exe),
+            &[&other, &bin],
+        );
+        assert_eq!(found, Some(bin));
+    }
+
+    #[test]
+    fn falls_back_to_profile_env_before_opposite_profile() {
+        let bin = mock_path(&["/", "repo", "target", "release", &with_ext("pkthere")]);
+        let alt = mock_path(&["/", "repo", "target", "debug", &with_ext("pkthere")]);
+        let target_dir = mock_path(&["/", "repo", "target"]);
+        let found = resolve_with(
+            &[("CARGO_TARGET_DIR", &target_dir), ("PROFILE", "release")],
+            None,
+            &[&alt, &bin],
+        );
+        assert_eq!(found, Some(bin));
+    }
 }

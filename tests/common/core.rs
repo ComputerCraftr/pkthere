@@ -5,7 +5,6 @@ use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs, UdpSocket,
 };
 use std::ops::{Deref, DerefMut};
-mod app_bin;
 
 use std::process::Child;
 use std::thread;
@@ -14,8 +13,6 @@ use std::time::{Duration, Instant};
 pub const TIMEOUT_SECS: Duration = Duration::from_secs(2);
 pub const MAX_WAIT_SECS: Duration = Duration::from_secs(4);
 pub const JSON_WAIT_MS: Duration = Duration::from_millis(50);
-
-pub use app_bin::find_app_bin;
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP", "ICMP"];

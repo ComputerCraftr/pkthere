@@ -10,15 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  test:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
@@ -34,7 +33,36 @@ jobs:
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo test --no-run --verbose
 
       - name: Run tests
         run: cargo test --verbose
+
+  stress-release:
+    name: Stress Regression (Release)
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enable ICMP ping sockets
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      - name: Build release test binaries
+        run: cargo test --release --tests --no-run --verbose
+
+      - name: Run release stress regression tests
+        run: cargo test --release stress_test_ipv4_all -- --ignored --nocapture
