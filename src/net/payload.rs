@@ -5,7 +5,7 @@ use crate::stats::Stats;
 use socket2::{SockAddr, Socket, Type};
 
 use std::io::{self, IoSlice};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering as AtomOrdering};
+use std::sync::atomic::{AtomicU16, Ordering as AtomOrdering};
 use std::time::Instant;
 
 #[cfg(unix)]
@@ -159,11 +159,9 @@ pub(crate) fn send_payload(
 pub(crate) fn handle_payload_result(
     c2u: bool,
     worker_id: usize,
-    t_start: Instant,
     t_recv: Instant,
     cfg: &Config,
     stats: &Stats,
-    last_seen_s: &AtomicU64,
     validated: &ValidatedPayload<'_>,
     send_res: &io::Result<bool>,
     sock_connected: bool,
@@ -172,8 +170,6 @@ pub(crate) fn handle_payload_result(
 ) {
     match send_res {
         Ok(res) => {
-            let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
-            last_seen_s.store(last_seen, AtomOrdering::Relaxed);
             if cfg.stats_interval_mins != 0 {
                 let t_send = Instant::now();
                 stats.send_add(c2u, validated.len as u64, t_recv, t_send);

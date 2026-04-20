@@ -506,3 +506,129 @@ fn relock_after_timeout_drop_ipv4_case(proto: &str, mode: SocketMode) {
         "unexpected low packet counts: c2u={c2u_pkts} u2c={u2c_pkts}"
     );
 }
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[test]
+fn timeout_drop_relocks_after_forward_errors_udp() {
+    for &mode in &SOCKET_MODES {
+        timeout_drop_relocks_after_forward_errors_udp_case(mode);
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn timeout_drop_relocks_after_forward_errors_udp_case(mode: SocketMode) {
+    let client_a = bind_udp_client(IpFamily::V4).expect("client_a IPv4 loopback not available");
+    let client_b = bind_udp_client(IpFamily::V4).expect("client_b IPv4 loopback not available");
+    let dead_upstream_port = random_unprivileged_port(IpFamily::V4).expect("dead upstream port");
+
+    let bin = find_app_bin().expect("could not find app binary");
+    let here_port = random_unprivileged_port(IpFamily::V4).expect("ephemeral listen port");
+    let mut cmd = Command::new(bin);
+    cmd.arg("--here")
+        .arg(format!("UDP:127.0.0.1:{here_port}"))
+        .arg("--there")
+        .arg(format!("UDP:127.0.0.1:{dead_upstream_port}"))
+        .arg("--timeout-secs")
+        .arg(TIMEOUT_SECS.as_secs().to_string())
+        .arg("--on-timeout")
+        .arg("drop")
+        .arg("--debug")
+        .arg("fast-stats")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    mode.apply(&mut cmd);
+
+    #[cfg(unix)]
+    if unistd::geteuid().is_root() {
+        cmd.arg("--user").arg("nobody");
+    }
+
+    let mut child = ChildGuard::new(cmd.spawn().expect("spawn app binary"));
+    let mut out = take_child_stdout(&mut child).expect("child stdout missing");
+
+    let listen_addr = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS).expect(&format!(
+        "did not see listening address line within {:?}",
+        MAX_WAIT_SECS
+    ));
+
+    client_a
+        .connect(listen_addr)
+        .expect("connect A -> forwarder");
+    client_a
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .expect("set read timeout on client A");
+
+    let payload_a = b"forward-error-client-a";
+    client_a.send(payload_a).expect("send A");
+
+    let a_locked = wait_for_locked_client_from(&mut out, MAX_WAIT_SECS)
+        .expect("did not see lock line for client A");
+    assert_eq!(
+        a_locked,
+        client_a.local_addr().expect("client A local addr"),
+        "forwarder locked to unexpected client A address"
+    );
+
+    match client_a.recv(&mut [0u8; 256]) {
+        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+        Err(e) => panic!("unexpected client A recv error: {e}"),
+        Ok(n) => panic!("unexpected client A payload of {n} bytes"),
+    }
+
+    // On Linux, UDP to an unused localhost port is legal for unprivileged users.
+    // The initial send may succeed, but the kernel feeds back ICMP port-unreachable.
+    // In practice this shows up as upstream-side recv errors on the connected socket.
+    let mut stats = None;
+    let give_up = Instant::now() + MAX_WAIT_SECS;
+    while Instant::now() < give_up {
+        let _ = client_a.send(payload_a);
+        if let Some(candidate) = wait_for_stats_json_from(&mut out, JSON_WAIT_MS) {
+            let errs = candidate["u2c_errs"].as_u64().unwrap_or(0);
+            let locked = candidate["locked"].as_bool().unwrap_or(false);
+            if locked && errs > 0 {
+                stats = Some(candidate);
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let stats = stats.expect(&format!(
+        "did not see forwarding errors in stats JSON within {:?}",
+        MAX_WAIT_SECS
+    ));
+    assert!(stats["locked"].as_bool().unwrap_or(false));
+    assert_eq!(
+        json_addr(&stats["client_addr"]).expect("stats client addr"),
+        client_a.local_addr().expect("client A local addr"),
+        "stats reported unexpected locked client"
+    );
+    assert!(stats["u2c_errs"].as_u64().unwrap_or(0) > 0);
+
+    thread::sleep(MAX_WAIT_SECS);
+
+    if let Ok(Some(status)) = child.try_wait() {
+        panic!("forwarder exited unexpectedly with status: {status}");
+    }
+
+    client_b
+        .connect(listen_addr)
+        .expect("connect B -> forwarder");
+    let payload_b = b"forward-error-client-b";
+
+    let mut b_locked = None;
+    for _ in 0..40 {
+        let _ = client_b.send(payload_b);
+        if let Some(locked) = wait_for_locked_client_from(&mut out, CLIENT_WAIT_MS) {
+            b_locked = Some(locked);
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        b_locked.expect("did not see lock line for client B"),
+        client_b.local_addr().expect("client B local addr"),
+        "forwarder did not relock to client B after timeout"
+    );
+}

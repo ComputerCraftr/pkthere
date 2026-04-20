@@ -149,6 +149,12 @@ impl CachedClientState {
     }
 }
 
+#[inline]
+fn record_session_activity(t_start: Instant, t_recv: Instant, last_seen_s: &AtomicU64) {
+    let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
+    last_seen_s.store(last_seen, AtomOrdering::Relaxed);
+}
+
 pub fn run_reresolve_thread(
     sock_mgrs: &[Arc<SocketManager>],
     reresolve_secs: u64,
@@ -180,6 +186,8 @@ pub fn run_watchdog_thread(
             let now_s = now.saturating_duration_since(t_start).as_secs();
             let last_s = last_seen_s.load(AtomOrdering::Relaxed);
 
+            // Invariant: once a client is locked, last_seen_s is set from the first accepted packet
+            // for that lock, even if the subsequent forward/send fails.
             if last_s != 0 && now_s.saturating_sub(last_s) >= cfg.timeout_secs {
                 match cfg.on_timeout {
                     TimeoutAction::Drop => {
@@ -271,14 +279,13 @@ pub fn run_upstream_to_client_thread(
                         &cache.dest_sa,
                         cache.dest_port_id,
                     );
+                    record_session_activity(t_start, t_recv, last_seen_s);
                     handle_payload_result(
                         C2U,
                         worker_id,
-                        t_start,
                         t_recv,
                         cfg,
                         stats,
-                        last_seen_s,
                         &validated,
                         &send_res,
                         handles.client_connected,
@@ -347,14 +354,13 @@ pub fn run_client_to_upstream_thread(
                             &cache.dest_sa,
                             cache.dest_port_id,
                         );
+                        record_session_activity(t_start, t_recv, last_seen_s);
                         handle_payload_result(
                             C2U,
                             worker_id,
-                            t_start,
                             t_recv,
                             cfg,
                             stats,
-                            last_seen_s,
                             &validated,
                             &send_res,
                             handles.upstream_connected,
@@ -467,14 +473,13 @@ pub fn run_client_to_upstream_thread(
                             &cache.dest_sa,
                             cache.dest_port_id,
                         );
+                        record_session_activity(t_start, t_recv, last_seen_s);
                         handle_payload_result(
                             C2U,
                             worker_id,
-                            t_start,
                             t_recv,
                             cfg,
                             stats,
-                            last_seen_s,
                             &validated,
                             &send_res,
                             handles.upstream_connected,
@@ -506,14 +511,13 @@ pub fn run_client_to_upstream_thread(
                             &cache.dest_sa,
                             cache.dest_port_id,
                         );
+                        record_session_activity(t_start, t_recv, last_seen_s);
                         handle_payload_result(
                             C2U,
                             worker_id,
-                            t_start,
                             t_recv,
                             cfg,
                             stats,
-                            last_seen_s,
                             &validated,
                             &send_res,
                             handles.upstream_connected,
@@ -532,5 +536,40 @@ pub fn run_client_to_upstream_thread(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_session_activity;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn record_session_activity_stores_elapsed_seconds() {
+        let last_seen_s = AtomicU64::new(0);
+        let t_start = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .unwrap_or_else(Instant::now);
+        let t_recv = Instant::now();
+
+        record_session_activity(t_start, t_recv, &last_seen_s);
+
+        let recorded = last_seen_s.load(AtomOrdering::Relaxed);
+        assert!(recorded >= 1, "activity timestamp must be nonzero");
+        assert!(
+            recorded <= 4,
+            "activity timestamp should reflect recent elapsed seconds"
+        );
+    }
+
+    #[test]
+    fn record_session_activity_clamps_same_tick_to_one() {
+        let last_seen_s = AtomicU64::new(0);
+        let now = Instant::now();
+
+        record_session_activity(now, now, &last_seen_s);
+
+        assert_eq!(last_seen_s.load(AtomOrdering::Relaxed), 1);
     }
 }
