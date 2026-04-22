@@ -1,14 +1,15 @@
 use serde_json::Value as Json;
+mod app_bin;
+mod child_guard;
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{
     Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs, UdpSocket,
 };
-use std::ops::{Deref, DerefMut};
-
-use std::process::Child;
 use std::thread;
 use std::time::{Duration, Instant};
+
+pub use child_guard::ChildGuard;
 
 pub const TIMEOUT_SECS: Duration = Duration::from_secs(2);
 pub const MAX_WAIT_SECS: Duration = Duration::from_secs(4);
@@ -24,43 +25,6 @@ pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP"];
 pub enum IpFamily {
     V4,
     V6,
-}
-
-/// Ensures the spawned child is terminated on drop (e.g., when a test panics).
-pub struct ChildGuard(Child);
-
-impl ChildGuard {
-    pub const fn new(child: Child) -> Self {
-        Self(child)
-    }
-}
-
-impl Deref for ChildGuard {
-    type Target = Child;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for ChildGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        // If it's still running (or we can't tell), try to kill and wait.
-        match self.0.try_wait() {
-            Ok(Some(_status)) => {
-                // already exited
-            }
-            Ok(None) | Err(_) => {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-    }
 }
 
 pub(crate) fn strip_log_prefix(line: &str) -> &str {

@@ -1,4 +1,7 @@
-use crate::net::params::MAX_WIRE_PAYLOAD;
+use crate::net::params::{
+    MAX_SAFE_ICMP_IPV4_PAYLOAD, MAX_SAFE_ICMP_IPV6_PAYLOAD, MAX_SAFE_UDP_IPV4_PAYLOAD,
+    MAX_SAFE_UDP_IPV6_PAYLOAD,
+};
 use crate::net::socket::resolve_first;
 
 use std::net::SocketAddr;
@@ -47,6 +50,36 @@ pub enum ReresolveMode {
     Both,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerFlowMode {
+    SharedFlow,
+    SingleFlow,
+}
+
+impl WorkerFlowMode {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "shared-flow" => Some(Self::SharedFlow),
+            "single-flow" => Some(Self::SingleFlow),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub const fn to_str(self) -> &'static str {
+        match self {
+            Self::SharedFlow => "shared-flow",
+            Self::SingleFlow => "single-flow",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerFlowMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_str())
+    }
+}
+
 impl ReresolveMode {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
@@ -76,12 +109,14 @@ pub struct Config {
     pub listen_proto: SupportedProtocol, // UDP | ICMP
     pub listen_str: String,              // original --here host:port string
     pub workers: usize,                  // listener/upstream worker pairs
+    pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
     pub upstream_proto: SupportedProtocol, // UDP | ICMP
     pub upstream_str: String,            // FQDN:port or IP:port
     pub timeout_secs: u64,               // idle timeout for single client
     pub on_timeout: TimeoutAction,       // Drop | Exit
     pub stats_interval_mins: u32,        // JSON stats print interval (0 disables stats thread)
     pub max_payload: usize,              // optional user-specified MTU/payload limit
+    pub icmp_sync_pps: u32,              // 0 = disabled; >0 targets a best-effort ICMP request rate
     pub reresolve_secs: u64,             // 0 = disabled
     pub reresolve_mode: ReresolveMode,   // which side(s) to re-resolve
     #[cfg(unix)]
@@ -106,7 +141,9 @@ pub fn parse_args() -> Config {
              \t--on-timeout drop|exit   What to do on timeout (default: drop)\n\
              \t--stats-interval-mins N  JSON stats print interval minutes (0=disabled, default: 60)\n\
              \t--workers N              Number of listener/upstream worker pairs (reuse-port, default: 1)\n\
+             \t--worker-flow-mode WHAT  Flow ownership across workers: shared-flow|single-flow (default: shared-flow)\n\
              \t--max-payload N          Payload limit (default: 1500)\n\
+             \t--icmp-sync-pps N        Sync ICMP request pace in packets/s (0=disabled, default: 0)\n\
              \t--reresolve-secs N       Re-resolve host(s) every N seconds (0=disabled)\n\
              \t--reresolve-mode WHAT    Which sockets to re-resolve: upstream|listen|both|none (default: upstream)\n\
              \t--user NAME              Drop privileges to this user (Unix only)\n\
@@ -161,10 +198,10 @@ pub fn parse_args() -> Config {
             }
         }
     }
-    fn validate_there(s: &str) -> (String, u16, SupportedProtocol) {
+    fn validate_there(s: &str) -> (String, SocketAddr, u16, SupportedProtocol) {
         let (proto, addr_str) = split_proto(s, "--there");
         match resolve_first(addr_str) {
-            Ok(sa) => (sa.to_string(), sa.port(), proto),
+            Ok(sa) => (sa.to_string(), sa, sa.port(), proto),
             Err(e) => {
                 log_error!(
                     "--there: failed to parse and resolve host:port or ip:port (got '{s}'): {e}"
@@ -187,14 +224,16 @@ pub fn parse_args() -> Config {
 
     // Required
     let mut listen_opt: Option<(String, SocketAddr, u16, SupportedProtocol)> = None;
-    let mut upstream_opt: Option<(String, u16, SupportedProtocol)> = None;
+    let mut upstream_opt: Option<(String, SocketAddr, u16, SupportedProtocol)> = None;
 
     // Optional (track presence to reject duplicates cleanly)
     let mut timeout_secs: Option<u64> = None;
     let mut on_timeout: Option<TimeoutAction> = None;
     let mut stats_interval_mins: Option<u32> = None;
     let mut max_payload: Option<usize> = None; // default 1500
+    let mut icmp_sync_pps: Option<u32> = None; // default 0 (disabled)
     let mut workers: Option<usize> = None; // default 1
+    let mut worker_flow_mode: Option<WorkerFlowMode> = None; // default shared-flow
     let mut reresolve_secs: Option<u64> = None; // 0 if None
     let mut reresolve_mode: Option<ReresolveMode> = None; // default upstream
 
@@ -246,15 +285,20 @@ pub fn parse_args() -> Config {
             "--max-payload" => {
                 let val = get_next_value(&mut args_iter, "--max-payload");
                 let parsed = parse_num::<usize>(&val, "--max-payload");
-                if parsed == 0 || parsed > MAX_WIRE_PAYLOAD {
+                if parsed > MAX_SAFE_UDP_IPV6_PAYLOAD {
                     log_error!(
-                        "--max-payload must be >= 1 and <= {} (requested {})",
-                        MAX_WIRE_PAYLOAD,
+                        "--max-payload must be <= {} (requested {})",
+                        MAX_SAFE_UDP_IPV6_PAYLOAD,
                         parsed
                     );
                     print_usage_and_exit(2)
                 }
                 set_once(&mut max_payload, parsed, "--max-payload");
+            }
+            "--icmp-sync-pps" => {
+                let val = get_next_value(&mut args_iter, "--icmp-sync-pps");
+                let parsed = parse_num::<u32>(&val, "--icmp-sync-pps");
+                set_once(&mut icmp_sync_pps, parsed, "--icmp-sync-pps");
             }
             "--workers" => {
                 let val = get_next_value(&mut args_iter, "--workers");
@@ -264,6 +308,14 @@ pub fn parse_args() -> Config {
                     print_usage_and_exit(2)
                 }
                 set_once(&mut workers, parsed, "--workers");
+            }
+            "--worker-flow-mode" => {
+                let val = get_next_value(&mut args_iter, "--worker-flow-mode");
+                let parsed = WorkerFlowMode::from_str(&val).unwrap_or_else(|| {
+                    log_error!("--worker-flow-mode must be shared-flow|single-flow (got '{val}')");
+                    print_usage_and_exit(2)
+                });
+                set_once(&mut worker_flow_mode, parsed, "--worker-flow-mode");
             }
             "--reresolve-secs" => {
                 let val = get_next_value(&mut args_iter, "--reresolve-secs");
@@ -324,7 +376,7 @@ pub fn parse_args() -> Config {
             print_usage_and_exit(2)
         }
     };
-    let (upstream_str, _upstream_port_id, upstream_proto) = match upstream_opt {
+    let (upstream_str, upstream_addr, _upstream_port_id, upstream_proto) = match upstream_opt {
         Some(t) => t,
         None => {
             log_error!("missing required flag: --there <protocol:upstream_host_or_ip:port>");
@@ -337,22 +389,49 @@ pub fn parse_args() -> Config {
     let on_timeout = on_timeout.unwrap_or(TimeoutAction::Drop);
     let stats_interval_mins = stats_interval_mins.unwrap_or(60);
     let max_payload = max_payload.unwrap_or(1500);
+    let icmp_sync_pps = icmp_sync_pps.unwrap_or(0);
     let workers = workers.unwrap_or(1);
+    let worker_flow_mode = worker_flow_mode.unwrap_or(WorkerFlowMode::SharedFlow);
     let reresolve_secs = reresolve_secs.unwrap_or(0);
     let reresolve_mode = reresolve_mode.unwrap_or(ReresolveMode::Upstream);
 
+    let absolute_max_payload = if listen_addr.is_ipv4() || upstream_addr.is_ipv4() {
+        if listen_proto == SupportedProtocol::ICMP || upstream_proto == SupportedProtocol::ICMP {
+            MAX_SAFE_ICMP_IPV4_PAYLOAD
+        } else {
+            MAX_SAFE_UDP_IPV4_PAYLOAD
+        }
+    } else if listen_proto == SupportedProtocol::ICMP || upstream_proto == SupportedProtocol::ICMP {
+        MAX_SAFE_ICMP_IPV6_PAYLOAD
+    } else {
+        MAX_SAFE_UDP_IPV6_PAYLOAD
+    };
+
+    if max_payload > absolute_max_payload {
+        log_error!(
+            "--max-payload {max_payload} exceeds the maximum supported by the selected protocols and address families ({absolute_max_payload})"
+        );
+        print_usage_and_exit(2);
+    }
+
+    if icmp_sync_pps > 0 && upstream_proto != SupportedProtocol::ICMP {
+        log_error!("--icmp-sync-pps requires --there ICMP:...");
+        print_usage_and_exit(2)
+    }
     Config {
         listen_addr,
         listen_port_id,
         listen_proto,
         listen_str,
         workers,
+        worker_flow_mode,
         upstream_proto,
         upstream_str,
         timeout_secs,
         on_timeout,
         stats_interval_mins,
         max_payload,
+        icmp_sync_pps,
         reresolve_secs,
         reresolve_mode,
         #[cfg(unix)]

@@ -5,12 +5,10 @@ mod core;
 #[path = "common/orchestrator.rs"]
 mod orchestrator;
 
-use crate::core::{
-    IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, bind_udp_client,
-    random_unprivileged_port, spawn_udp_echo_server, wait_for_stats_json_from,
-};
+use crate::core::{JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, wait_for_stats_json_from};
 use crate::orchestrator::{
-    ForwarderConfig, SocketMode, launch_forwarder, wait_for_child_exit_success,
+    ForwarderConfig, IpFamily, SocketMode, bind_udp_client, launch_forwarder,
+    random_unprivileged_port, spawn_udp_echo_server, wait_for_child_exit_success,
 };
 
 use std::io;
@@ -47,9 +45,11 @@ fn stress_test_ipv4(proto: &str) {
         here: "UDP:127.0.0.1:0".to_string(),
         there: format!("{proto}:{up_addr}"),
         timeout_action: "exit",
+        timeout_secs: None,
         max_payload: None,
         fast_stats: false,
         stats_interval_mins: Some(1),
+        icmp_sync_pps: None,
     });
 
     client_sock

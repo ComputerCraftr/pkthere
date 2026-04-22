@@ -1,21 +1,58 @@
+#[doc(hidden)]
+pub const fn log_dir_label(c2u: bool) -> &'static str {
+    if c2u { "c2u" } else { "u2c" }
+}
+
+#[macro_export]
+macro_rules! __log_emit_plain {
+    (stdout, $level:literal, $($arg:tt)*) => {
+        ::std::println!("[{}] {}", $level, ::std::format_args!($($arg)*));
+    };
+    (stderr, $level:literal, $($arg:tt)*) => {
+        ::std::eprintln!("[{}] {}", $level, ::std::format_args!($($arg)*));
+    };
+}
+
+#[macro_export]
+macro_rules! __log_emit_dir {
+    (stdout, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {
+        ::std::println!(
+            "[{}][worker {}][{}] {}",
+            $level,
+            $worker,
+            $crate::logging::log_dir_label($c2u),
+            ::std::format_args!($($arg)*)
+        );
+    };
+    (stderr, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {
+        ::std::eprintln!(
+            "[{}][worker {}][{}] {}",
+            $level,
+            $worker,
+            $crate::logging::log_dir_label($c2u),
+            ::std::format_args!($($arg)*)
+        );
+    };
+}
+
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
-        ::std::println!("[INFO] {}", ::std::format_args!($($arg)*));
+        $crate::__log_emit_plain!(stdout, "INFO", $($arg)*);
     };
 }
 
 #[macro_export]
 macro_rules! log_warn {
     ($($arg:tt)*) => {
-        ::std::eprintln!("[WARN] {}", ::std::format_args!($($arg)*));
+        $crate::__log_emit_plain!(stderr, "WARN", $($arg)*);
     };
 }
 
 #[macro_export]
 macro_rules! log_error {
     ($($arg:tt)*) => {
-        ::std::eprintln!("[ERROR] {}", ::std::format_args!($($arg)*));
+        $crate::__log_emit_plain!(stderr, "ERROR", $($arg)*);
     };
 }
 
@@ -23,7 +60,7 @@ macro_rules! log_error {
 macro_rules! log_debug {
     ($enabled:expr, $($arg:tt)*) => {
         if $enabled {
-            ::std::eprintln!("[DEBUG] {}", ::std::format_args!($($arg)*));
+            $crate::__log_emit_plain!(stderr, "DEBUG", $($arg)*);
         }
     };
 }
@@ -31,36 +68,21 @@ macro_rules! log_debug {
 #[macro_export]
 macro_rules! log_info_dir {
     ($worker:expr, $c2u:expr, $($arg:tt)*) => {
-        ::std::println!(
-            "[INFO][worker {}][{}] {}",
-            $worker,
-            if $c2u { "c2u" } else { "u2c" },
-            ::std::format_args!($($arg)*)
-        );
+        $crate::__log_emit_dir!(stdout, "INFO", $worker, $c2u, $($arg)*);
     };
 }
 
 #[macro_export]
 macro_rules! log_warn_dir {
     ($worker:expr, $c2u:expr, $($arg:tt)*) => {
-        ::std::eprintln!(
-            "[WARN][worker {}][{}] {}",
-            $worker,
-            if $c2u { "c2u" } else { "u2c" },
-            ::std::format_args!($($arg)*)
-        );
+        $crate::__log_emit_dir!(stderr, "WARN", $worker, $c2u, $($arg)*);
     };
 }
 
 #[macro_export]
 macro_rules! log_error_dir {
     ($worker:expr, $c2u:expr, $($arg:tt)*) => {
-        ::std::eprintln!(
-            "[ERROR][worker {}][{}] {}",
-            $worker,
-            if $c2u { "c2u" } else { "u2c" },
-            ::std::format_args!($($arg)*)
-        );
+        $crate::__log_emit_dir!(stderr, "ERROR", $worker, $c2u, $($arg)*);
     };
 }
 
@@ -68,25 +90,7 @@ macro_rules! log_error_dir {
 macro_rules! log_debug_dir {
     ($enabled:expr, $worker:expr, $c2u:expr, $($arg:tt)*) => {
         if $enabled {
-            ::std::eprintln!(
-                "[DEBUG][worker {}][{}] {}",
-                $worker,
-                if $c2u { "c2u" } else { "u2c" },
-                ::std::format_args!($($arg)*)
-            );
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! option_or_log_continue {
-    ($opt:expr, $log_macro:ident, $($args:tt)*) => {
-        match $opt {
-            Some(v) => v,
-            None => {
-                $log_macro!($($args)*);
-                continue;
-            }
+            $crate::__log_emit_dir!(stderr, "DEBUG", $worker, $c2u, $($arg)*);
         }
     };
 }

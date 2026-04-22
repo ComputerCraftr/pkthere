@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -106,6 +107,7 @@ fn resolve_app_bin_with(
 }
 
 /// Locate the pkthere test binary for the current cargo invocation.
+#[allow(dead_code)]
 pub fn find_app_bin() -> Option<String> {
     let env_map = env::vars().collect::<BTreeMap<_, _>>();
     let current_exe = env::current_exe().ok();

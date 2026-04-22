@@ -4,10 +4,12 @@ mod cli;
 mod net;
 mod stats;
 mod worker;
+mod worker_support;
 
-use cli::{Config, SupportedProtocol, TimeoutAction, parse_args};
+use cli::{Config, SupportedProtocol, TimeoutAction, WorkerFlowMode, parse_args};
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
+use net::sync_icmp::SharedSyncIcmpState;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
 use stats::Stats;
@@ -39,6 +41,7 @@ fn print_startup(cfg: &Config, sock_mgr: &SocketManager) {
         cfg.on_timeout
     );
     log_info!("Workers: {}", cfg.workers);
+    log_info!("Worker flow mode: {}", cfg.worker_flow_mode);
     log_info!("Re-resolve every: {}s (0=disabled)", cfg.reresolve_secs);
 }
 
@@ -107,7 +110,7 @@ fn main() -> io::Result<()> {
     let locked = Arc::new(AtomicBool::new(false));
     let last_seen_s = Arc::new(AtomicU64::new(0));
 
-    let stats = Arc::new(Stats::new());
+    let stats = Arc::new(Stats::with_worker_shards(worker_count));
     let exit_code_set = Arc::new(AtomicU32::new(0));
 
     // Graceful shutdown on Ctrl-C / SIGINT (and SIGTERM on Unix via ctrlc)
@@ -130,8 +133,14 @@ fn main() -> io::Result<()> {
 
     print_startup(&cfg, &sock_mgrs[0]);
 
+    let shared_sync_state = matches!(cfg.worker_flow_mode, WorkerFlowMode::SharedFlow)
+        .then(|| Arc::new(SharedSyncIcmpState::new(cfg.icmp_sync_pps)));
+
     for (idx, sock_mgr) in sock_mgrs.iter().enumerate() {
         let worker_base = idx * 2;
+        let sync_state = shared_sync_state
+            .clone()
+            .unwrap_or_else(|| Arc::new(SharedSyncIcmpState::new(cfg.icmp_sync_pps)));
         // Client -> Upstream
         {
             let cfg_a = Arc::clone(&cfg);
@@ -140,7 +149,8 @@ fn main() -> io::Result<()> {
             let worker_id = worker_base;
             let locked_a = Arc::clone(&locked);
             let last_seen_a = Arc::clone(&last_seen_s);
-            let stats_a = Arc::clone(&stats);
+            let stats_a = stats.shard(idx);
+            let sync_state_a = Arc::clone(&sync_state);
 
             thread::spawn(move || {
                 run_client_to_upstream_thread(
@@ -152,6 +162,7 @@ fn main() -> io::Result<()> {
                     &locked_a,
                     &last_seen_a,
                     &stats_a,
+                    &sync_state_a,
                 )
             });
         }
@@ -163,7 +174,8 @@ fn main() -> io::Result<()> {
             let worker_id = worker_base + 1;
             let locked_b = Arc::clone(&locked);
             let last_seen_b = Arc::clone(&last_seen_s);
-            let stats_b = Arc::clone(&stats);
+            let stats_b = stats.shard(idx);
+            let sync_state_b = Arc::clone(&sync_state);
 
             thread::spawn(move || {
                 run_upstream_to_client_thread(
@@ -174,6 +186,7 @@ fn main() -> io::Result<()> {
                     &locked_b,
                     &last_seen_b,
                     &stats_b,
+                    &sync_state_b,
                 )
             });
         }

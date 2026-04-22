@@ -1,159 +1,24 @@
-use crate::cli::{Config, SupportedProtocol, TimeoutAction};
-use crate::net::params::MAX_WIRE_PAYLOAD;
-use crate::net::payload::{handle_payload_result, send_payload, validate_payload};
-use crate::net::sock_mgr::{SocketHandles, SocketManager};
-use crate::stats::Stats;
-use socket2::{SockAddr, Type};
+use crate::cli::{Config, TimeoutAction};
+use crate::net::payload::{PayloadEvent, PayloadOrigin, send_payload, validate_payload};
+use crate::net::session::{counts_as_session_activity, handle_send_result};
+use crate::net::sock_mgr::SocketManager;
+use crate::net::sync_icmp::{
+    SharedSyncIcmpState, classify_u2c, prepare_send, remember_request_seq, reset_session,
+    sync_icmp_enabled,
+};
+use crate::stats::{StatsShard, StatsSink};
+use crate::worker_support::{
+    AlignedBuf, BestEffortPacer, BufferedSyncPayload, CachedClientState, as_uninit_mut,
+    buffer_sync_event, handle_c2u_keepalive, locked_client_matches, normalize_client_sockaddr,
+    sync_session_on_lock_transition, wait_socket_until_readable,
+};
+use socket2::SockAddr;
 
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
-
-#[inline]
-fn as_uninit_mut(buf: &mut [u8]) -> &mut [std::mem::MaybeUninit<u8>] {
-    // Safety: socket2::Socket::recv/recv_from promise not to write uninitialised bytes past what they return.
-    unsafe {
-        std::slice::from_raw_parts_mut(
-            buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
-            buf.len(),
-        )
-    }
-}
-
-#[inline]
-fn normalize_client_sockaddr(
-    src_sa: &SockAddr,
-    listen_proto: SupportedProtocol,
-    listen_port_id: u16,
-) -> Option<SocketAddr> {
-    let src = src_sa.as_socket()?;
-    if listen_proto == SupportedProtocol::ICMP {
-        let normalized = match src {
-            SocketAddr::V4(addr) => {
-                SocketAddr::V4(std::net::SocketAddrV4::new(*addr.ip(), listen_port_id))
-            }
-            SocketAddr::V6(addr) => SocketAddr::V6(std::net::SocketAddrV6::new(
-                *addr.ip(),
-                listen_port_id,
-                addr.flowinfo(),
-                addr.scope_id(),
-            )),
-        };
-        Some(normalized)
-    } else {
-        Some(src)
-    }
-}
-
-// Stack-resident, cacheline-aligned buffers
-#[repr(align(64))]
-struct AlignedBuf {
-    data: [u8; MAX_WIRE_PAYLOAD],
-}
-
-impl AlignedBuf {
-    const fn new() -> Self {
-        Self {
-            data: [0u8; MAX_WIRE_PAYLOAD],
-        }
-    }
-}
-
-struct CachedClientState {
-    c2u: bool,
-    worker_id: usize,
-    dest_sock_type: Type,
-    dest_sa: SockAddr,
-    dest_port_id: u16,
-    recv_port_id: u16,
-    log_handles: bool,
-}
-
-impl CachedClientState {
-    fn new(
-        c2u: bool,
-        worker_id: usize,
-        handles: &SocketHandles,
-        recv_port_id: u16,
-        log_handles: bool,
-    ) -> Self {
-        if c2u {
-            Self {
-                c2u,
-                worker_id,
-                dest_sock_type: handles.upstream_sock.r#type().unwrap_or(Type::RAW),
-                dest_sa: SockAddr::from(handles.upstream_addr),
-                dest_port_id: handles.upstream_addr.port(),
-                recv_port_id,
-                log_handles,
-            }
-        } else {
-            let (dest_sa, dest_port_id) = handles
-                .client_addr
-                .map(|addr| (SockAddr::from(addr), addr.port()))
-                .unwrap_or_else(|| {
-                    (
-                        SockAddr::from(SocketAddr::new([0, 0, 0, 0].into(), 0)),
-                        0u16,
-                    )
-                });
-            Self {
-                c2u,
-                worker_id,
-                dest_sock_type: handles.client_sock.r#type().unwrap_or(Type::RAW),
-                dest_sa,
-                dest_port_id,
-                recv_port_id,
-                log_handles,
-            }
-        }
-    }
-
-    fn refresh_from_handles(&mut self, handles: &SocketHandles) {
-        if self.c2u {
-            self.dest_sock_type = handles.upstream_sock.r#type().unwrap_or(Type::RAW);
-            self.dest_sa = SockAddr::from(handles.upstream_addr);
-            self.dest_port_id = handles.upstream_addr.port();
-        } else {
-            self.dest_sock_type = handles.client_sock.r#type().unwrap_or(Type::RAW);
-            (self.dest_sa, self.dest_port_id) = handles
-                .client_addr
-                .map(|addr| (SockAddr::from(addr), addr.port()))
-                .unwrap_or_else(|| (self.dest_sa.clone(), self.dest_port_id));
-            self.recv_port_id = handles.upstream_addr.port();
-        }
-    }
-
-    #[inline]
-    fn refresh_handles_and_cache(&mut self, sock_mgr: &SocketManager, handles: &mut SocketHandles) {
-        if handles.version != sock_mgr.get_version() {
-            let prev_ver = handles.version;
-            *handles = sock_mgr.refresh_handles();
-            self.refresh_from_handles(handles);
-            log_debug_dir!(
-                self.log_handles,
-                self.worker_id,
-                self.c2u,
-                "refresh_handles_and_cache: stale={}, new_ver={}, client_addr={:?}, client_connected={}, upstream_addr={}, upstream_connected={}",
-                prev_ver,
-                handles.version,
-                handles.client_addr,
-                handles.client_connected,
-                handles.upstream_addr,
-                handles.upstream_connected
-            );
-        }
-    }
-}
-
-#[inline]
-fn record_session_activity(t_start: Instant, t_recv: Instant, last_seen_s: &AtomicU64) {
-    let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
-    last_seen_s.store(last_seen, AtomOrdering::Relaxed);
-}
 
 pub fn run_reresolve_thread(
     sock_mgrs: &[Arc<SocketManager>],
@@ -186,8 +51,6 @@ pub fn run_watchdog_thread(
             let now_s = now.saturating_duration_since(t_start).as_secs();
             let last_s = last_seen_s.load(AtomOrdering::Relaxed);
 
-            // Invariant: once a client is locked, last_seen_s is set from the first accepted packet
-            // for that lock, even if the subsequent forward/send fails.
             if last_s != 0 && now_s.saturating_sub(last_s) >= cfg.timeout_secs {
                 match cfg.on_timeout {
                     TimeoutAction::Drop => {
@@ -240,12 +103,14 @@ pub fn run_upstream_to_client_thread(
     worker_id: usize,
     locked: &AtomicBool,
     last_seen_s: &AtomicU64,
-    stats: &Stats,
+    stats: &StatsShard,
+    sync_state: &SharedSyncIcmpState,
 ) {
     const C2U: bool = false;
     let mut buf = AlignedBuf::new();
-    // Cache upstream socket and destination; refresh only when version changes
     let mut handles = sock_mgr.refresh_handles();
+    let mut was_locked = false;
+    let mut sync_cache = sync_state.cache();
     let mut cache = CachedClientState::new(
         C2U,
         worker_id,
@@ -257,36 +122,69 @@ pub fn run_upstream_to_client_thread(
         match handles.upstream_sock.recv(as_uninit_mut(&mut buf.data)) {
             Ok(len) => {
                 let t_recv = Instant::now();
-
-                // Cheap hot-path check: refresh local handles only when version changes
                 cache.refresh_handles_and_cache(sock_mgr, &mut handles);
+                sync_session_on_lock_transition(
+                    &mut was_locked,
+                    locked.load(AtomOrdering::Relaxed),
+                    sync_state,
+                    &mut sync_cache,
+                );
 
                 if locked.load(AtomOrdering::Relaxed) {
-                    let validated = result_or_log_continue!(
-                        validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                    let event = result_or_log_continue!(
+                        validate_payload(
+                            C2U,
+                            cfg,
+                            stats,
+                            &buf.data[..len],
+                            cache.recv_port_id,
+                            PayloadOrigin::Wire,
+                        ),
                         log_debug_dir,
                         cfg.debug_log_drops,
                         worker_id,
                         C2U,
                         "validate_payload error: {}"
                     );
-                    let send_res = send_payload(
+                    let decision = result_or_log_continue!(
+                        classify_u2c(
+                            cfg,
+                            &event,
+                            PayloadOrigin::Wire,
+                            sync_state,
+                            &mut sync_cache
+                        ),
+                        log_debug_dir,
+                        cfg.debug_log_drops,
+                        worker_id,
                         C2U,
-                        &validated,
-                        &handles.client_sock,
-                        handles.client_connected,
-                        cache.dest_sock_type,
-                        &cache.dest_sa,
-                        cache.dest_port_id,
+                        "classify_u2c error: {}"
                     );
-                    record_session_activity(t_start, t_recv, last_seen_s);
-                    handle_payload_result(
+                    let wire = event.wire();
+                    let send_res = if decision.should_send() {
+                        send_payload(
+                            &handles.client_sock,
+                            handles.client_connected,
+                            cache.dest_sock_type,
+                            &cache.dest_sa,
+                            cache.dest_port_id,
+                            &event,
+                            C2U,
+                            prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                        )
+                    } else {
+                        Ok(true)
+                    };
+                    handle_send_result(
                         C2U,
                         worker_id,
+                        t_start,
                         t_recv,
                         cfg,
                         stats,
-                        &validated,
+                        last_seen_s,
+                        wire.len(),
+                        counts_as_session_activity(&event, decision.counts_as_payload()),
                         &send_res,
                         handles.client_connected,
                         &cache.dest_sa,
@@ -314,12 +212,22 @@ pub fn run_client_to_upstream_thread(
     worker_id: usize,
     locked: &AtomicBool,
     last_seen_s: &AtomicU64,
-    stats: &Stats,
+    stats: &StatsShard,
+    sync_state: &SharedSyncIcmpState,
 ) {
     const C2U: bool = true;
     let mut buf = AlignedBuf::new();
-    // Cache upstream socket and destination; refresh only when version changes
+    let sync_icmp_mode = sync_icmp_enabled(cfg);
+    let mut sync_pacer = sync_icmp_mode.then(|| {
+        BestEffortPacer::new(Duration::from_nanos(
+            (1_000_000_000u64 / u64::from(cfg.icmp_sync_pps)).max(1),
+        ))
+    });
+    let mut latest_sync_payload: Option<BufferedSyncPayload> = None;
+
     let mut handles = sock_mgr.refresh_handles();
+    let mut was_locked = false;
+    let mut sync_cache = sync_state.cache();
     let mut cache = CachedClientState::new(
         C2U,
         worker_id,
@@ -328,45 +236,206 @@ pub fn run_client_to_upstream_thread(
         cfg.debug_log_handles,
     );
     loop {
-        // Cheap hot-path check: only refresh when manager version changes
+        let locked_now = locked.load(AtomOrdering::Relaxed);
+        if !was_locked && locked_now {
+            if let Some(pacer) = sync_pacer.as_mut() {
+                pacer.reset();
+            }
+        }
+        sync_session_on_lock_transition(&mut was_locked, locked_now, sync_state, &mut sync_cache);
         cache.refresh_handles_and_cache(sock_mgr, &mut handles);
         if handles.client_connected {
-            // Connected fast path: only packets from the locked client are delivered
+            if sync_icmp_mode {
+                if !locked_now {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+
+                let pacer = sync_pacer
+                    .as_mut()
+                    .expect("sync pacing state must exist in sync mode");
+                let now = Instant::now();
+                if pacer.send_due(now) {
+                    let buffered_payload = latest_sync_payload.take();
+                    let synthetic_event;
+                    let event = if let Some(ref payload) = buffered_payload {
+                        payload.as_event()
+                    } else {
+                        synthetic_event = validate_payload(
+                            C2U,
+                            cfg,
+                            stats,
+                            &[],
+                            cache.recv_port_id,
+                            PayloadOrigin::SyntheticSyncKeepalive,
+                        )
+                        .unwrap_or_else(|e| {
+                            log_debug_dir!(
+                                cfg.debug_log_drops,
+                                worker_id,
+                                C2U,
+                                "validate_payload error: {}",
+                                e
+                            );
+                            unreachable!("synthetic sync keepalive validation must not fail")
+                        });
+                        synthetic_event
+                    };
+                    let wire = event.wire();
+                    let send_res = send_payload(
+                        &handles.upstream_sock,
+                        handles.upstream_connected,
+                        cache.dest_sock_type,
+                        &cache.dest_sa,
+                        cache.dest_port_id,
+                        &event,
+                        C2U,
+                        prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                    );
+                    handle_send_result(
+                        C2U,
+                        worker_id,
+                        t_start,
+                        now,
+                        cfg,
+                        stats,
+                        last_seen_s,
+                        wire.len(),
+                        counts_as_session_activity(&event, true),
+                        &send_res,
+                        handles.upstream_connected,
+                        &cache.dest_sa,
+                        None,
+                    );
+                    pacer.mark_sent(now);
+                    continue;
+                }
+
+                let readable =
+                    match wait_socket_until_readable(&handles.client_sock, pacer.poll_wait()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log_error_dir!(worker_id, C2U, "poll/read wait error: {}", e);
+                            stats.drop_err(C2U);
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    };
+                if !readable {
+                    continue;
+                }
+                match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
+                    Ok(len) => {
+                        latest_sync_payload = match validate_payload(
+                            C2U,
+                            cfg,
+                            stats,
+                            &buf.data[..len],
+                            cache.recv_port_id,
+                            PayloadOrigin::Wire,
+                        ) {
+                            Ok(event) => buffer_sync_event(
+                                worker_id,
+                                t_start,
+                                Instant::now(),
+                                cfg,
+                                stats,
+                                last_seen_s,
+                                &mut handles,
+                                sync_state,
+                                &mut sync_cache,
+                                None,
+                                event,
+                            ),
+                            Err(e) => {
+                                log_debug_dir!(
+                                    cfg.debug_log_drops,
+                                    worker_id,
+                                    C2U,
+                                    "validate_payload error: {}",
+                                    e
+                                );
+                                None
+                            }
+                        };
+                    }
+                    Err(ref e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut => {}
+                    Err(e) => {
+                        log_error_dir!(worker_id, C2U, "recv error: {}", e);
+                        stats.drop_err(C2U);
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                continue;
+            }
+
             match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
                 Ok(len) => {
                     let t_recv = Instant::now();
 
                     if locked.load(AtomOrdering::Relaxed) {
-                        let validated = result_or_log_continue!(
-                            validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                        let event = result_or_log_continue!(
+                            validate_payload(
+                                C2U,
+                                cfg,
+                                stats,
+                                &buf.data[..len],
+                                cache.recv_port_id,
+                                PayloadOrigin::Wire,
+                            ),
                             log_debug_dir,
                             cfg.debug_log_drops,
                             worker_id,
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let send_res = send_payload(
-                            C2U,
-                            &validated,
-                            &handles.upstream_sock,
-                            handles.upstream_connected,
-                            cache.dest_sock_type,
-                            &cache.dest_sa,
-                            cache.dest_port_id,
-                        );
-                        record_session_activity(t_start, t_recv, last_seen_s);
-                        handle_payload_result(
-                            C2U,
-                            worker_id,
-                            t_recv,
-                            cfg,
-                            stats,
-                            &validated,
-                            &send_res,
-                            handles.upstream_connected,
-                            &cache.dest_sa,
-                            None,
-                        );
+                        match event {
+                            PayloadEvent::UserData(ref wire) => {
+                                if wire.src_is_icmp {
+                                    remember_request_seq(sync_state, &mut sync_cache, &wire);
+                                }
+                                let send_res = send_payload(
+                                    &handles.upstream_sock,
+                                    handles.upstream_connected,
+                                    cache.dest_sock_type,
+                                    &cache.dest_sa,
+                                    cache.dest_port_id,
+                                    &event,
+                                    C2U,
+                                    prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                );
+                                handle_send_result(
+                                    C2U,
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    last_seen_s,
+                                    wire.len(),
+                                    counts_as_session_activity(&event, true),
+                                    &send_res,
+                                    handles.upstream_connected,
+                                    &cache.dest_sa,
+                                    None,
+                                );
+                            }
+                            PayloadEvent::SyncKeepalive(wire) => handle_c2u_keepalive(
+                                worker_id,
+                                t_start,
+                                t_recv,
+                                cfg,
+                                stats,
+                                last_seen_s,
+                                &mut handles,
+                                sync_state,
+                                &mut sync_cache,
+                                None,
+                                &wire,
+                            ),
+                        }
                     }
                 }
                 Err(ref e)
@@ -379,27 +448,160 @@ pub fn run_client_to_upstream_thread(
                 }
             }
         } else {
+            if sync_icmp_mode && locked_now {
+                let pacer = sync_pacer
+                    .as_mut()
+                    .expect("sync pacing state must exist in sync mode");
+                let now = Instant::now();
+                if pacer.send_due(now) {
+                    let buffered_payload = latest_sync_payload.take();
+                    let synthetic_event;
+                    let event = if let Some(ref payload) = buffered_payload {
+                        payload.as_event()
+                    } else {
+                        synthetic_event = validate_payload(
+                            C2U,
+                            cfg,
+                            stats,
+                            &[],
+                            cache.recv_port_id,
+                            PayloadOrigin::SyntheticSyncKeepalive,
+                        )
+                        .unwrap_or_else(|e| {
+                            log_debug_dir!(
+                                cfg.debug_log_drops,
+                                worker_id,
+                                C2U,
+                                "validate_payload error: {}",
+                                e
+                            );
+                            unreachable!("synthetic sync keepalive validation must not fail")
+                        });
+                        synthetic_event
+                    };
+                    let wire = event.wire();
+                    let send_res = send_payload(
+                        &handles.upstream_sock,
+                        handles.upstream_connected,
+                        cache.dest_sock_type,
+                        &cache.dest_sa,
+                        cache.dest_port_id,
+                        &event,
+                        C2U,
+                        prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                    );
+                    handle_send_result(
+                        C2U,
+                        worker_id,
+                        t_start,
+                        now,
+                        cfg,
+                        stats,
+                        last_seen_s,
+                        wire.len(),
+                        counts_as_session_activity(&event, true),
+                        &send_res,
+                        handles.upstream_connected,
+                        &cache.dest_sa,
+                        None,
+                    );
+                    pacer.mark_sent(now);
+                    continue;
+                }
+
+                let readable =
+                    match wait_socket_until_readable(&handles.client_sock, pacer.poll_wait()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log_error_dir!(worker_id, C2U, "poll/read wait error: {}", e);
+                            stats.drop_err(C2U);
+                            thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                    };
+                if !readable {
+                    continue;
+                }
+                match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
+                    Ok((len, src_sa)) => {
+                        let normalized_src = normalize_client_sockaddr(
+                            &src_sa,
+                            cfg.listen_proto,
+                            cfg.listen_port_id,
+                        );
+                        if locked_client_matches(normalized_src, handles.client_addr) {
+                            latest_sync_payload = match validate_payload(
+                                C2U,
+                                cfg,
+                                stats,
+                                &buf.data[..len],
+                                cache.recv_port_id,
+                                PayloadOrigin::Wire,
+                            ) {
+                                Ok(event) => buffer_sync_event(
+                                    worker_id,
+                                    t_start,
+                                    Instant::now(),
+                                    cfg,
+                                    stats,
+                                    last_seen_s,
+                                    &mut handles,
+                                    sync_state,
+                                    &mut sync_cache,
+                                    None,
+                                    event,
+                                ),
+                                Err(e) => {
+                                    log_debug_dir!(
+                                        cfg.debug_log_drops,
+                                        worker_id,
+                                        C2U,
+                                        "validate_payload error: {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            };
+                        }
+                    }
+                    Err(ref e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::TimedOut => {}
+                    Err(e) => {
+                        log_error_dir!(worker_id, C2U, "recv_from error: {}", e);
+                        stats.drop_err(C2U);
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                continue;
+            }
+
             match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
                 Ok((len, src_sa)) => {
                     let t_recv = Instant::now();
+                    let normalized_src =
+                        normalize_client_sockaddr(&src_sa, cfg.listen_proto, cfg.listen_port_id);
 
-                    // First lock: publish client and connect the socket for fast path
                     if !locked.load(AtomOrdering::Relaxed) {
-                        let src = option_or_log_continue!(
-                            normalize_client_sockaddr(
-                                &src_sa,
-                                cfg.listen_proto,
-                                cfg.listen_port_id
-                            ),
-                            log_warn_dir,
-                            worker_id,
-                            C2U,
-                            "recv_from client non-IP address family (ignored): {:?}",
-                            src_sa
-                        );
+                        let Some(src) = normalized_src else {
+                            log_warn_dir!(
+                                worker_id,
+                                C2U,
+                                "recv_from client non-IP address family (ignored): {:?}",
+                                src_sa
+                            );
+                            continue;
+                        };
 
-                        let validated = result_or_log_continue!(
-                            validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                        let event = result_or_log_continue!(
+                            validate_payload(
+                                C2U,
+                                cfg,
+                                stats,
+                                &buf.data[..len],
+                                cache.recv_port_id,
+                                PayloadOrigin::Wire,
+                            ),
                             log_debug_dir,
                             cfg.debug_log_drops,
                             worker_id,
@@ -407,8 +609,9 @@ pub fn run_client_to_upstream_thread(
                             "validate_payload error: {}"
                         );
 
-                        // Signal to other threads that a client is currently being locked
+                        reset_session(sync_state, &mut sync_cache);
                         locked.store(true, AtomOrdering::Relaxed);
+                        was_locked = true;
                         let src_sa_clean = SockAddr::from(src);
                         let addr_opt = Some(src);
 
@@ -423,7 +626,6 @@ pub fn run_client_to_upstream_thread(
                             log_info!("Locked to single client {} (connected)", src);
                         }
 
-                        // Publish lock state for this worker
                         handles.version = sock_mgr.set_client_addr_connected(
                             addr_opt,
                             handles.client_connected,
@@ -439,11 +641,8 @@ pub fn run_client_to_upstream_thread(
                             handles.version
                         );
 
-                        // Propagate client address to other workers and attempt send/recv before fallback.
-                        // Duplicate connect() may cause EADDRINUSE on the same 5-tuple across SO_REUSEPORT sockets.
                         for mgr in all_sock_mgrs {
                             if !std::ptr::eq(mgr.as_ref(), sock_mgr) {
-                                // Best effort
                                 let _ = mgr.set_client_sock_connected(
                                     addr_opt,
                                     handles.client_connected,
@@ -453,7 +652,6 @@ pub fn run_client_to_upstream_thread(
                             }
                         }
 
-                        // Only refresh upstream on initial lock; keep listener stable for the new client.
                         if let Ok(new_handles) = sock_mgr.reresolve(
                             cfg.reresolve_mode.allow_upstream(),
                             false,
@@ -463,67 +661,112 @@ pub fn run_client_to_upstream_thread(
                             cache.refresh_from_handles(&handles);
                         }
 
-                        // Forward the first packet from the new client
-                        let send_res = send_payload(
-                            C2U,
-                            &validated,
-                            &handles.upstream_sock,
-                            handles.upstream_connected,
-                            cache.dest_sock_type,
-                            &cache.dest_sa,
-                            cache.dest_port_id,
-                        );
-                        record_session_activity(t_start, t_recv, last_seen_s);
-                        handle_payload_result(
-                            C2U,
-                            worker_id,
-                            t_recv,
-                            cfg,
-                            stats,
-                            &validated,
-                            &send_res,
-                            handles.upstream_connected,
-                            &cache.dest_sa,
-                            None,
-                        );
-                    } else if normalize_client_sockaddr(
-                        &src_sa,
-                        cfg.listen_proto,
-                        cfg.listen_port_id,
-                    ) == handles.client_addr
-                        && handles.client_addr.is_some()
-                    {
-                        // Only forward packets from the locked client (recv_from may still deliver before connect succeeds)
-                        let validated = result_or_log_continue!(
-                            validate_payload(C2U, cfg, stats, &buf.data[..len], cache.recv_port_id),
+                        match event {
+                            PayloadEvent::UserData(ref wire) => {
+                                if wire.src_is_icmp {
+                                    remember_request_seq(sync_state, &mut sync_cache, &wire);
+                                }
+                                let send_res = send_payload(
+                                    &handles.upstream_sock,
+                                    handles.upstream_connected,
+                                    cache.dest_sock_type,
+                                    &cache.dest_sa,
+                                    cache.dest_port_id,
+                                    &event,
+                                    C2U,
+                                    prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                );
+                                handle_send_result(
+                                    C2U,
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    last_seen_s,
+                                    wire.len(),
+                                    counts_as_session_activity(&event, true),
+                                    &send_res,
+                                    handles.upstream_connected,
+                                    &cache.dest_sa,
+                                    None,
+                                );
+                            }
+                            PayloadEvent::SyncKeepalive(wire) => handle_c2u_keepalive(
+                                worker_id,
+                                t_start,
+                                t_recv,
+                                cfg,
+                                stats,
+                                last_seen_s,
+                                &mut handles,
+                                sync_state,
+                                &mut sync_cache,
+                                Some((src_sa_clean.clone(), src.port())),
+                                &wire,
+                            ),
+                        }
+                    } else if locked_client_matches(normalized_src, handles.client_addr) {
+                        let event = result_or_log_continue!(
+                            validate_payload(
+                                C2U,
+                                cfg,
+                                stats,
+                                &buf.data[..len],
+                                cache.recv_port_id,
+                                PayloadOrigin::Wire,
+                            ),
                             log_debug_dir,
                             cfg.debug_log_drops,
                             worker_id,
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let send_res = send_payload(
-                            C2U,
-                            &validated,
-                            &handles.upstream_sock,
-                            handles.upstream_connected,
-                            cache.dest_sock_type,
-                            &cache.dest_sa,
-                            cache.dest_port_id,
-                        );
-                        record_session_activity(t_start, t_recv, last_seen_s);
-                        handle_payload_result(
-                            C2U,
-                            worker_id,
-                            t_recv,
-                            cfg,
-                            stats,
-                            &validated,
-                            &send_res,
-                            handles.upstream_connected,
-                            &cache.dest_sa,
-                            None,
-                        );
+                        match event {
+                            PayloadEvent::UserData(ref wire) => {
+                                if wire.src_is_icmp {
+                                    remember_request_seq(sync_state, &mut sync_cache, &wire);
+                                }
+                                let send_res = send_payload(
+                                    &handles.upstream_sock,
+                                    handles.upstream_connected,
+                                    cache.dest_sock_type,
+                                    &cache.dest_sa,
+                                    cache.dest_port_id,
+                                    &event,
+                                    C2U,
+                                    prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                );
+                                handle_send_result(
+                                    C2U,
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    last_seen_s,
+                                    wire.len(),
+                                    counts_as_session_activity(&event, true),
+                                    &send_res,
+                                    handles.upstream_connected,
+                                    &cache.dest_sa,
+                                    None,
+                                );
+                            }
+                            PayloadEvent::SyncKeepalive(wire) => handle_c2u_keepalive(
+                                worker_id,
+                                t_start,
+                                t_recv,
+                                cfg,
+                                stats,
+                                last_seen_s,
+                                &mut handles,
+                                sync_state,
+                                &mut sync_cache,
+                                None,
+                                &wire,
+                            ),
+                        }
                     }
                 }
                 Err(ref e)
@@ -536,40 +779,5 @@ pub fn run_client_to_upstream_thread(
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::record_session_activity;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn record_session_activity_stores_elapsed_seconds() {
-        let last_seen_s = AtomicU64::new(0);
-        let t_start = Instant::now()
-            .checked_sub(Duration::from_secs(3))
-            .unwrap_or_else(Instant::now);
-        let t_recv = Instant::now();
-
-        record_session_activity(t_start, t_recv, &last_seen_s);
-
-        let recorded = last_seen_s.load(AtomOrdering::Relaxed);
-        assert!(recorded >= 1, "activity timestamp must be nonzero");
-        assert!(
-            recorded <= 4,
-            "activity timestamp should reflect recent elapsed seconds"
-        );
-    }
-
-    #[test]
-    fn record_session_activity_clamps_same_tick_to_one() {
-        let last_seen_s = AtomicU64::new(0);
-        let now = Instant::now();
-
-        record_session_activity(now, now, &last_seen_s);
-
-        assert_eq!(last_seen_s.load(AtomOrdering::Relaxed), 1);
     }
 }

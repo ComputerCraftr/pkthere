@@ -87,28 +87,8 @@ const fn fold32_16(mut sum: u32) -> u16 {
     sum as u16
 }
 
-/// Compute the Internet Checksum (RFC 1071) for ICMPv4 Echo header+payload.
-///
-/// The Internet checksum is a 1's-complement sum of 16-bit words in network byte
-/// order (big-endian), with end-around carry, and then bitwise complemented.
-///
-/// Implementation notes:
-///   * We use `wide::u32x16` to process 64-byte chunks as 16 lanes of `u32` (4 bytes per lane).
-///     For a lane containing bytes `[b0,b1,b2,b3]` in memory, the RFC1071 contribution is:
-///       `(b0<<8)+b1 + (b2<<8)+b3`
-///   * On little-endian, the `u32` value is `v = b0 + (b1<<8) + (b2<<16) + (b3<<24)`.
-///     Swapping bytes within each 16-bit halfword yields `[b1,b0,b3,b2]`, so the low 16 bits
-///     become `(b0<<8)+b1` and the high 16 bits become `(b2<<8)+b3`. The per-lane contribution is:
-///       `(swapped & 0xFFFF) + (swapped >> 16)`
-///   * Big-endian hosts already match wire order, so we can split the 16-bit halves directly.
-///
-/// Uses a scalar fast path for small payloads and a wide SIMD path for medium/large payloads.
-/// All casting is size-preserving and safe.
-#[inline]
-pub(crate) fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
-    // Use a u32 scalar accumulator for MAX_WIRE_PAYLOAD so we never rely on overflow before folding.
-    let mut sum = csum_icmp_echo_hdr(hdr);
-
+#[inline(always)]
+fn csum_slice(data: &[u8]) -> u32 {
     // SIMD over 64-byte chunks (16 u32 lanes per iteration).
     let (head, aligned, tail) = pod_align_to::<u8, u32x16>(data);
 
@@ -182,12 +162,41 @@ pub(crate) fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
     // Handle the remaining bytes (both prefix and suffix) scalarly.
     let scalar_head = csum_bytes(head);
     let scalar_tail = csum_bytes(tail);
-    let scalar = scalar_head + scalar_tail;
+    res + scalar_head + scalar_tail
+}
 
-    // Add low/high 32-bit halves into the scalar sum.
-    sum += res + scalar;
+/// Compute the Internet Checksum (RFC 1071) for ICMPv4 Echo header+payload.
+///
+/// The Internet checksum is a 1's-complement sum of 16-bit words in network byte
+/// order (big-endian), with end-around carry, and then bitwise complemented.
+///
+/// Implementation notes:
+///   * We use `wide::u32x16` to process 64-byte chunks as 16 lanes of `u32` (4 bytes per lane).
+///     For a lane containing bytes `[b0,b1,b2,b3]` in memory, the RFC1071 contribution is:
+///       `(b0<<8)+b1 + (b2<<8)+b3`
+///   * On little-endian, the `u32` value is `v = b0 + (b1<<8) + (b2<<16) + (b3<<24)`.
+///     Swapping bytes within each 16-bit halfword yields `[b1,b0,b3,b2]`, so the low 16 bits
+///     become `(b0<<8)+b1` and the high 16 bits become `(b2<<8)+b3`. The per-lane contribution is:
+///       `(swapped & 0xFFFF) + (swapped >> 16)`
+///   * Big-endian hosts already match wire order, so we can split the 16-bit halves directly.
+///
+/// Uses a scalar fast path for small payloads and a wide SIMD path for medium/large payloads.
+/// All casting is size-preserving and safe.
+#[inline]
+pub(crate) fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
+    // Use a u32 scalar accumulator for MAX_WIRE_PAYLOAD so we never rely on overflow before folding.
+    let sum = csum_icmp_echo_hdr(hdr) + csum_slice(data);
+    !(fold32_16(sum))
+}
 
-    // Final 1's-complement fold down to 16 bits.
+#[inline]
+pub(crate) fn checksum16_parts(hdr: &[u8; 8], prefix: &[u8], data: &[u8]) -> u16 {
+    let mut data_sum = fold32_16(csum_slice(data));
+    if prefix.len() % 2 != 0 {
+        data_sum = data_sum.swap_bytes();
+    }
+
+    let sum = csum_icmp_echo_hdr(hdr) + csum_bytes(prefix) + (data_sum as u32);
     !(fold32_16(sum))
 }
 
@@ -200,6 +209,57 @@ mod tests {
         let a = csum_icmp_echo_hdr(hdr);
         let b = csum_bytes(data);
         !(fold32_16(a + b))
+    }
+
+    fn reference_checksum_parts(hdr: &[u8; 8], prefix: &[u8], data: &[u8]) -> u16 {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(data);
+        reference_checksum(hdr, &buf)
+    }
+
+    #[test]
+    fn checksum16_parts_matches_joined_checksum16() {
+        let hdr = [8, 0, 0, 0, 0x11, 0x22, 0x33, 0x44];
+        let prefix = [0xAA];
+        let data = [0xBB, 0xCC, 0xDD];
+
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&prefix);
+        joined.extend_from_slice(&data);
+
+        let split_res = checksum16_parts(&hdr, &prefix, &data);
+        let joined_res = checksum16(&hdr, &joined);
+
+        assert_eq!(
+            split_res, joined_res,
+            "Split checksum must match joined checksum"
+        );
+    }
+
+    #[test]
+    fn checksum16_parts_matches_reference() {
+        let hdr = [8, 0, 0, 0, 0x12, 0x34, 0x56, 0x78];
+        let payloads = [
+            vec![],
+            vec![1],
+            vec![1, 2],
+            vec![1, 2, 3],
+            (0..100).map(|i| i as u8).collect(),
+        ];
+        let prefixes = [vec![], vec![0xAA], vec![0xAA, 0xBB], vec![0xAA, 0xBB, 0xCC]];
+
+        for prefix in &prefixes {
+            for data in &payloads {
+                assert_eq!(
+                    checksum16_parts(&hdr, prefix, data),
+                    reference_checksum_parts(&hdr, prefix, data),
+                    "failed for prefix len {} data len {}",
+                    prefix.len(),
+                    data.len()
+                );
+            }
+        }
     }
 
     #[test]

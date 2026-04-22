@@ -2,35 +2,326 @@
 mod app_bin;
 #[path = "common/core.rs"]
 mod core;
-#[path = "common/matrix.rs"]
-mod matrix;
 #[path = "common/orchestrator.rs"]
 mod orchestrator;
-#[path = "common/runtime_asserts.rs"]
-mod runtime_asserts;
-
-use crate::core::{
-    IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, bind_udp_client,
-    random_unprivileged_port, spawn_udp_echo_server, wait_for_stats_json_from,
-};
-use crate::matrix::{
-    IPV4_ONLY_FAMILIES, MatrixCase, SOCKET_MODES, bind_client_or_skip, run_matrix_cases,
-    spawn_echo_or_skip,
-};
-use crate::orchestrator::{ForwarderConfig, launch_forwarder, wait_for_child_exit_success};
-use crate::runtime_asserts::{
-    CLIENT_WAIT_MS, json_addr, send_until_locked, wait_for_locked_client_from,
+use crate::core::{JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, wait_for_stats_json_from};
+use crate::orchestrator::{
+    CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, SOCKET_MODES,
+    bind_client_or_skip, bind_udp_client, json_addr, launch_forwarder, random_unprivileged_port,
+    run_matrix_cases, send_until_locked, spawn_echo_or_skip, spawn_udp_echo_server,
+    try_launch_forwarder, wait_for_child_exit_success, wait_for_locked_client_from,
 };
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use crate::runtime_asserts::{expect_no_echo, wait_for_stats_matching};
+use crate::orchestrator::{expect_no_echo, wait_for_stats_matching};
 
 use std::io::ErrorKind;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[test]
+fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
+    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
+    let (up_addr, _up_thread) = IpFamily::V4
+        .spawn_echo()
+        .expect("IPv4 loopback upstream bind");
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: String::from("UDP:127.0.0.1:0"),
+        there: format!("ICMP:{up_addr}"),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: Some(5),
+    });
+    client_sock
+        .connect(session.listen_addr)
+        .expect("connect to forwarder (sync keepalive)");
+
+    client_sock
+        .send(b"x")
+        .expect("send initial payload to establish lock");
+    let mut buf = [0u8; 2048];
+    let n = client_sock
+        .recv(&mut buf)
+        .expect("recv initial sync reply from forwarder");
+    assert_eq!(n, 1, "expected 1-byte echoed payload");
+    assert_eq!(&buf[..n], b"x", "expected exact echoed payload");
+
+    let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(2))
+        .expect("did not see stats JSON line");
+    let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap_or(0);
+    let c2u_bytes = stats["c2u_bytes"].as_u64().unwrap_or(0);
+    let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap_or(0);
+    let u2c_bytes = stats["u2c_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        c2u_pkts >= 1,
+        "expected at least one c2u packet recorded in sync mode, got {}",
+        c2u_pkts
+    );
+    assert_eq!(
+        c2u_bytes, 1,
+        "expected exactly one forwarded c2u payload byte"
+    );
+    assert!(
+        u2c_pkts >= 1,
+        "expected at least one u2c packet recorded in sync mode, got {}",
+        u2c_pkts
+    );
+    assert_eq!(
+        u2c_bytes, 1,
+        "expected exactly one forwarded u2c payload byte"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[test]
+fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
+    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
+    let (up_addr, _up_thread) = IpFamily::V4
+        .spawn_echo()
+        .expect("IPv4 loopback upstream bind");
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: String::from("UDP:127.0.0.1:0"),
+        there: format!("ICMP:{up_addr}"),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: Some(2),
+    });
+    client_sock
+        .connect(session.listen_addr)
+        .expect("connect to forwarder (sync timeout)");
+
+    let payload = b"sync-timeout-check";
+    client_sock
+        .send(payload)
+        .expect("send initial payload to establish lock");
+
+    client_sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("set read timeout for sync flow");
+
+    let mut saw_echo = false;
+    let mut saw_zero_len_udp_reply = false;
+
+    let recv_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < recv_deadline {
+        let mut buf = [0u8; 2048];
+        match client_sock.recv(&mut buf) {
+            Ok(0) => saw_zero_len_udp_reply = true,
+            Ok(n) => {
+                if &buf[..n] == payload {
+                    saw_echo = true;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(e) => panic!("recv sync flow packet: {e}"),
+        }
+    }
+
+    assert!(saw_echo, "expected to receive echoed non-empty payload");
+    assert!(
+        !saw_zero_len_udp_reply,
+        "pkthere must never emit zero-length UDP packets"
+    );
+
+    let exit_deadline = Instant::now() + Duration::from_secs(12);
+    let status = loop {
+        match session.child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= exit_deadline {
+                    panic!("forwarder did not exit on timeout while keepalives were active");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("wait error: {e}"),
+        }
+    };
+
+    assert!(status.success(), "forwarder did not exit cleanly: {status}");
+
+    let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(1))
+        .expect("did not see stats JSON line after timeout exit");
+    let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap_or(0);
+    let c2u_bytes = stats["c2u_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        c2u_pkts >= 2,
+        "expected at least one successful keepalive in addition to initial payload; c2u_pkts={}",
+        c2u_pkts,
+    );
+    assert_eq!(
+        c2u_bytes,
+        payload.len() as u64,
+        "expected keepalives to be zero-length so c2u bytes stay at initial payload size"
+    );
+    let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap_or(0);
+    let u2c_bytes = stats["u2c_bytes"].as_u64().unwrap_or(0);
+    assert!(
+        u2c_pkts >= 1 && u2c_bytes == payload.len() as u64,
+        "u2c bytes should only contain echoed non-empty payload"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[test]
+fn zero_len_udp_client_payload_round_trips_over_icmp() {
+    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
+    let (up_addr, _up_thread) = IpFamily::V4
+        .spawn_echo()
+        .expect("IPv4 loopback upstream bind");
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: String::from("UDP:127.0.0.1:0"),
+        there: format!("ICMP:{up_addr}"),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+    });
+    client_sock
+        .connect(session.listen_addr)
+        .expect("connect to forwarder");
+    client_sock
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .expect("set read timeout");
+
+    client_sock
+        .send(&[])
+        .expect("send zero-length UDP payload through ICMP hop");
+
+    let mut buf = [0u8; 32];
+    match client_sock.recv(&mut buf) {
+        Ok(0) => {}
+        Ok(n) => panic!("expected zero-length UDP echo, got {n} bytes"),
+        Err(e) => panic!("unexpected recv error: {e}"),
+    }
+
+    let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(2))
+        .expect("did not see stats JSON line");
+    assert_eq!(stats["c2u_drops_oversize"].as_u64().unwrap_or(0), 0);
+    assert!(stats["c2u_pkts"].as_u64().unwrap_or(0) >= 1);
+    assert!(stats["u2c_pkts"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(stats["c2u_bytes"].as_u64().unwrap_or(0), 0);
+    assert_eq!(stats["u2c_bytes"].as_u64().unwrap_or(0), 0);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[test]
+fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
+    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
+    let (udp_up_addr, _udp_up_thread) = IpFamily::V4
+        .spawn_echo()
+        .expect("IPv4 loopback upstream bind");
+    let icmp_port_3 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 3");
+    let mut icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
+    while icmp_port_2 == icmp_port_3 {
+        icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("distinct ICMP listen id 2");
+    }
+
+    let _node3 = match try_launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: format!("ICMP:127.0.0.1:{icmp_port_3}"),
+        there: format!("UDP:{udp_up_addr}"),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+    }) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("skipping multihop ICMP bridge test: cannot launch ICMP endpoint node: {e}");
+            return;
+        }
+    };
+    let _node2 = match try_launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: format!("ICMP:127.0.0.1:{icmp_port_2}"),
+        there: format!("ICMP:127.0.0.1:{icmp_port_3}"),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: Some(5),
+    }) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!(
+                "skipping multihop ICMP bridge test: cannot launch pure ICMP middle node: {e}"
+            );
+            return;
+        }
+    };
+    let mut node1 = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: String::from("UDP:127.0.0.1:0"),
+        there: format!("ICMP:127.0.0.1:{icmp_port_2}"),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: Some(5),
+    });
+    client_sock
+        .connect(node1.listen_addr)
+        .expect("connect client to first forwarder");
+
+    let payload = b"multihop-icmp-bridge";
+    client_sock.send(payload).expect("send multihop payload");
+    let mut buf = [0u8; 2048];
+    let n = client_sock.recv(&mut buf).expect("recv multihop reply");
+    assert_eq!(&buf[..n], payload);
+
+    client_sock
+        .send(&[])
+        .expect("send zero-length multihop payload");
+    let n = client_sock
+        .recv(&mut buf)
+        .expect("recv multihop zero-length reply");
+    assert_eq!(
+        n, 0,
+        "expected zero-length UDP reply through multihop ICMP bridge"
+    );
+
+    client_sock
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("set read timeout");
+    match client_sock.recv(&mut buf) {
+        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+        Ok(n) => panic!("expected no extra keepalive UDP packet, got {n} bytes"),
+        Err(e) => panic!("unexpected recv error: {e}"),
+    }
+
+    let stats = wait_for_stats_json_from(&mut node1.out, Duration::from_secs(2))
+        .expect("did not see stats JSON line");
+    assert_eq!(
+        stats["c2u_bytes"].as_u64().unwrap_or(0),
+        payload.len() as u64
+    );
+    assert_eq!(
+        stats["u2c_bytes"].as_u64().unwrap_or(0),
+        payload.len() as u64
+    );
+    assert!(stats["c2u_pkts"].as_u64().unwrap_or(0) >= 2);
+    assert!(stats["u2c_pkts"].as_u64().unwrap_or(0) >= 2);
+}
 
 #[test]
 fn enforce_max_payload_all() {
     for (family, max_payload, recv_buf_len) in [
+        (IpFamily::V4, 0usize, 2048usize),
         (IpFamily::V4, 548usize, 2048usize),
         (IpFamily::V6, 1232usize, 4096usize),
     ] {
@@ -53,9 +344,11 @@ fn run_enforce_max_payload(case: MatrixCase<'_>, max_payload: usize, recv_buf_le
         here: case.family.listen_arg().to_string(),
         there: format!("{}:{up_addr}", case.proto),
         timeout_action: "exit",
+        timeout_secs: None,
         max_payload: Some(max_payload),
         fast_stats: false,
         stats_interval_mins: None,
+        icmp_sync_pps: None,
     });
 
     client_sock
@@ -116,9 +409,11 @@ fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
         here: case.family.listen_arg().to_string(),
         there: format!("{}:{up_addr}", case.proto),
         timeout_action: "exit",
+        timeout_secs: None,
         max_payload: None,
         fast_stats: false,
         stats_interval_mins: None,
+        icmp_sync_pps: None,
     });
 
     client_sock
@@ -217,9 +512,11 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
         here: format!("UDP:127.0.0.1:{here_port}"),
         there: format!("{}:{up_addr}", case.proto),
         timeout_action: "drop",
+        timeout_secs: None,
         max_payload: None,
         fast_stats: true,
         stats_interval_mins: None,
+        icmp_sync_pps: None,
     });
 
     client_a
@@ -318,9 +615,11 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase<'_>) {
         here: format!("UDP:127.0.0.1:{here_port}"),
         there: format!("UDP:127.0.0.1:{dead_upstream_port}"),
         timeout_action: "drop",
+        timeout_secs: None,
         max_payload: None,
         fast_stats: true,
         stats_interval_mins: None,
+        icmp_sync_pps: None,
     });
 
     client_a
