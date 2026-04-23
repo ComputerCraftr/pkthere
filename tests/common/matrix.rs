@@ -1,5 +1,8 @@
-use crate::core::{IpFamily, bind_udp_client, spawn_udp_echo_server};
-use crate::orchestrator::SocketMode;
+pub use crate::core::{
+    IpFamily, bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg,
+    localhost_addr, random_unprivileged_port, spawn_udp_echo_server,
+};
+use crate::orchestrator::forwarder::SocketMode;
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -44,6 +47,12 @@ pub fn run_matrix_cases<'a>(
 ) {
     for &family in families {
         for &proto in protos {
+            if proto == "ICMP"
+                && crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
+                && !crate::orchestrator::raw_icmp_test_supported()
+            {
+                continue;
+            }
             for &mode in modes {
                 run(MatrixCase {
                     family,

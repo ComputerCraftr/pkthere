@@ -1,4 +1,4 @@
-use crate::cli::{Config, SupportedProtocol};
+use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::net::payload::{PayloadEvent, PayloadOrigin, WirePayload};
 
 use std::io;
@@ -110,7 +110,7 @@ impl SyncIcmpCache {
 }
 
 #[inline]
-pub(crate) fn sync_icmp_enabled(cfg: &Config) -> bool {
+pub(crate) fn sync_icmp_enabled(cfg: &RuntimeConfig) -> bool {
     cfg.icmp_sync_pps > 0 && cfg.upstream_proto == SupportedProtocol::ICMP
 }
 
@@ -158,7 +158,7 @@ pub(crate) fn remember_request_seq(
 }
 
 pub(crate) fn classify_u2c(
-    cfg: &Config,
+    cfg: &RuntimeConfig,
     event: &PayloadEvent<'_>,
     origin: PayloadOrigin,
     shared: &SharedSyncIcmpState,
@@ -228,7 +228,7 @@ pub(crate) fn classify_u2c(
 }
 
 pub(crate) fn classify_c2u_keepalive(
-    cfg: &Config,
+    cfg: &RuntimeConfig,
     wire: &WirePayload<'_>,
     shared: &SharedSyncIcmpState,
     cache: &mut SyncIcmpCache,
@@ -281,21 +281,30 @@ pub(crate) fn prepare_send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{ReresolveMode, TimeoutAction};
+    use crate::cli::{DebugBehavior, DebugLogs, ReresolveMode, TimeoutAction};
+    use crate::net::params::CanonicalAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::thread;
 
     static SYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn test_config() -> Config {
-        Config {
-            listen_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
-            listen_port_id: 1234,
+    fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            listen: CanonicalAddr::new(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
+                1234,
+            ),
+            listen_bind_is_dynamic: false,
             listen_proto: SupportedProtocol::UDP,
+            listen_icmp_mode: crate::cli::IcmpListenMode::FixedId,
             listen_str: String::from("test-listen"),
             workers: 1,
             worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,
+            upstream: CanonicalAddr::new(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2222)),
+                2222,
+            ),
             upstream_proto: SupportedProtocol::ICMP,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,
@@ -309,16 +318,15 @@ mod tests {
             run_as_user: None,
             #[cfg(unix)]
             run_as_group: None,
-            debug_no_connect: false,
-            debug_log_drops: false,
-            debug_log_handles: false,
-            debug_fast_stats: false,
+            debug_behavior: DebugBehavior::default(),
+            debug_logs: DebugLogs::default(),
         }
     }
 
     fn test_wire<'a>(payload: &'a [u8], seq: u16, dst_proto: SupportedProtocol) -> WirePayload<'a> {
         WirePayload {
             src_is_icmp: true,
+            src_ident: 0,
             src_seq: seq,
             dst_proto,
             payload,
@@ -524,7 +532,7 @@ mod tests {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.listen_proto = SupportedProtocol::ICMP;
-        cfg.listen_port_id = 2222;
+        cfg.listen.id = 2222;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
         shared.latest.seq.store(5, AtomOrdering::Relaxed);

@@ -1,5 +1,8 @@
+use crate::flow_state::FlowRuntimeState;
 use crate::net::sock_mgr::SocketManager;
+use crate::stats_support::{EWMA_LN_BETA, MAINT_TICK_MS};
 use serde_json::json;
+use socket2::Type;
 
 use std::io::Write;
 use std::process;
@@ -7,9 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomOrderi
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-
-// EWMA decay constant: ln(beta) where beta = 2^(-1/H) and H is half-life in samples.
-const EWMA_LN_BETA: f64 = -std::f64::consts::LN_2 / 200_000.0; // H = 200k
 
 pub(crate) trait StatsSink {
     fn send_add(&self, c2u: bool, bytes: u64, start: Instant, end: Instant);
@@ -156,8 +156,8 @@ impl Stats {
 
     fn print_snapshot(
         &self,
-        sock_mgr: &SocketManager,
-        locked: &AtomicBool,
+        sock_mgrs: &[Arc<SocketManager>],
+        flow_states: &[Arc<FlowRuntimeState>],
         c2u_ewma_ns: u64,
         u2c_ewma_ns: u64,
     ) {
@@ -177,22 +177,47 @@ impl Stats {
         let u2c_us_ewma = u2c_ewma_ns / 1000;
         let c2u_us_max = snap.c2u_lat_max_ns / 1000;
         let u2c_us_max = snap.u2c_lat_max_ns / 1000;
-        let locked = locked.load(AtomOrdering::Relaxed);
-        let (client_addr_opt, _, client_proto) = {
-            let res = sock_mgr.get_client_dest();
-            (if locked { res.0 } else { None }, res.1, res.2)
-        };
-        let client_addr = client_addr_opt
-            .map(|x| x.to_string())
-            .unwrap_or_else(|| "null".to_string());
-        let (upstream_addr, _, upstream_proto) = sock_mgr.get_upstream_dest();
+        let worker_flows: Vec<_> = sock_mgrs
+            .iter()
+            .zip(flow_states.iter())
+            .enumerate()
+            .map(|(worker_pair, (sock_mgr, state))| {
+                let snapshot = sock_mgr.snapshot_state();
+                let locked = state.is_locked();
+                let client_sock_type = match snapshot.listen_sock_type {
+                    Type::RAW => "RAW",
+                    Type::DGRAM => "DGRAM",
+                    _ => "OTHER",
+                };
+                let upstream_sock_type = match snapshot.upstream_sock_type {
+                    Type::RAW => "RAW",
+                    Type::DGRAM => "DGRAM",
+                    _ => "OTHER",
+                };
+                json!({
+                    "worker_pair": worker_pair,
+                    "locked": locked,
+                    "client_proto": snapshot.client_proto.to_str(),
+                    "client_sock_type": client_sock_type,
+                    "client_connected": if locked { snapshot.client_connected } else { false },
+                    "flow_key": if locked { snapshot.locked_flow.map(|key| key.to_string()) } else { None::<String> },
+                    "client_addr": if locked { snapshot.locked_flow.map(|key| key.display_addr().to_string()) } else { None::<String> },
+                    "client_canonical": if locked { snapshot.client_peer.map(|addr| addr.to_string()) } else { None::<String> },
+                    "listen_canonical": snapshot.listen.to_string(),
+                    "upstream_canonical": snapshot.upstream.to_string(),
+                    "upstream_connected": snapshot.upstream_connected,
+                    "upstream_local_canonical": snapshot.upstream_local.to_string(),
+                    "upstream_proto": snapshot.upstream_proto.to_str(),
+                    "upstream_sock_type": upstream_sock_type,
+                })
+            })
+            .collect();
+        let locked_worker_pairs = flow_states.iter().filter(|state| state.is_locked()).count();
         let line = json!({
             "uptime_s": uptime,
-            "locked": locked,
-            "client_addr": client_addr,
-            "client_proto": client_proto.to_str(),
-            "upstream_addr": upstream_addr,
-            "upstream_proto": upstream_proto.to_str(),
+            "locked": locked_worker_pairs > 0,
+            "locked_worker_pairs": locked_worker_pairs,
+            "worker_flows": worker_flows,
             "c2u_pkts": snap.c2u_pkts,
             "c2u_bytes": snap.c2u_bytes,
             "c2u_bytes_max": snap.c2u_bytes_max,
@@ -215,8 +240,8 @@ impl Stats {
 
     pub fn spawn_stats_printer(
         self: &Arc<Self>,
-        sock_mgr: Arc<SocketManager>,
-        locked: Arc<AtomicBool>,
+        sock_mgrs: Vec<Arc<SocketManager>>,
+        flow_states: Vec<Arc<FlowRuntimeState>>,
         start: Instant,
         every_secs: u64,
         exit_code_set: Arc<AtomicU32>,
@@ -232,7 +257,6 @@ impl Stats {
         }
         let _ = stats.start.set(start);
         thread::spawn(move || {
-            const MAINT_TICK_MS: u64 = 250;
             let mut prev = stats.load_snapshot();
             let mut c2u_ewma_ns = 0u64;
             let mut u2c_ewma_ns = 0u64;
@@ -256,7 +280,7 @@ impl Stats {
 
                 let now = Instant::now();
                 if now >= next_print_at {
-                    stats.print_snapshot(&sock_mgr, &locked, c2u_ewma_ns, u2c_ewma_ns);
+                    stats.print_snapshot(&sock_mgrs, &flow_states, c2u_ewma_ns, u2c_ewma_ns);
                     next_print_at += print_period;
                     if next_print_at <= now {
                         next_print_at = now + print_period;
@@ -265,7 +289,7 @@ impl Stats {
 
                 let exit = exit_code_set.load(AtomOrdering::Relaxed);
                 if exit >> 31 == 1 {
-                    stats.print_snapshot(&sock_mgr, &locked, c2u_ewma_ns, u2c_ewma_ns);
+                    stats.print_snapshot(&sock_mgrs, &flow_states, c2u_ewma_ns, u2c_ewma_ns);
                     process::exit((exit & 0xFF) as i32);
                 }
 

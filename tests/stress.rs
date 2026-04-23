@@ -5,14 +5,14 @@ mod core;
 #[path = "common/orchestrator.rs"]
 mod orchestrator;
 
-use crate::core::{JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, wait_for_stats_json_from};
+use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    ForwarderConfig, IpFamily, SocketMode, bind_udp_client, launch_forwarder,
-    random_unprivileged_port, spawn_udp_echo_server, wait_for_child_exit_success,
+    ForwarderConfig, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, SocketMode,
+    bind_udp_client, default_test_upstream_arg, launch_forwarder, localhost_addr,
+    spawn_udp_echo_server, wait_for_child_exit_success,
 };
 
 use std::io;
-use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -34,16 +34,13 @@ fn stress_test_ipv4(proto: &str) {
             .expect("IPv4 echo server could not bind")
             .0
     } else {
-        let ident = random_unprivileged_port(IpFamily::V4).expect("random ICMP identifier");
-        format!("127.0.0.1:{ident}")
-            .parse::<SocketAddr>()
-            .expect("IPv4 socket address could not be parsed")
+        localhost_addr(IpFamily::V4, 0)
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: SocketMode::Connected,
-        here: "UDP:127.0.0.1:0".to_string(),
-        there: format!("{proto}:{up_addr}"),
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: default_test_upstream_arg(proto, up_addr),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -71,13 +68,13 @@ fn stress_test_ipv4(proto: &str) {
         while Instant::now() < end {
             match recv_sock.recv(&mut buf) {
                 Ok(_) => rcvd += 1,
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    continue;
+                Err(e) => {
+                    let kind = e.kind();
+                    if kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::TimedOut {
+                        continue;
+                    }
+                    panic!("recv from forwarder (IPv4): {e}");
                 }
-                Err(e) => panic!("recv from forwarder (IPv4): {e}"),
             }
         }
         rcvd

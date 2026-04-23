@@ -1,7 +1,11 @@
+#[path = "path_policy.rs"]
+mod path_policy;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
+const BLANKET_ALLOW_ATTR_ALLOWLIST: &[&str] = &["tests/common/orchestrator.rs"];
 
 fn collect_sources_with_exts(root: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     let mut entries = fs::read_dir(root)
@@ -38,7 +42,7 @@ pub fn assert_rust_source_files_stay_under_1000_lines() {
         if line_count >= MAX_SOURCE_LINES_EXCLUSIVE {
             offenders.push(format!(
                 "{} has {} lines",
-                path.strip_prefix(repo_root).unwrap().display(),
+                path_policy::render_repo_relative_path(repo_root, &path),
                 line_count
             ));
         }
@@ -276,10 +280,9 @@ pub fn assert_no_direct_recursion_in_rust_sources() {
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
         for (line, name) in detect_direct_recursion_in_rust_text(&contents) {
-            let rel = path.strip_prefix(repo_root).unwrap();
             violations.push(format!(
                 "{}:{}: direct recursion in {}()",
-                rel.display(),
+                path_policy::render_repo_relative_path(repo_root, &path),
                 line,
                 name
             ));
@@ -289,6 +292,49 @@ pub fn assert_no_direct_recursion_in_rust_sources() {
     assert!(
         violations.is_empty(),
         "Direct recursion is forbidden in Rust sources:\n{}",
+        violations.join("\n")
+    );
+}
+
+pub fn assert_blanket_dead_code_and_unused_import_allows_are_scoped() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    collect_sources_with_exts(&repo_root.join("src"), &["rs"], &mut sources);
+    collect_sources_with_exts(&repo_root.join("tests"), &["rs"], &mut sources);
+
+    let mut violations = Vec::new();
+    for path in sources {
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let rel = path_policy::render_repo_relative_path(repo_root, &path);
+
+        // Standardize the content to make detection more robust against formatting/multi-line
+        let content_no_spaces = contents
+            .replace(' ', "")
+            .replace('\n', "")
+            .replace('\r', "")
+            .replace('\t', "");
+
+        let allow_prefix = "allow(";
+        let has_forbidden_blanket_allow = content_no_spaces
+            .contains(format!("{allow_prefix}dead_code").as_str())
+            || content_no_spaces.contains(format!("{allow_prefix}unused_imports").as_str())
+            || content_no_spaces.contains(format!("{allow_prefix}unused").as_str())
+            || content_no_spaces.contains(format!("{allow_prefix}unused_variables").as_str());
+
+        if has_forbidden_blanket_allow
+            && !BLANKET_ALLOW_ATTR_ALLOWLIST
+                .iter()
+                .any(|allowed| *allowed == rel)
+        {
+            violations.push(rel);
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Blanket allow on (dead_code)/(unused_imports) is only permitted in {:?}:\n{}",
+        BLANKET_ALLOW_ATTR_ALLOWLIST,
         violations.join("\n")
     );
 }

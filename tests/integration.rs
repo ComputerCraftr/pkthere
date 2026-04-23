@@ -4,31 +4,46 @@ mod app_bin;
 mod core;
 #[path = "common/orchestrator.rs"]
 mod orchestrator;
-use crate::core::{JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, wait_for_stats_json_from};
+use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, SOCKET_MODES,
-    bind_client_or_skip, bind_udp_client, json_addr, launch_forwarder, random_unprivileged_port,
-    run_matrix_cases, send_until_locked, spawn_echo_or_skip, spawn_udp_echo_server,
-    try_launch_forwarder, wait_for_child_exit_success, wait_for_locked_client_from,
+    CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS,
+    MatrixCase, SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client,
+    default_test_icmp_upstream_arg, default_test_upstream_arg, expect_no_echo, json_addr,
+    launch_forwarder, localhost_addr, random_unprivileged_port, raw_icmp_test_supported,
+    run_matrix_cases, send_until_locked, skip_unless_raw_icmp_supported, spawn_echo_or_skip,
+    spawn_udp_echo_server, try_launch_forwarder, wait_for_child_exit_success,
+    wait_for_locked_client_from, wait_for_stats_matching,
 };
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use crate::orchestrator::{expect_no_echo, wait_for_stats_matching};
 
 use std::io::ErrorKind;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn locked_worker_flow<'a>(stats: &'a serde_json::Value) -> &'a serde_json::Value {
+    stats["worker_flows"]
+        .as_array()
+        .and_then(|flows| {
+            flows.iter().find(|flow| {
+                flow["locked"].as_bool().unwrap_or(false)
+                    || !flow["client_addr"].is_null()
+                    || !flow["flow_key"].is_null()
+            })
+        })
+        .expect("expected at least one worker flow entry")
+}
+
 #[test]
 fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
+    if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
+        && !raw_icmp_test_supported()
+    {
+        return;
+    }
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
-    let (up_addr, _up_thread) = IpFamily::V4
-        .spawn_echo()
-        .expect("IPv4 loopback upstream bind");
     let mut session = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: String::from("UDP:127.0.0.1:0"),
-        there: format!("ICMP:{up_addr}"),
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -76,17 +91,18 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[test]
 fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
+    if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
+        && !raw_icmp_test_supported()
+    {
+        return;
+    }
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
-    let (up_addr, _up_thread) = IpFamily::V4
-        .spawn_echo()
-        .expect("IPv4 loopback upstream bind");
     let mut session = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: String::from("UDP:127.0.0.1:0"),
-        there: format!("ICMP:{up_addr}"),
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -169,17 +185,18 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
     );
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[test]
 fn zero_len_udp_client_payload_round_trips_over_icmp() {
+    if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
+        && !raw_icmp_test_supported()
+    {
+        return;
+    }
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
-    let (up_addr, _up_thread) = IpFamily::V4
-        .spawn_echo()
-        .expect("IPv4 loopback upstream bind");
     let mut session = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: String::from("UDP:127.0.0.1:0"),
-        there: format!("ICMP:{up_addr}"),
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -214,22 +231,23 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
     assert_eq!(stats["u2c_bytes"].as_u64().unwrap_or(0), 0);
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[test]
 fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
+    if skip_unless_raw_icmp_supported(
+        "icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node",
+    ) {
+        return;
+    }
+
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let (udp_up_addr, _udp_up_thread) = IpFamily::V4
         .spawn_echo()
         .expect("IPv4 loopback upstream bind");
-    let icmp_port_3 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 3");
-    let mut icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
-    while icmp_port_2 == icmp_port_3 {
-        icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("distinct ICMP listen id 2");
-    }
+    let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
 
-    let _node3 = match try_launch_forwarder(ForwarderConfig {
+    let node3 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: format!("ICMP:127.0.0.1:{icmp_port_3}"),
+        here: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
         timeout_secs: None,
@@ -237,36 +255,32 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
-    }) {
-        Ok(session) => session,
-        Err(e) => {
-            eprintln!("skipping multihop ICMP bridge test: cannot launch ICMP endpoint node: {e}");
-            return;
-        }
-    };
-    let _node2 = match try_launch_forwarder(ForwarderConfig {
+    })
+    .expect("could not launch ICMP endpoint node on raw-capable host");
+    let node2 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: format!("ICMP:127.0.0.1:{icmp_port_2}"),
-        there: format!("ICMP:127.0.0.1:{icmp_port_3}"),
+        here: format!(
+            "ICMP:{}:{}",
+            localhost_addr(IpFamily::V4, 0).ip(),
+            icmp_port_2
+        ),
+        there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: Some(5),
-    }) {
-        Ok(session) => session,
-        Err(e) => {
-            eprintln!(
-                "skipping multihop ICMP bridge test: cannot launch pure ICMP middle node: {e}"
-            );
-            return;
-        }
-    };
+    })
+    .expect("could not launch pure ICMP middle node");
     let mut node1 = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: String::from("UDP:127.0.0.1:0"),
-        there: format!("ICMP:127.0.0.1:{icmp_port_2}"),
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: format!(
+            "ICMP:{}:{}",
+            localhost_addr(IpFamily::V4, 0).ip(),
+            icmp_port_2
+        ),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -277,6 +291,32 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     client_sock
         .connect(node1.listen_addr)
         .expect("connect client to first forwarder");
+
+    // Verify node2 (pure ICMP) uses RAW listener and DGRAM upstream (where supported)
+    let mut node2_out = node2.out;
+    let stats2 = wait_for_stats_json_from(&mut node2_out, JSON_WAIT_MS).expect("node2 stats");
+    assert_eq!(
+        stats2["worker_flows"][0]["client_sock_type"], "RAW",
+        "middle node listener must be RAW"
+    );
+    let expected_middle_upstream =
+        if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp() {
+            "RAW"
+        } else {
+            "DGRAM"
+        };
+    assert_eq!(
+        stats2["worker_flows"][0]["upstream_sock_type"], expected_middle_upstream,
+        "middle node upstream must be {expected_middle_upstream}"
+    );
+
+    // Verify node3 (ICMP endpoint) uses RAW listener
+    let mut node3_out = node3.out;
+    let stats3 = wait_for_stats_json_from(&mut node3_out, JSON_WAIT_MS).expect("node3 stats");
+    assert_eq!(
+        stats3["worker_flows"][0]["client_sock_type"], "RAW",
+        "endpoint node listener must be RAW"
+    );
 
     let payload = b"multihop-icmp-bridge";
     client_sock.send(payload).expect("send multihop payload");
@@ -342,7 +382,7 @@ fn run_enforce_max_payload(case: MatrixCase<'_>, max_payload: usize, recv_buf_le
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: case.family.listen_arg().to_string(),
-        there: format!("{}:{up_addr}", case.proto),
+        there: default_test_upstream_arg(case.proto, up_addr),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: Some(max_payload),
@@ -407,7 +447,7 @@ fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: case.family.listen_arg().to_string(),
-        there: format!("{}:{up_addr}", case.proto),
+        there: default_test_upstream_arg(case.proto, up_addr),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -442,10 +482,18 @@ fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
     assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), COUNT as u64);
     assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), COUNT as u64);
 
-    let stats_client = json_addr(&stats["client_addr"]).expect("parse stats client_addr");
+    let worker = locked_worker_flow(&stats);
+    let stats_client = json_addr(&worker["client_addr"]).expect("parse stats client_addr");
     assert_eq!(stats_client, client_local, "stats client_addr mismatch");
-    let stats_upstream = json_addr(&stats["upstream_addr"]).expect("parse stats upstream_addr");
-    assert_eq!(stats_upstream, up_addr, "stats upstream_addr mismatch");
+    assert_eq!(
+        worker["upstream_canonical"].as_str().unwrap_or_default(),
+        if case.proto == "ICMP" {
+            format!("{}:0", up_addr.ip())
+        } else {
+            format!("{}:{}", up_addr.ip(), up_addr.port())
+        },
+        "stats upstream_canonical mismatch"
+    );
 
     assert_eq!(
         stats["c2u_bytes"].as_u64().unwrap_or(0),
@@ -509,8 +557,12 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
-        here: format!("UDP:127.0.0.1:{here_port}"),
-        there: format!("{}:{up_addr}", case.proto),
+        here: format!("UDP:{}", localhost_addr(IpFamily::V4, here_port)),
+        there: if case.proto == "ICMP" {
+            default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip())
+        } else {
+            format!("{}:{up_addr}", case.proto)
+        },
         timeout_action: "drop",
         timeout_secs: None,
         max_payload: None,
@@ -584,7 +636,8 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     ));
     let _ = session.child.kill();
 
-    let stats_client = json_addr(&stats["client_addr"]).expect("parse stats client_addr");
+    let stats_client =
+        json_addr(&locked_worker_flow(&stats)["client_addr"]).expect("parse stats client_addr");
     assert_eq!(
         stats_client, client_b_local,
         "forwarder did not relock to client B"
@@ -595,7 +648,6 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     assert!(c2u_pkts >= 2 && u2c_pkts >= 2);
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn timeout_drop_relocks_after_forward_errors_udp() {
     run_matrix_cases(&IPV4_ONLY_FAMILIES, &["UDP"], &SOCKET_MODES, |case| {
@@ -603,7 +655,6 @@ fn timeout_drop_relocks_after_forward_errors_udp() {
     });
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase<'_>) {
     let client_a = bind_udp_client(IpFamily::V4).expect("client_a IPv4 loopback not available");
     let client_b = bind_udp_client(IpFamily::V4).expect("client_b IPv4 loopback not available");
@@ -612,8 +663,8 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase<'_>) {
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
-        here: format!("UDP:127.0.0.1:{here_port}"),
-        there: format!("UDP:127.0.0.1:{dead_upstream_port}"),
+        here: format!("UDP:{}", localhost_addr(IpFamily::V4, here_port)),
+        there: format!("UDP:{}", localhost_addr(IpFamily::V4, dead_upstream_port)),
         timeout_action: "drop",
         timeout_secs: None,
         max_payload: None,
@@ -646,7 +697,7 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase<'_>) {
     })
     .expect("did not see forwarding errors in stats JSON");
     assert_eq!(
-        json_addr(&stats["client_addr"]).expect("stats client addr"),
+        json_addr(&locked_worker_flow(&stats)["client_addr"]).expect("stats client addr"),
         client_a.local_addr().expect("client A local addr")
     );
 

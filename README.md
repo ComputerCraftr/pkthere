@@ -17,14 +17,29 @@ Protocols and behaviors:
 - **Connected/unconnected modes**: optional `--debug no-connect` leaves the client socket unconnected for diagnostics.
 - **Drop logging**: `--debug log-drops` prints reasons when packets are rejected.
 - **Payload limits**: enforce MTU-like behavior with `--max-payload`.
-- **Stats**: periodic JSON lines show per-direction byte/packet counts, latency metrics, and the locked client address.
+- **Stats**: periodic JSON lines show aggregate per-direction byte/packet counts and latency metrics. The `worker_flows` array provides per-worker details including locked status and client addresses.
 
 Notable CLI options:
 
 - `--max-payload N` – drop packets larger than `N` bytes.
-- `--debug WHAT` – enable debug behavior (`no-connect` and/or `log-drops`).
+- `--debug-no-connect` – leave client socket unconnected (useful for multi-hop or diagnostics).
+- `--debug-log drops|handles` – enable targeted debug logging.
 - `--stats-interval-mins N` – periodic JSON stats interval (0 disables stats thread).
 - `--user/--group NAME` (Unix) – drop privileges after binding low ports.
+
+Worker flow modes:
+
+- `shared-flow` keeps one global locked flow shared across all worker pairs.
+- `single-flow` keeps worker-pair-local locked flows and worker-pair-local ICMP sync state.
+- `single-flow` is still valid with `--workers 1`, but it has no distribution benefit there.
+
+Dynamic `:0` semantics:
+
+- `--here UDP:host:0` binds an ephemeral local UDP port.
+- `--there UDP:host:port` still means a fixed remote UDP destination port.
+- `--here ICMP:host:0` enables wildcard-learn ICMP listening and learns the peer ICMP ID on first lock.
+- `--there ICMP:host:0` means a dynamic local ICMP source ID chosen by the kernel ping socket.
+- Nonzero ICMP IDs remain fixed listener/peer IDs (on Linux/Android, requesting a fixed nonzero ICMP ID forces the use of privileged raw sockets).
 
 Build:
 
@@ -35,7 +50,10 @@ Run examples:
 - `./target/release/pkthere --here UDP:0.0.0.0:5354 --there UDP:1.1.1.1:53`
 - `./target/release/pkthere --here UDP:0.0.0.0:5354 --there UDP:one.one.one.one:53 --timeout-secs 45 --on-timeout drop`
 - `./target/release/pkthere --here UDP:0.0.0.0:5354 --there UDP:[2606:4700:4700::1001]:53 --on-timeout exit`
-- `./target/release/pkthere --here ICMP:0.0.0.0:1234 --there ICMP:8.8.8.8:33434 --debug log-drops`
+- `./target/release/pkthere --here UDP:127.0.0.1:0 --there UDP:1.1.1.1:53`
+- `./target/release/pkthere --here ICMP:0.0.0.0:1234 --there ICMP:8.8.8.8:33434 --debug-log drops`
+- `./target/release/pkthere --here ICMP:0.0.0.0:0 --there UDP:1.1.1.1:53`
+- `./target/release/pkthere --here UDP:127.0.0.1:5354 --there ICMP:8.8.8.8:0`
 
 Tests:
 

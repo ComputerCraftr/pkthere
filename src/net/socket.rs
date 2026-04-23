@@ -1,4 +1,6 @@
 use crate::cli::SupportedProtocol;
+use crate::net::icmp_support::{choose_effective_local_icmp_id, upstream_requires_raw_icmp};
+use crate::net::params::CanonicalAddr;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use std::io;
@@ -16,9 +18,9 @@ pub fn make_socket(
     bind_addr: SocketAddr,
     proto: SupportedProtocol,
     read_timeout_ms: u64,
-    reuseaddr: bool,
+    reuseport: bool,
     force_raw_icmp: bool,
-) -> io::Result<(Socket, SocketAddr)> {
+) -> io::Result<(Socket, CanonicalAddr, Type)> {
     // Raw ICMP: use well-known protocol numbers (see IANA)
     // IPv4 ICMP = 1, IPv6 ICMP = 58; same on Unix and Windows.
     let (domain, icmp_proto) = match bind_addr {
@@ -26,16 +28,20 @@ pub fn make_socket(
         _ => (Domain::IPV4, Protocol::ICMPV4),
     };
 
-    let sock = match proto {
+    let (sock, sock_type) = match proto {
         SupportedProtocol::ICMP => {
             // Linux kernels expose SOCK_DGRAM ping sockets when ping_group_range
             // permits it; fall back to raw sockets elsewhere.
-            make_icmp_socket(domain, icmp_proto, force_raw_icmp)?
+            let (s, t) = make_icmp_socket(domain, icmp_proto, force_raw_icmp)?;
+            (s, t)
         }
-        _ => Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?,
+        _ => (
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?,
+            Type::DGRAM,
+        ),
     };
 
-    if reuseaddr {
+    if reuseport {
         sock.set_reuse_address(true)?;
         // Best effort: only some platforms support SO_REUSEPORT.
         #[cfg(unix)]
@@ -57,18 +63,24 @@ pub fn make_socket(
         Some(Duration::from_millis(read_timeout_ms))
     })?;
 
-    let actual_local = if force_raw_icmp {
-        bind_addr
+    let actual_local = if sock_type == Type::DGRAM {
+        CanonicalAddr::from_socket_addr(sock.local_addr()?.as_socket().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
+        })?)
     } else {
-        sock.local_addr()?.as_socket().unwrap_or(bind_addr)
+        CanonicalAddr::from_socket_addr(bind_addr)
     };
 
-    Ok((sock, actual_local))
+    Ok((sock, actual_local, sock_type))
 }
 
-fn make_icmp_socket(domain: Domain, proto: Protocol, force_raw: bool) -> io::Result<Socket> {
+fn make_icmp_socket(
+    domain: Domain,
+    proto: Protocol,
+    force_raw: bool,
+) -> io::Result<(Socket, Type)> {
     if force_raw {
-        return Socket::new(domain, Type::RAW, Some(proto));
+        return Ok((Socket::new(domain, Type::RAW, Some(proto))?, Type::RAW));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -77,13 +89,13 @@ fn make_icmp_socket(domain: Domain, proto: Protocol, force_raw: bool) -> io::Res
         // and avoid raw socket privileges. Prefer that path, but gracefully fall back to
         // SOCK_RAW if the kernel denies access or the feature is disabled.
         match Socket::new(domain, Type::DGRAM, Some(proto)) {
-            Ok(sock) => Ok(sock),
+            Ok(sock) => Ok((sock, Type::DGRAM)),
             Err(err) => {
                 log_warn!(
                     "ICMP datagram sockets unavailable on {:?} ({err}); falling back to raw sockets",
                     domain
                 );
-                Socket::new(domain, Type::RAW, Some(proto))
+                Ok((Socket::new(domain, Type::RAW, Some(proto))?, Type::RAW))
             }
         }
     }
@@ -92,32 +104,55 @@ fn make_icmp_socket(domain: Domain, proto: Protocol, force_raw: bool) -> io::Res
     {
         // Other OSes do not expose ping sockets via SOCK_DGRAM; raw sockets are the
         // only option for sending ICMP Echo traffic.
-        Socket::new(domain, Type::RAW, Some(proto))
+        Ok((Socket::new(domain, Type::RAW, Some(proto))?, Type::RAW))
     }
 }
 
 /// Create and connect a socket suitable for forwarding data to `dest`.
 pub fn make_upstream_socket_for(
-    dest: SocketAddr,
+    dest: CanonicalAddr,
     proto: SupportedProtocol,
-) -> io::Result<(Socket, SocketAddr)> {
+    requested_port_id: u16,
+) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type)> {
     let local_port = if proto == SupportedProtocol::ICMP {
-        dest.port()
+        dest.id
     } else {
         0
     };
     let bind_addr = match dest {
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_port),
+        CanonicalAddr {
+            addr: SocketAddr::V6(_),
+            ..
+        } => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_port),
         _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_port),
     };
 
-    let (sock, _) = make_socket(bind_addr, proto, 1000, false, false)?;
+    let (sock, _actual_local, sock_type) = make_socket(
+        bind_addr,
+        proto,
+        1000,
+        false,
+        proto == SupportedProtocol::ICMP && upstream_requires_raw_icmp(requested_port_id),
+    )?;
 
-    let dest_sa = SockAddr::from(dest);
+    let dest_sa = dest.as_sock_addr();
     sock.connect(&dest_sa)?;
-    let actual_dest = sock.peer_addr()?.as_socket().unwrap_or(bind_addr);
 
-    Ok((sock, actual_dest))
+    // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
+    let final_local_port = sock
+        .local_addr()?
+        .as_socket()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname"))?
+        .port();
+
+    let effective_local_id = if proto == SupportedProtocol::ICMP {
+        choose_effective_local_icmp_id(requested_port_id, final_local_port, true).0
+    } else {
+        final_local_port
+    };
+
+    let local = CanonicalAddr::new(bind_addr, effective_local_id);
+    Ok((sock, dest, local, sock_type))
 }
 
 #[inline]
@@ -232,4 +267,40 @@ pub fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
         io::ErrorKind::Other,
         "Function disconnect_socket is not supported on this OS",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn test_make_upstream_socket_local_id_assigned() {
+        // Use a loopback UDP address as destination to avoid privilege issues
+        // while still testing the port/ID assignment logic.
+        // We use port 9 (Discard protocol) or just something that exists.
+        let dest = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9), 9);
+
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        let proto = SupportedProtocol::ICMP;
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        let proto = SupportedProtocol::UDP;
+
+        let (sock, _remote, local, sock_type) =
+            make_upstream_socket_for(dest, proto, 0).expect("make_upstream_socket_for failed");
+
+        assert_ne!(local.id, 0, "Local port should be assigned after connect");
+        assert_eq!(
+            sock_type,
+            Type::DGRAM,
+            "Upstream socket type should be DGRAM"
+        );
+        #[cfg(any(target_os = "macos"))]
+        assert_eq!(sock.local_addr().unwrap().as_socket().unwrap().port(), 0);
+        #[cfg(not(any(target_os = "macos")))]
+        assert_eq!(
+            sock.local_addr().unwrap().as_socket().unwrap().port(),
+            local.id
+        );
+    }
 }

@@ -1,4 +1,5 @@
-use crate::core::{JSON_WAIT_MS, strip_log_prefix, wait_for_stats_json_from};
+use crate::core::{strip_log_prefix, wait_for_stats_json_from};
+use crate::orchestrator::JSON_WAIT_MS;
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};

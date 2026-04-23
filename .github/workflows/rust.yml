@@ -35,6 +35,19 @@ jobs:
       - name: Build
         run: cargo test --no-run --verbose
 
+      - name: Grant raw ICMP capability to debug binary
+        if: runner.os == 'Linux'
+        run: |
+          sudo setcap cap_net_raw+ep target/debug/pkthere
+          getcap target/debug/pkthere
+
+      - name: Grant raw ICMP capability to debug binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo chown root target/debug/pkthere
+          sudo chmod u+s target/debug/pkthere
+          ls -l target/debug/pkthere
+
       - name: Run tests
         run: cargo test --verbose
 
@@ -63,6 +76,19 @@ jobs:
 
       - name: Build release test binaries
         run: cargo test --release --tests --no-run --verbose
+
+      - name: Grant raw ICMP capability to release binary
+        if: runner.os == 'Linux'
+        run: |
+          sudo setcap cap_net_raw+ep target/release/pkthere
+          getcap target/release/pkthere
+
+      - name: Grant raw ICMP capability to release binary (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo chown root target/release/pkthere
+          sudo chmod u+s target/release/pkthere
+          ls -l target/release/pkthere
 
       - name: Run release stress regression tests
         run: cargo test --release stress_test_ipv4_all -- --ignored --nocapture

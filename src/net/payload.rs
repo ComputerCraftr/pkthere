@@ -1,23 +1,41 @@
-use crate::cli::{Config, SupportedProtocol};
+use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::net::checksum::{checksum16, checksum16_parts};
+use crate::net::payload_support::{
+    DEST_ADDR_REQUIRED, ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_IS_DATA,
+};
 use crate::stats::StatsSink;
 use socket2::{SockAddr, Socket, Type};
 
 use std::io::{self, IoSlice};
 
-#[cfg(unix)]
-const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
-#[cfg(windows)]
-const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
-
-const ICMP_SHIM_IS_DATA: u8 = 0x80;
-const ICMP_SHIM_HAS_PAYLOAD: u8 = 0x40;
-const ICMP_SHIM_ALLOWED_BITS: u8 = ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PayloadOrigin {
     Wire,
     SyntheticSyncKeepalive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IcmpIdPolicy {
+    Any,
+    Exact(u16),
+}
+
+impl IcmpIdPolicy {
+    #[inline]
+    const fn accepts(self, ident: u16) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(expected) => ident == expected,
+        }
+    }
+
+    #[inline]
+    const fn synthetic_ident(self) -> u16 {
+        match self {
+            Self::Any => 0,
+            Self::Exact(ident) => ident,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,6 +60,7 @@ impl<'a> PayloadEvent<'a> {
     #[inline]
     pub(crate) const fn from_wire_parts(
         is_user_data: bool,
+        src_ident: u16,
         src_seq: u16,
         dst_proto: SupportedProtocol,
         payload: &'a [u8],
@@ -49,6 +68,7 @@ impl<'a> PayloadEvent<'a> {
     ) -> Self {
         let wire = WirePayload {
             src_is_icmp: true,
+            src_ident,
             src_seq,
             dst_proto,
             payload,
@@ -65,6 +85,7 @@ impl<'a> PayloadEvent<'a> {
 #[derive(Debug)]
 pub(crate) struct WirePayload<'a> {
     pub(crate) src_is_icmp: bool,
+    pub(crate) src_ident: u16,
     pub(crate) src_seq: u16,
     pub(crate) dst_proto: SupportedProtocol,
     pub(crate) payload: &'a [u8],
@@ -107,6 +128,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
     match (is_data, has_user_payload, user_payload.is_empty()) {
         (true, true, false) => Ok(PayloadEvent::UserData(WirePayload {
             src_is_icmp: true,
+            src_ident: 0,
             src_seq: 0,
             dst_proto: SupportedProtocol::UDP,
             payload: user_payload,
@@ -114,6 +136,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
         })),
         (true, false, true) => Ok(PayloadEvent::UserData(WirePayload {
             src_is_icmp: true,
+            src_ident: 0,
             src_seq: 0,
             dst_proto: SupportedProtocol::UDP,
             payload: &[],
@@ -121,6 +144,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
         })),
         (false, false, true) => Ok(PayloadEvent::SyncKeepalive(WirePayload {
             src_is_icmp: true,
+            src_ident: 0,
             src_seq: 0,
             dst_proto: SupportedProtocol::ICMP,
             payload: &[],
@@ -136,10 +160,10 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
 #[inline]
 pub(crate) fn validate_payload<'a>(
     c2u: bool,
-    cfg: &Config,
+    cfg: &RuntimeConfig,
     stats: &dyn StatsSink,
     buf: &'a [u8],
-    recv_port_id: u16,
+    icmp_id_policy: IcmpIdPolicy,
     origin: PayloadOrigin,
 ) -> io::Result<PayloadEvent<'a>> {
     let (src_proto, dst_proto) = if c2u {
@@ -152,6 +176,7 @@ pub(crate) fn validate_payload<'a>(
         if c2u && dst_proto == SupportedProtocol::ICMP && cfg.icmp_sync_pps > 0 {
             return Ok(PayloadEvent::SyncKeepalive(WirePayload {
                 src_is_icmp: src_proto == SupportedProtocol::ICMP,
+                src_ident: icmp_id_policy.synthetic_ident(),
                 src_seq: 0,
                 dst_proto,
                 payload: &[],
@@ -171,7 +196,7 @@ pub(crate) fn validate_payload<'a>(
             let res = parse_icmp_echo_header(buf);
             (true, res.0, &res.1[res.2..res.3], res.4, res.5, res.6)
         }
-        _ => (false, true, buf, recv_port_id, 0u16, c2u),
+        _ => (false, true, buf, 0u16, 0u16, c2u),
     };
 
     if !icmp_success {
@@ -182,12 +207,12 @@ pub(crate) fn validate_payload<'a>(
         ));
     }
 
-    if c2u != src_is_req || src_ident != recv_port_id {
+    if c2u != src_is_req || (src_is_icmp && !icmp_id_policy.accepts(src_ident)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "ICMP Echo direction or identity mismatch: got (req={}, id={}), expected (req={})",
-                src_is_req, src_ident, c2u,
+                "ICMP Echo direction or identity mismatch: got (req={}, id={}), expected (req={}, policy={:?})",
+                src_is_req, src_ident, c2u, icmp_id_policy
             ),
         ));
     }
@@ -197,6 +222,7 @@ pub(crate) fn validate_payload<'a>(
         let base = event.wire();
         PayloadEvent::from_wire_parts(
             event.is_user_data(),
+            src_ident,
             src_seq,
             dst_proto,
             base.payload,
@@ -205,6 +231,7 @@ pub(crate) fn validate_payload<'a>(
     } else {
         PayloadEvent::UserData(WirePayload {
             src_is_icmp,
+            src_ident,
             src_seq,
             dst_proto,
             payload,
@@ -227,8 +254,8 @@ pub(crate) fn send_payload(
     sock_connected: bool,
     sock_type: Type,
     dest_sa: &SockAddr,
-    dest_port_id: u16,
     event: &PayloadEvent<'_>,
+    icmp_header_id: u16,
     c2u: bool,
     icmp_seq: Option<u16>,
 ) -> io::Result<bool> {
@@ -245,7 +272,7 @@ pub(crate) fn send_payload(
             sock_connected,
             sock_type,
             dest_sa,
-            dest_port_id,
+            icmp_header_id,
             icmp_seq.expect("missing ICMP sequence for ICMP destination"),
             !c2u,
             Some(&shim),
@@ -275,7 +302,7 @@ pub(crate) fn send_payload(
                     false,
                     sock_type,
                     dest_sa,
-                    dest_port_id,
+                    icmp_header_id,
                     icmp_seq.expect("missing ICMP sequence for ICMP destination"),
                     !c2u,
                     Some(&shim),
@@ -387,17 +414,17 @@ fn send_icmp_echo(
             }
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        (_, ty) if ty == Type::RAW => {
+        (_, ty) if ty == Type::DGRAM => {
+            hdr[0] = 8u8 * (!reply as u8);
+            0u16
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        _ => {
             hdr[0] = 8u8 * (!reply as u8);
             match payload_prefix {
                 Some(prefix) => checksum16_parts(&hdr, prefix, payload),
                 None => checksum16(&hdr, payload),
             }
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        _ => {
-            hdr[0] = 8u8 * (!reply as u8);
-            0u16
         }
     };
 
@@ -418,19 +445,45 @@ fn send_icmp_echo(
 }
 
 #[cfg(test)]
+#[inline]
+fn test_icmp_echo_header(ident: u16, seq: u16) -> [u8; 8] {
+    let mut hdr = [0u8; 8];
+    let idb = ident.to_be_bytes();
+    let sqb = seq.to_be_bytes();
+    hdr[4] = idb[0];
+    hdr[5] = idb[1];
+    hdr[6] = sqb[0];
+    hdr[7] = sqb[1];
+    hdr
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{DebugBehavior, DebugLogs};
+    use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    fn test_config(listen_proto: SupportedProtocol, upstream_proto: SupportedProtocol) -> Config {
-        Config {
-            listen_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
-            listen_port_id: 1234,
+    fn test_config(
+        listen_proto: SupportedProtocol,
+        upstream_proto: SupportedProtocol,
+    ) -> RuntimeConfig {
+        RuntimeConfig {
+            listen: CanonicalAddr::new(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
+                1234,
+            ),
+            listen_bind_is_dynamic: false,
             listen_proto,
+            listen_icmp_mode: crate::cli::IcmpListenMode::FixedId,
             listen_str: String::from("test-listen"),
             workers: 1,
             worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,
+            upstream: CanonicalAddr::new(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321)),
+                4321,
+            ),
             upstream_proto,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,
@@ -444,11 +497,19 @@ mod tests {
             run_as_user: None,
             #[cfg(unix)]
             run_as_group: None,
-            debug_no_connect: false,
-            debug_log_drops: false,
-            debug_log_handles: false,
-            debug_fast_stats: false,
+            debug_behavior: DebugBehavior::default(),
+            debug_logs: DebugLogs::default(),
         }
+    }
+
+    #[test]
+    fn explicit_icmp_header_id_is_serialized_verbatim() {
+        let hdr = test_icmp_echo_header(4242, 9);
+        let packet = [hdr.as_slice(), b"x"].concat();
+        let (_, _raw, start, end, ident, seq, _is_req) = parse_icmp_echo_header(&packet);
+        assert_eq!(ident, 4242);
+        assert_eq!(seq, 9);
+        assert_eq!(&packet[start..end], b"x");
     }
 
     #[test]
@@ -537,7 +598,7 @@ mod tests {
             &cfg,
             &stats,
             &[],
-            cfg.listen_port_id,
+            IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
         )
         .expect("wire zero-length UDP must be treated as user data");
@@ -549,7 +610,7 @@ mod tests {
             &cfg,
             &stats,
             &[],
-            cfg.listen_port_id,
+            IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::SyntheticSyncKeepalive,
         )
         .expect("synthetic sync keepalive should be accepted");
@@ -569,7 +630,7 @@ mod tests {
             &cfg,
             &stats,
             &buf,
-            cfg.listen_port_id,
+            IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
         )
         .expect("wire ICMP keepalive header should decode");
@@ -598,7 +659,7 @@ mod tests {
             &cfg,
             &stats,
             &buf,
-            cfg.listen_port_id,
+            IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
         )
         .expect("ICMP shim should decode zero-length user data");
@@ -617,12 +678,32 @@ mod tests {
             &cfg,
             &stats,
             &buf,
-            cfg.listen_port_id,
+            IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
         )
         .expect("ICMP shim should decode non-empty user data");
         assert!(matches!(event, PayloadEvent::UserData(_)));
         assert_eq!(event.wire().payload, b"abc");
+    }
+
+    #[test]
+    fn validate_payload_wildcard_icmp_policy_accepts_any_identifier() {
+        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
+        let stats = Stats::new();
+        let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
+        buf[4] = 0xAA;
+        buf[5] = 0x55;
+
+        let event = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            IcmpIdPolicy::Any,
+            PayloadOrigin::Wire,
+        )
+        .expect("wildcard ICMP policy should accept arbitrary identifier");
+        assert_eq!(event.wire().src_ident, 0xAA55);
     }
 
     #[test]
@@ -655,7 +736,7 @@ mod tests {
                     &cfg,
                     &stats,
                     &bad,
-                    cfg.listen_port_id,
+                    IcmpIdPolicy::Exact(cfg.listen.id),
                     PayloadOrigin::Wire,
                 )
                 .is_err(),
@@ -678,7 +759,7 @@ mod tests {
                 &cfg,
                 &stats,
                 &[],
-                cfg.listen_port_id,
+                IcmpIdPolicy::Exact(cfg.listen.id),
                 PayloadOrigin::Wire
             )
             .is_ok()
@@ -689,7 +770,7 @@ mod tests {
                 &cfg,
                 &stats,
                 &[0],
-                cfg.listen_port_id,
+                IcmpIdPolicy::Exact(cfg.listen.id),
                 PayloadOrigin::Wire
             )
             .is_err()
@@ -708,7 +789,7 @@ mod tests {
                 &cfg_icmp,
                 &stats,
                 &ok_icmp,
-                cfg_icmp.listen_port_id,
+                IcmpIdPolicy::Exact(cfg_icmp.listen.id),
                 PayloadOrigin::Wire
             )
             .is_ok()
@@ -719,7 +800,7 @@ mod tests {
                 &cfg_icmp,
                 &stats,
                 &over_icmp,
-                cfg_icmp.listen_port_id,
+                IcmpIdPolicy::Exact(cfg_icmp.listen.id),
                 PayloadOrigin::Wire
             )
             .is_err()
@@ -740,7 +821,7 @@ mod tests {
                 &cfg,
                 &stats,
                 &ok,
-                cfg.listen_port_id,
+                IcmpIdPolicy::Exact(cfg.listen.id),
                 PayloadOrigin::Wire,
             )
             .is_ok()
@@ -751,7 +832,7 @@ mod tests {
                 &cfg,
                 &stats,
                 &over,
-                cfg.listen_port_id,
+                IcmpIdPolicy::Exact(cfg.listen.id),
                 PayloadOrigin::Wire,
             )
             .is_err()

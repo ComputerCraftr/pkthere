@@ -2,17 +2,24 @@
 mod app_bin;
 #[path = "child_guard.rs"]
 mod child_guard;
+#[path = "path_policy.rs"]
+mod path_policy;
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use child_guard::ChildGuard;
 
+pub fn app_bin_path() -> PathBuf {
+    app_bin::find_app_bin().expect("could not find app binary")
+}
+
 pub fn run_cli_args(args: &[&str]) -> (Option<i32>, String) {
-    let bin = app_bin::find_app_bin().expect("could not find app binary");
-    let child = Command::new(bin)
+    let bin = app_bin_path();
+    let child = Command::new(&bin)
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -28,33 +35,70 @@ pub fn run_cli_args(args: &[&str]) -> (Option<i32>, String) {
     (status.code(), err)
 }
 
-pub fn run_cli_args_expect_running(args: &[&str], wait: Duration) -> (Option<i32>, String) {
-    let bin = app_bin::find_app_bin().expect("could not find app binary");
-    let child = Command::new(bin)
+pub fn run_cli_args_with_stdout(args: &[&str]) -> (Option<i32>, String, String) {
+    let bin = app_bin_path();
+    let child = Command::new(&bin)
         .args(args)
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn failed");
     let mut child = ChildGuard::new(child);
 
-    thread::sleep(wait);
-    let early_exit_code = child
-        .try_wait()
-        .expect("try_wait failed")
-        .map(|status| status.code())
-        .unwrap_or(None);
+    let status = child.wait().expect("wait failed");
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut out);
+    }
+    let mut err = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut err);
+    }
+    (status.code(), out, err)
+}
+
+pub fn run_cli_args_expect_running_with_stdout(
+    args: &[&str],
+    wait: Duration,
+) -> (Option<i32>, String, String) {
+    let bin = app_bin_path();
+    let child = Command::new(&bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn failed");
+    let mut child = ChildGuard::new(child);
+
+    let deadline = std::time::Instant::now() + wait;
+    let early_exit_code = loop {
+        if let Some(status) = child.try_wait().expect("try_wait failed") {
+            break status.code();
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
 
     if early_exit_code.is_none() {
         let _ = child.kill();
         let _ = child.wait();
     }
 
+    let mut out = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut out);
+    }
     let mut err = String::new();
     if let Some(mut s) = child.stderr.take() {
         let _ = s.read_to_string(&mut err);
     }
-    (early_exit_code, err)
+    (early_exit_code, out, err)
+}
+
+pub fn render_app_bin_path() -> String {
+    path_policy::render_test_path(&app_bin_path())
 }
 
 pub fn assert_cli_rejects(args: &[&str], expected_substrings: &[&str]) {
@@ -78,14 +122,12 @@ pub fn assert_cli_rejects(args: &[&str], expected_substrings: &[&str]) {
     }
 }
 
-pub fn assert_cli_accepts_running(args: &[&str], wait: Duration, forbidden_substrings: &[&str]) {
-    let (early_code, err) = run_cli_args_expect_running(args, wait);
-    assert_ne!(
-        early_code,
-        Some(2),
-        "expected valid config not to fail CLI parsing; early_code={:?}; stderr: {}",
-        early_code,
-        err
+pub fn assert_cli_runs(args: &[&str], wait: Duration, forbidden_substrings: &[&str]) {
+    let (early_code, _out, err) = run_cli_args_expect_running_with_stdout(args, wait);
+    assert_eq!(
+        early_code, None,
+        "expected valid config to still be running after {:?}; early_code={:?}; stderr: {}",
+        wait, early_code, err
     );
 
     let err_lower = err.to_lowercase();

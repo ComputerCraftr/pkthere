@@ -1,6 +1,8 @@
 mod checksum;
+pub(crate) mod icmp_support;
 pub mod params;
 pub mod payload;
+pub(crate) mod payload_support;
 pub mod session;
 pub mod sock_mgr;
 pub mod socket;

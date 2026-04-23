@@ -1,31 +1,44 @@
 #[macro_use]
 mod logging;
 mod cli;
+mod flow_claim;
+mod flow_key;
+mod flow_state;
 mod net;
+mod runtime_support;
 mod stats;
+mod stats_support;
 mod worker;
 mod worker_support;
 
-use cli::{Config, SupportedProtocol, TimeoutAction, WorkerFlowMode, parse_args};
+use cli::{
+    RuntimeConfig, SupportedProtocol, TimeoutAction, WorkerFlowMode, parse_args, realize_config,
+};
+use flow_claim::FlowClaimTable;
+use flow_state::FlowRuntimeState;
+use net::icmp_support::{choose_effective_local_icmp_id, listener_requires_raw_icmp};
+use net::params::CanonicalAddr;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
 use net::sync_icmp::SharedSyncIcmpState;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
+use runtime_support::SIGINT_EXIT;
 use stats::Stats;
 use worker::{
     run_client_to_upstream_thread, run_reresolve_thread, run_upstream_to_client_thread,
     run_watchdog_thread,
 };
+use worker_support::GlobalSyncPacer;
 
 use std::io;
 use std::process;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomOrdering};
+use std::sync::atomic::{AtomicU32, Ordering as AtomOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-fn print_startup(cfg: &Config, sock_mgr: &SocketManager) {
+fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
     let (_, _, client_proto) = sock_mgr.get_client_dest();
     let (upstream_addr, _, upstream_proto) = sock_mgr.get_upstream_dest();
     log_info!(
@@ -41,62 +54,128 @@ fn print_startup(cfg: &Config, sock_mgr: &SocketManager) {
         cfg.on_timeout
     );
     log_info!("Workers: {}", cfg.workers);
-    log_info!("Worker flow mode: {}", cfg.worker_flow_mode);
+    match cfg.worker_flow_mode {
+        WorkerFlowMode::SharedFlow => {
+            log_info!(
+                "Worker flow mode: shared-flow (one global locked flow shared across worker pairs)"
+            );
+        }
+        WorkerFlowMode::SingleFlow => {
+            log_info!(
+                "Worker flow mode: single-flow (worker-pair-local locked flows and worker-pair-local ICMP sync state)"
+            );
+            if cfg.workers == 1 {
+                log_info!(
+                    "single-flow with --workers 1 is valid but has no distribution benefit; flow ownership behaves like shared-flow"
+                );
+            }
+        }
+    }
+    if cfg.listen_bind_is_dynamic {
+        log_info!("UDP listener bind: dynamic local port requested with --here UDP:host:0");
+    }
+    if cfg.listen_proto == SupportedProtocol::ICMP {
+        match cfg.listen_icmp_mode {
+            cli::IcmpListenMode::FixedId => {
+                log_info!(
+                    "ICMP listener mode: fixed-id (effective local id {})",
+                    cfg.listen.id
+                );
+            }
+            cli::IcmpListenMode::WildcardLearn => {
+                log_info!(
+                    "ICMP listener mode: wildcard-learn (--here ICMP:host:0 learns the peer ICMP id on first lock)"
+                );
+            }
+        }
+    }
+    if cfg.upstream_proto == SupportedProtocol::UDP {
+        log_info!(
+            "UDP upstream destination: fixed remote port {}",
+            cfg.upstream.id
+        );
+    }
+    if cfg.upstream_proto == SupportedProtocol::ICMP {
+        if cfg.upstream.id == 0 {
+            log_info!(
+                "ICMP upstream mode: dynamic local source id (--there ICMP:host:0 uses a kernel-assigned ping-socket id)"
+            );
+        } else {
+            log_info!(
+                "ICMP upstream mode: fixed remote peer/listener id {}",
+                cfg.upstream.id
+            );
+        }
+    }
+    if cfg.icmp_sync_pps > 0 {
+        log_info!(
+            "ICMP sync pace: global total best-effort target {} packet(s)/s shared across all workers and flows",
+            cfg.icmp_sync_pps
+        );
+    }
     log_info!("Re-resolve every: {}s (0=disabled)", cfg.reresolve_secs);
 }
 
 fn main() -> io::Result<()> {
     let t_start = Instant::now();
-    let mut user_requested_cfg = parse_args();
-    let worker_count = user_requested_cfg.workers.max(1);
+    let mut requested_cfg = parse_args();
+    let worker_count = requested_cfg.workers.max(1);
 
     // Disconnect does not work for raw listen sockets and FreeBSD UDP
     // disconnect is unreliable; keep sockets unconnected so we can relock.
-    if user_requested_cfg.on_timeout == TimeoutAction::Drop
-        && (user_requested_cfg.listen_proto == SupportedProtocol::ICMP
-            || cfg!(target_os = "freebsd"))
+    if requested_cfg.on_timeout == TimeoutAction::Drop
+        && (requested_cfg.listen_proto == SupportedProtocol::ICMP || cfg!(target_os = "freebsd"))
     {
-        user_requested_cfg.debug_no_connect = true;
+        requested_cfg.debug_behavior.no_connect = true;
     }
 
     // Listener for the local client (this may require root for low ports)
-    let (client_sock, actual_listen_addr) = make_socket(
-        user_requested_cfg.listen_addr,
-        user_requested_cfg.listen_proto,
+    let (client_sock, actual_listen, listen_sock_type) = make_socket(
+        requested_cfg.listen_request.addr,
+        requested_cfg.listen_proto,
         1000,
         worker_count != 1,
-        user_requested_cfg.listen_proto == SupportedProtocol::ICMP,
+        requested_cfg.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
     )?;
-    user_requested_cfg.listen_addr = actual_listen_addr;
-    user_requested_cfg.listen_port_id = actual_listen_addr.port();
 
-    let cfg = Arc::new(user_requested_cfg);
+    let listen_effective_id = if requested_cfg.listen_proto == SupportedProtocol::ICMP {
+        choose_effective_local_icmp_id(requested_cfg.listen_request.id, actual_listen.id, false).0
+    } else {
+        actual_listen.id
+    };
+    let actual_listen = CanonicalAddr::new(actual_listen.addr, listen_effective_id);
+
+    let cfg = Arc::new(realize_config(requested_cfg, actual_listen)?);
 
     // Initial upstream resolution + socket managers (one per worker)
     let mut sock_mgrs = Vec::with_capacity(worker_count);
 
     sock_mgrs.push(Arc::new(SocketManager::new(
         client_sock,
-        cfg.listen_addr,
+        cfg.listen,
+        listen_sock_type,
         cfg.listen_str.clone(),
         cfg.listen_proto,
+        cfg.upstream,
         cfg.upstream_str.clone(),
         cfg.upstream_proto,
     )?));
 
     for _ in 1..worker_count {
-        let (extra_sock, _) = make_socket(
-            cfg.listen_addr,
+        let (extra_sock, _, extra_sock_type) = make_socket(
+            cfg.listen.addr,
             cfg.listen_proto,
             1000,
             true,
-            cfg.listen_proto == SupportedProtocol::ICMP,
+            cfg.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
         )?;
         sock_mgrs.push(Arc::new(SocketManager::new(
             extra_sock,
-            cfg.listen_addr,
+            cfg.listen,
+            extra_sock_type,
             cfg.listen_str.clone(),
             cfg.listen_proto,
+            cfg.upstream,
             cfg.upstream_str.clone(),
             cfg.upstream_proto,
         )?));
@@ -107,18 +186,29 @@ fn main() -> io::Result<()> {
     drop_privileges(&cfg)?;
 
     // Global application state
-    let locked = Arc::new(AtomicBool::new(false));
-    let last_seen_s = Arc::new(AtomicU64::new(0));
-
     let stats = Arc::new(Stats::with_worker_shards(worker_count));
     let exit_code_set = Arc::new(AtomicU32::new(0));
+    let flow_states: Vec<_> = match cfg.worker_flow_mode {
+        WorkerFlowMode::SharedFlow => {
+            let shared = Arc::new(FlowRuntimeState::new());
+            (0..worker_count).map(|_| Arc::clone(&shared)).collect()
+        }
+        WorkerFlowMode::SingleFlow => (0..worker_count)
+            .map(|_| Arc::new(FlowRuntimeState::new()))
+            .collect(),
+    };
+    let flow_claims = matches!(cfg.worker_flow_mode, WorkerFlowMode::SingleFlow)
+        .then(|| Arc::new(FlowClaimTable::new()));
+    let global_sync_pacer =
+        (cfg.icmp_sync_pps > 0 && cfg.upstream_proto == SupportedProtocol::ICMP).then(|| {
+            Arc::new(GlobalSyncPacer::new(Duration::from_nanos(
+                (1_000_000_000u64 / u64::from(cfg.icmp_sync_pps)).max(1),
+            )))
+        });
 
     // Graceful shutdown on Ctrl-C / SIGINT (and SIGTERM on Unix via ctrlc)
     {
         let exit_code_set_c = Arc::clone(&exit_code_set);
-
-        // Exit code 130 is the conventional code for SIGINT (128 + SIGINT)
-        const SIGINT_EXIT: u32 = (1 << 31) | 130;
         ctrlc::set_handler(move || {
             // Signal the main loop to exit with code 130
             exit_code_set_c.store(SIGINT_EXIT, AtomOrdering::Relaxed);
@@ -147,10 +237,11 @@ fn main() -> io::Result<()> {
             let sock_mgr_a = Arc::clone(&sock_mgr);
             let sock_mgrs_a = sock_mgrs.clone();
             let worker_id = worker_base;
-            let locked_a = Arc::clone(&locked);
-            let last_seen_a = Arc::clone(&last_seen_s);
+            let flow_state_a = Arc::clone(&flow_states[idx]);
             let stats_a = stats.shard(idx);
             let sync_state_a = Arc::clone(&sync_state);
+            let sync_pacer_a = global_sync_pacer.clone();
+            let flow_claims_a = flow_claims.clone();
 
             thread::spawn(move || {
                 run_client_to_upstream_thread(
@@ -159,10 +250,12 @@ fn main() -> io::Result<()> {
                     &sock_mgr_a,
                     &sock_mgrs_a,
                     worker_id,
-                    &locked_a,
-                    &last_seen_a,
+                    &flow_state_a,
                     &stats_a,
                     &sync_state_a,
+                    sync_pacer_a.as_deref(),
+                    flow_claims_a.as_deref(),
+                    idx,
                 )
             });
         }
@@ -172,8 +265,7 @@ fn main() -> io::Result<()> {
             let cfg_b = Arc::clone(&cfg);
             let sock_mgr_b = Arc::clone(&sock_mgr);
             let worker_id = worker_base + 1;
-            let locked_b = Arc::clone(&locked);
-            let last_seen_b = Arc::clone(&last_seen_s);
+            let flow_state_b = Arc::clone(&flow_states[idx]);
             let stats_b = stats.shard(idx);
             let sync_state_b = Arc::clone(&sync_state);
 
@@ -183,10 +275,10 @@ fn main() -> io::Result<()> {
                     &cfg_b,
                     &sock_mgr_b,
                     worker_id,
-                    &locked_b,
-                    &last_seen_b,
+                    &flow_state_b,
                     &stats_b,
                     &sync_state_b,
+                    idx,
                 )
             });
         }
@@ -196,18 +288,18 @@ fn main() -> io::Result<()> {
     {
         let cfg_w = Arc::clone(&cfg);
         let sock_mgrs_w = sock_mgrs.clone();
-        let locked_w = Arc::clone(&locked);
-        let last_seen_w = Arc::clone(&last_seen_s);
+        let flow_states_w = flow_states.clone();
         let exit_code_set_w = Arc::clone(&exit_code_set);
+        let flow_claims_w = flow_claims.clone();
 
         thread::spawn(move || {
             run_watchdog_thread(
                 t_start,
                 &cfg_w,
                 &sock_mgrs_w,
-                &locked_w,
-                &last_seen_w,
+                &flow_states_w,
                 &exit_code_set_w,
+                flow_claims_w.as_deref(),
             )
         });
     }
@@ -230,15 +322,15 @@ fn main() -> io::Result<()> {
     }
 
     // Stats thread (report peer info from the first worker), unless disabled.
-    let stats_interval_secs = if !cfg.debug_fast_stats {
+    let stats_interval_secs = if !cfg.debug_behavior.fast_stats {
         u64::from(cfg.stats_interval_mins).saturating_mul(60)
     } else {
         1
     };
     if stats_interval_secs != 0 {
         stats.spawn_stats_printer(
-            Arc::clone(&sock_mgrs[0]),
-            Arc::clone(&locked),
+            sock_mgrs.clone(),
+            flow_states.clone(),
             t_start,
             stats_interval_secs,
             Arc::clone(&exit_code_set),
@@ -263,7 +355,7 @@ fn main() -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn drop_privileges(cfg: &Config) -> io::Result<()> {
+fn drop_privileges(cfg: &RuntimeConfig) -> io::Result<()> {
     if !unistd::geteuid().is_root() {
         // Not root: ignore any requested run-as flags.
         if cfg.run_as_user.is_some() || cfg.run_as_group.is_some() {

@@ -1,17 +1,13 @@
-use crate::cli::Config;
+use crate::cli::RuntimeConfig;
+use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::PayloadEvent;
+use crate::net::payload_support::DEST_ADDR_REQUIRED;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use crate::stats::StatsSink;
 use socket2::SockAddr;
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 use std::time::Instant;
-
-#[cfg(unix)]
-const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
-#[cfg(windows)]
-const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
 
 #[inline]
 pub(crate) fn counts_as_session_activity(event: &PayloadEvent<'_>, will_forward: bool) -> bool {
@@ -23,9 +19,9 @@ pub(crate) fn handle_send_result(
     worker_id: usize,
     t_start: Instant,
     t_recv: Instant,
-    cfg: &Config,
+    cfg: &RuntimeConfig,
     stats: &dyn StatsSink,
-    last_seen_s: &AtomicU64,
+    flow_state: &FlowRuntimeState,
     payload_len: usize,
     counts_as_session_activity: bool,
     send_res: &io::Result<bool>,
@@ -34,8 +30,7 @@ pub(crate) fn handle_send_result(
     disconnect_ctx: Option<(&mut SocketHandles, &SocketManager)>,
 ) {
     if counts_as_session_activity {
-        let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
-        last_seen_s.store(last_seen, AtomOrdering::Relaxed);
+        flow_state.record_activity(t_start, t_recv);
     }
 
     match send_res {
@@ -56,7 +51,8 @@ pub(crate) fn handle_send_result(
                         );
                         handles.client_connected = false;
                         handles.version = match sock_mgr.set_client_sock_disconnected(
-                            handles.client_addr,
+                            handles.locked_flow,
+                            handles.client_peer,
                             false,
                             prev_ver,
                         ) {
@@ -67,11 +63,11 @@ pub(crate) fn handle_send_result(
                             }
                         };
                         log_debug_dir!(
-                            cfg.debug_log_handles,
+                            cfg.debug_logs.handles,
                             worker_id,
                             c2u,
                             "publish disconnect: addr={:?} ver {}->{}",
-                            handles.client_addr,
+                            handles.locked_flow,
                             prev_ver,
                             handles.version
                         );
@@ -81,7 +77,7 @@ pub(crate) fn handle_send_result(
         }
         Err(e) => {
             log_debug_dir!(
-                cfg.debug_log_drops,
+                cfg.debug_logs.drops,
                 worker_id,
                 c2u,
                 "send_payload error ({} on dest_sa '{:?}'): {}",
@@ -108,6 +104,7 @@ mod tests {
     fn forwarded_user_data_counts_as_activity_even_when_zero_length() {
         let zero = PayloadEvent::UserData(WirePayload {
             src_is_icmp: false,
+            src_ident: 0,
             src_seq: 0,
             dst_proto: SupportedProtocol::UDP,
             payload: &[],
@@ -115,6 +112,7 @@ mod tests {
         });
         let keepalive = PayloadEvent::SyncKeepalive(WirePayload {
             src_is_icmp: true,
+            src_ident: 0,
             src_seq: 1,
             dst_proto: SupportedProtocol::ICMP,
             payload: &[],
