@@ -1,0 +1,4 @@
+.artifacts/
+cross-artifacts/
+docker-artifacts/
+target/

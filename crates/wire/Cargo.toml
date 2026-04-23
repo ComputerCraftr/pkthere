@@ -1,0 +1,15 @@
+[package]
+name = "pkthere-wire"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["must_cast"] }
+wide = "1.5.0"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "packet_parsers"
+harness = false

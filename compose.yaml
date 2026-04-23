@@ -1,0 +1,97 @@
+x-alpine-service: &alpine-service
+  image: pkthere-alpine-reality
+  user: "0:0"
+  cap_drop: ["ALL"]
+  env_file: docker/alpine/topology.env
+  sysctls:
+    net.ipv4.ping_group_range: "0 2147483647"
+  volumes:
+    - ${PKTHERE_ARTIFACT_DIR:?set PKTHERE_ARTIFACT_DIR}/runtime:/logs
+
+services:
+  reality:
+    <<: *alpine-service
+    profiles: ["reality"]
+    command: ["reality"]
+    cap_add: ["NET_RAW", "NET_ADMIN", "SETFCAP", "SETUID", "SETGID", "KILL"]
+
+  echo:
+    <<: *alpine-service
+    profiles: ["topology"]
+    command: ["echo"]
+    networks:
+      reality-net:
+        ipv4_address: ${ECHO_IP}
+
+  node-b:
+    <<: *alpine-service
+    profiles: ["topology"]
+    depends_on: [echo]
+    command: ["node-b"]
+    cap_add: ["NET_RAW", "SETUID", "SETGID"]
+    networks:
+      reality-net:
+        ipv4_address: ${NODE_B_IP}
+
+  node-a:
+    <<: *alpine-service
+    profiles: ["topology"]
+    depends_on: [node-b]
+    command: ["node-a"]
+    cap_add: ["NET_RAW", "SETUID", "SETGID"]
+    networks:
+      reality-net:
+        ipv4_address: ${NODE_A_IP}
+
+  attacker:
+    <<: *alpine-service
+    profiles: ["topology"]
+    depends_on: [node-b]
+    command: ["attacker"]
+    cap_add: ["NET_RAW"]
+    networks:
+      reality-net:
+        ipv4_address: ${ATTACKER_IP}
+
+  driver:
+    <<: *alpine-service
+    profiles: ["topology"]
+    depends_on: [node-a, node-b, echo, attacker]
+    command: ["driver"]
+    networks:
+      reality-net:
+        ipv4_address: ${DRIVER_IP}
+
+  blackhole:
+    <<: *alpine-service
+    profiles: ["timeout"]
+    command: ["blackhole"]
+    cap_add: ["NET_ADMIN"]
+    networks:
+      reality-net:
+        ipv4_address: ${BLACKHOLE_IP}
+
+  timeout-node:
+    <<: *alpine-service
+    profiles: ["timeout"]
+    depends_on: [blackhole]
+    command: ["timeout-node"]
+    cap_add: ["NET_RAW", "SETUID", "SETGID"]
+    networks:
+      reality-net:
+        ipv4_address: ${TIMEOUT_NODE_IP}
+
+  timeout-driver:
+    <<: *alpine-service
+    profiles: ["timeout"]
+    depends_on: [blackhole, timeout-node]
+    command: ["timeout-driver"]
+    networks:
+      reality-net:
+        ipv4_address: ${TIMEOUT_DRIVER_IP}
+
+networks:
+  reality-net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

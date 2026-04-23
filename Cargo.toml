@@ -3,6 +3,17 @@ name = "pkthere"
 version = "0.1.0"
 edition = "2024"
 
+[dev-dependencies]
+pkthere-test-support = { path = "tests/support" }
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
+quote = "1.0.47"
+serde_yaml_ng = "0.10.0"
+syn = { version = "3.0.3", features = ["full", "parsing", "visit"] }
+toml = "1.1.3"
+
+[workspace]
+members = [".", "tests/support", "crates/wire", "crates/socket_policy"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -11,11 +22,14 @@ strip = "symbols"
 debug = 0
 
 [dependencies]
-bytemuck = { version = "1.25.0", features = ["must_cast"] }
+pkthere-wire = { path = "crates/wire" }
+pkthere-socket-policy = { path = "crates/socket_policy" }
+
+bytemuck = { version = "1.25.2", features = ["must_cast"] }
 ctrlc = { version = "3.5.2", features = ["termination"] }
-libc = "0.2.185"
-nix = { version = "0.31.2", features = ["user"] }
-serde_json = "1.0.149"
-socket2 = { version = "0.6.3", features = ["all"] }
-wide = { version = "1.3.0", features = ["serde"] }
+libc = "0.2.189"
+nix = { version = "0.31.3", features = ["user"] }
+serde_json = "1.0.151"
+socket2 = { version = "0.6.5", features = ["all"] }
+wide = { version = "1.5.0", features = ["serde"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }

@@ -1,196 +1,41 @@
-use crate::cli::{Config, SupportedProtocol};
-use crate::net::payload::{PayloadEvent, PayloadOrigin, WirePayload};
+use crate::cli::RuntimeConfig;
+use crate::net::icmp_sequence::{IcmpSequenceCache, SharedIcmpSequenceState};
 
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering as AtomOrdering};
-
-static REQUEST_ICMP_SEQ: AtomicU16 = AtomicU16::new(0);
 
 const MIN_CATCHUP_WINDOW: usize = 8;
 const MAX_CATCHUP_WINDOW: usize = 1024;
-const DEDUP_SLOT_COUNT: usize = 2048;
-
-#[repr(align(64))]
-struct AlignedAtomicU64(AtomicU64);
-
-#[repr(align(64))]
-struct AlignedLatest {
-    seq: AtomicU16,
-    valid: AtomicBool,
-}
-
-#[repr(align(64))]
-struct AlignedReplySeq(AtomicU16);
-
-#[repr(align(64))]
-struct DedupSlot(AtomicU64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum U2cDecision {
-    ForwardPayload,
-    ForwardKeepaliveReply,
-    ConsumeKeepalive,
-}
-
-impl U2cDecision {
-    #[inline]
-    pub(crate) const fn should_send(self) -> bool {
-        matches!(self, Self::ForwardPayload | Self::ForwardKeepaliveReply)
-    }
-
-    #[inline]
-    pub(crate) const fn counts_as_payload(self) -> bool {
-        matches!(self, Self::ForwardPayload)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum C2uKeepaliveDecision {
-    Consume,
-    ReplyLocally,
-}
-
-pub(crate) struct SharedSyncIcmpState {
-    generation: AlignedAtomicU64,
-    latest: AlignedLatest,
-    reply_icmp_seq: AlignedReplySeq,
-    dedup_slots: [DedupSlot; DEDUP_SLOT_COUNT],
-    catchup_window: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SyncIcmpCache {
-    generation: u64,
-    latest_sent_seq: u16,
-    latest_valid: bool,
-    reply_icmp_seq: u16,
-    catchup_window: usize,
-}
-
-impl SharedSyncIcmpState {
-    pub(crate) fn new(icmp_sync_pps: u32) -> Self {
-        Self {
-            generation: AlignedAtomicU64(AtomicU64::new(1)),
-            latest: AlignedLatest {
-                seq: AtomicU16::new(0),
-                valid: AtomicBool::new(false),
-            },
-            reply_icmp_seq: AlignedReplySeq(AtomicU16::new(0)),
-            dedup_slots: [const { DedupSlot(AtomicU64::new(0)) }; DEDUP_SLOT_COUNT],
-            catchup_window: sync_catchup_window(icmp_sync_pps),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn cache(&self) -> SyncIcmpCache {
-        SyncIcmpCache {
-            generation: self.generation.0.load(AtomOrdering::Relaxed),
-            latest_sent_seq: self.latest.seq.load(AtomOrdering::Relaxed),
-            latest_valid: self.latest.valid.load(AtomOrdering::Relaxed),
-            reply_icmp_seq: self.reply_icmp_seq.0.load(AtomOrdering::Relaxed),
-            catchup_window: self.catchup_window,
-        }
-    }
-}
-
-impl SyncIcmpCache {
-    #[inline]
-    fn refresh_from_shared(&mut self, shared: &SharedSyncIcmpState) {
-        self.generation = shared.generation.0.load(AtomOrdering::Relaxed);
-        self.latest_sent_seq = shared.latest.seq.load(AtomOrdering::Relaxed);
-        self.latest_valid = shared.latest.valid.load(AtomOrdering::Relaxed);
-        self.reply_icmp_seq = shared.reply_icmp_seq.0.load(AtomOrdering::Relaxed);
-        self.catchup_window = shared.catchup_window;
-    }
-
-    #[cfg(test)]
-    fn catchup_window(&self) -> usize {
-        self.catchup_window
-    }
-}
-
-#[inline]
-pub(crate) fn sync_icmp_enabled(cfg: &Config) -> bool {
-    cfg.icmp_sync_pps > 0 && cfg.upstream_proto == SupportedProtocol::ICMP
-}
 
 #[inline]
 pub(crate) fn sync_catchup_window(icmp_sync_pps: u32) -> usize {
-    usize::try_from(icmp_sync_pps)
-        .unwrap_or(usize::MAX)
+    (icmp_sync_pps as usize)
         .saturating_div(4)
         .clamp(MIN_CATCHUP_WINDOW, MAX_CATCHUP_WINDOW)
 }
 
-#[inline]
-fn pack_dedup_stamp(generation: u64, seq: u16) -> u64 {
-    (generation << 16) | u64::from(seq)
-}
-
-pub(crate) fn reset_session(shared: &SharedSyncIcmpState, cache: &mut SyncIcmpCache) {
-    let next_generation = shared
-        .generation
-        .0
-        .fetch_add(1, AtomOrdering::Relaxed)
-        .wrapping_add(1);
-    shared.latest.valid.store(false, AtomOrdering::Relaxed);
-    shared.latest.seq.store(0, AtomOrdering::Relaxed);
-    shared.reply_icmp_seq.0.store(0, AtomOrdering::Relaxed);
-    cache.generation = next_generation;
-    cache.latest_valid = false;
-    cache.latest_sent_seq = 0;
-    cache.reply_icmp_seq = 0;
-    cache.catchup_window = shared.catchup_window;
-}
-
-pub(crate) fn remember_request_seq(
-    shared: &SharedSyncIcmpState,
-    cache: &mut SyncIcmpCache,
-    wire: &WirePayload<'_>,
-) {
-    if wire.src_is_icmp {
-        shared
-            .reply_icmp_seq
-            .0
-            .store(wire.src_seq, AtomOrdering::Relaxed);
-        cache.reply_icmp_seq = wire.src_seq;
-    }
-}
-
-pub(crate) fn classify_u2c(
-    cfg: &Config,
-    event: &PayloadEvent<'_>,
-    origin: PayloadOrigin,
-    shared: &SharedSyncIcmpState,
-    cache: &mut SyncIcmpCache,
-) -> io::Result<U2cDecision> {
-    let wire = event.wire();
-    if !wire.src_is_icmp {
-        return Ok(U2cDecision::ForwardPayload);
-    }
-    if !sync_icmp_enabled(cfg) {
-        return if matches!(event, PayloadEvent::SyncKeepalive(_)) {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ICMP keepalive arrived while sync mode is disabled",
-            ))
-        } else {
-            Ok(U2cDecision::ForwardPayload)
-        };
+pub(crate) fn validate_u2c_sync(
+    cfg: &RuntimeConfig,
+    icmp_seq: u16,
+    sequence_state: &SharedIcmpSequenceState,
+    sequence_cache: &mut IcmpSequenceCache,
+) -> io::Result<()> {
+    if !cfg.is_icmp_sync_enabled() {
+        return Ok(());
     }
 
-    cache.refresh_from_shared(shared);
-    if !cache.latest_valid {
+    sequence_cache.refresh_from_shared(sequence_state);
+    if !sequence_cache.latest_valid {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "ICMP sync mode: reply arrived before any request",
         ));
     }
 
-    let latest_seq = cache.latest_sent_seq;
-    let lag = latest_seq.wrapping_sub(wire.src_seq) as usize;
-    if lag > cache.catchup_window {
-        let ahead = wire.src_seq.wrapping_sub(latest_seq);
+    let latest_seq = sequence_cache.latest_sent_seq;
+    let lag = latest_seq.wrapping_sub(icmp_seq) as usize;
+    let catchup_window = sync_catchup_window(cfg.icmp_sync_pps);
+    if lag > catchup_window {
+        let ahead = icmp_seq.wrapping_sub(latest_seq);
         let msg = if ahead != 0 && ahead <= u16::MAX / 2 {
             "ICMP sync mode: future reply sequence"
         } else {
@@ -198,142 +43,108 @@ pub(crate) fn classify_u2c(
         };
         return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
-
-    let stamp = pack_dedup_stamp(cache.generation, wire.src_seq);
-    let slot = &shared.dedup_slots[(wire.src_seq as usize) & (DEDUP_SLOT_COUNT - 1)].0;
-    let mut prev = slot.load(AtomOrdering::Relaxed);
-    loop {
-        if prev == stamp {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ICMP sync mode: duplicate reply sequence",
-            ));
-        }
-        match slot.compare_exchange_weak(prev, stamp, AtomOrdering::Relaxed, AtomOrdering::Relaxed)
-        {
-            Ok(_) => break,
-            Err(current) => prev = current,
-        }
-    }
-
-    if matches!(event, PayloadEvent::SyncKeepalive(_)) && origin == PayloadOrigin::Wire {
-        if cfg.listen_proto == SupportedProtocol::ICMP {
-            Ok(U2cDecision::ForwardKeepaliveReply)
-        } else {
-            Ok(U2cDecision::ConsumeKeepalive)
-        }
-    } else {
-        Ok(U2cDecision::ForwardPayload)
-    }
-}
-
-pub(crate) fn classify_c2u_keepalive(
-    cfg: &Config,
-    wire: &WirePayload<'_>,
-    shared: &SharedSyncIcmpState,
-    cache: &mut SyncIcmpCache,
-) -> io::Result<C2uKeepaliveDecision> {
-    if !wire.src_is_icmp {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMP keepalive arrived while sync mode is disabled",
-        ));
-    }
-    remember_request_seq(shared, cache, wire);
-    if wire.dst_proto == SupportedProtocol::ICMP {
-        if !sync_icmp_enabled(cfg) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ICMP keepalive arrived while sync mode is disabled",
-            ));
-        }
-        Ok(C2uKeepaliveDecision::Consume)
-    } else {
-        Ok(C2uKeepaliveDecision::ReplyLocally)
-    }
-}
-
-pub(crate) fn prepare_send(
-    c2u: bool,
-    wire: &WirePayload<'_>,
-    will_forward: bool,
-    shared: &SharedSyncIcmpState,
-    cache: &mut SyncIcmpCache,
-) -> Option<u16> {
-    if !will_forward || wire.dst_proto != SupportedProtocol::ICMP {
-        return None;
-    }
-
-    if c2u {
-        let seq = REQUEST_ICMP_SEQ.fetch_add(1, AtomOrdering::Relaxed);
-        shared.latest.seq.store(seq, AtomOrdering::Relaxed);
-        shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = seq;
-        cache.latest_valid = true;
-        cache.generation = shared.generation.0.load(AtomOrdering::Relaxed);
-        Some(seq)
-    } else {
-        cache.reply_icmp_seq = shared.reply_icmp_seq.0.load(AtomOrdering::Relaxed);
-        Some(cache.reply_icmp_seq)
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::cli::{ReresolveMode, TimeoutAction};
+    use super::{RuntimeConfig, sync_catchup_window, validate_u2c_sync};
+    use crate::cli::{
+        DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeOptions,
+        SupportedProtocol, TimeoutAction, WorkerFlowMode,
+    };
+    use crate::net::icmp_sequence::{SharedIcmpSequenceState, reset_sequence_state};
+    use crate::net::params::CanonicalAddr;
+    use crate::net::payload::{
+        C2uSessionControlDecision, PayloadEvent, U2cDecision, allocate_send_sequence,
+        classify_c2u_session_control_event, classify_u2c_event,
+    };
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::sync::atomic::Ordering as AtomOrdering;
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::thread;
 
     static SYNC_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    fn test_config() -> Config {
-        Config {
-            listen_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
-            listen_port_id: 1234,
-            listen_proto: SupportedProtocol::UDP,
-            listen_str: String::from("test-listen"),
-            workers: 1,
-            worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,
-            upstream_proto: SupportedProtocol::ICMP,
-            upstream_str: String::from("test-upstream"),
-            timeout_secs: 10,
-            on_timeout: TimeoutAction::Drop,
-            stats_interval_mins: 0,
-            max_payload: 1500,
-            icmp_sync_pps: 10,
-            reresolve_secs: 0,
-            reresolve_mode: ReresolveMode::Upstream,
-            #[cfg(unix)]
-            run_as_user: None,
-            #[cfg(unix)]
-            run_as_group: None,
-            debug_no_connect: false,
-            debug_log_drops: false,
-            debug_log_handles: false,
-            debug_fast_stats: false,
+    fn lock_sync_state() -> MutexGuard<'static, ()> {
+        match SYNC_TEST_LOCK.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
         }
     }
 
-    fn test_wire<'a>(payload: &'a [u8], seq: u16, dst_proto: SupportedProtocol) -> WirePayload<'a> {
-        WirePayload {
-            src_is_icmp: true,
-            src_seq: seq,
-            dst_proto,
-            payload,
-            pub_len: payload.len(),
+    fn localhost_canonical(id: u16) -> CanonicalAddr {
+        CanonicalAddr::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, id)),
+            id,
+        )
+    }
+
+    fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            listen: localhost_canonical(0),
+            listener_source_id_request: IcmpReplyIdRequest::Default,
+            listener_reply_id_request: IcmpReplyIdRequest::Default,
+            listen_proto: SupportedProtocol::UDP,
+            listen_mode: ListenMode::Dynamic,
+            listen_str: String::from("UDP:127.0.0.1:0"),
+            upstream: localhost_canonical(0),
+            upstream_source_id_request: IcmpReplyIdRequest::Default,
+            upstream_reply_id_request: IcmpReplyIdRequest::Default,
+            upstream_proto: SupportedProtocol::ICMP,
+            upstream_str: String::from("UDP:127.0.0.1:0"),
+            options: RuntimeOptions {
+                workers: 1,
+                worker_flow_mode: WorkerFlowMode::SharedFlow,
+                timeout_secs: 1,
+                icmp_handshake_timeout_secs: 1,
+                on_timeout: TimeoutAction::Drop,
+                stats_interval_mins: 60,
+                max_payload: 1500,
+                icmp_sync_pps: 100,
+                reresolve_secs: 0,
+                reresolve_mode: ReresolveMode::Upstream,
+                debug_reresolve_address_file: None,
+                #[cfg(unix)]
+                run_as_user: None,
+                #[cfg(unix)]
+                run_as_group: None,
+                debug_behavior: DebugBehavior {
+                    icmp_kernel_echo_self_handshake: false,
+                    client_unconnected: false,
+                    upstream_unconnected: false,
+                    fast_stats: false,
+                    force_raw_icmp_wildcard_upstream: false,
+                },
+                debug_logs: DebugLogs {
+                    packets: false,
+                    handshake: false,
+                    handles: false,
+                    drops: false,
+                    packet_dump: false,
+                },
+            },
         }
+    }
+
+    fn test_user_event(bytes: &[u8], seq: u16, dst_proto: SupportedProtocol) -> PayloadEvent<'_> {
+        PayloadEvent::user_payload(0, 0, seq, dst_proto, bytes)
+    }
+
+    fn test_session_control_event(seq: u16, dst_proto: SupportedProtocol) -> PayloadEvent<'static> {
+        PayloadEvent::session_control(0, 0, seq, dst_proto, &[], Some(0x9999))
+    }
+
+    fn test_reply_id_session_control_event(
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        reply_id: u16,
+    ) -> PayloadEvent<'static> {
+        PayloadEvent::session_control(0, 0, seq, dst_proto, &[], Some(reply_id))
     }
 
     fn reset_request_counter() {
-        REQUEST_ICMP_SEQ.store(0, AtomOrdering::Relaxed);
-    }
-
-    fn lock_sync_state() -> MutexGuard<'static, ()> {
-        SYNC_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        crate::net::icmp_sequence::reset_request_counter_for_tests();
     }
 
     #[test]
@@ -341,16 +152,11 @@ mod tests {
         let _guard = lock_sync_state();
         reset_request_counter();
         let cfg = Arc::new(test_config());
-        let shared = Arc::new(SharedSyncIcmpState::new(cfg.icmp_sync_pps));
-        let mut seed = shared.cache();
-        seed.generation = shared.generation.0.load(AtomOrdering::Relaxed);
-        prepare_send(
-            true,
-            &test_wire(b"x", 0, SupportedProtocol::ICMP),
-            true,
-            &shared,
-            &mut seed,
-        );
+        let sequence_state = Arc::new(SharedIcmpSequenceState::new());
+        let mut seed_cache = sequence_state.cache();
+        seed_cache.generation = sequence_state.generation.0.load(AtomOrdering::Relaxed);
+        let seed_event = test_user_event(b"x", 0, SupportedProtocol::ICMP);
+        allocate_send_sequence(true, &seed_event, true, &sequence_state, &mut seed_cache);
 
         let thread_count = 16;
         let barrier = Arc::new(Barrier::new(thread_count));
@@ -358,16 +164,12 @@ mod tests {
         for _ in 0..thread_count {
             let b = barrier.clone();
             let c = cfg.clone();
-            let s = shared.clone();
+            let s = sequence_state.clone();
             handles.push(thread::spawn(move || {
-                let mut cache = s.cache();
-                let event = PayloadEvent::UserData(test_wire(
-                    b"race",
-                    cache.latest_sent_seq,
-                    SupportedProtocol::UDP,
-                ));
+                let cache = s.cache();
+                let event = test_user_event(b"race", cache.latest_sent_seq, SupportedProtocol::UDP);
                 b.wait();
-                classify_u2c(&c, &event, PayloadOrigin::Wire, &s, &mut cache)
+                classify_u2c_event(&c, &event, &s)
             }));
         }
 
@@ -375,9 +177,9 @@ mod tests {
         let mut dup_count = 0;
         for h in handles {
             match h.join().unwrap() {
-                Ok(U2cDecision::ForwardPayload) => success_count += 1,
+                Ok(_) => success_count += 1,
                 Err(e) if e.to_string().contains("duplicate") => dup_count += 1,
-                other => panic!("unexpected result: {:?}", other),
+                Err(e) => panic!("unexpected error: {e}"),
             }
         }
         assert_eq!(success_count, 1);
@@ -389,37 +191,33 @@ mod tests {
         let _guard = lock_sync_state();
         reset_request_counter();
         let cfg = test_config();
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
-        prepare_send(
-            true,
-            &test_wire(b"x", 0, SupportedProtocol::ICMP),
-            true,
-            &shared,
-            &mut cache,
-        );
+
+        let seed_event = test_user_event(b"x", 0, SupportedProtocol::ICMP);
+        allocate_send_sequence(true, &seed_event, true, &shared, &mut cache);
         shared.latest.seq.store(100, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 100;
+        shared.latest.valid.store(true, AtomOrdering::Relaxed);
+        cache.refresh_from_shared(&shared);
 
-        let seq100 = PayloadEvent::UserData(test_wire(b"100", 100, SupportedProtocol::UDP));
-        assert!(classify_u2c(&cfg, &seq100, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
+        let seq100 = test_user_event(b"100", 100, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &seq100, &shared).is_ok());
 
-        let seq99 = PayloadEvent::UserData(test_wire(b"99", 99, SupportedProtocol::UDP));
-        assert!(classify_u2c(&cfg, &seq99, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
+        let seq99 = test_user_event(b"99", 99, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &seq99, &shared).is_ok());
         assert!(
-            classify_u2c(&cfg, &seq99, PayloadOrigin::Wire, &shared, &mut cache)
+            classify_u2c_event(&cfg, &seq99, &shared)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")
         );
 
-        let stale = PayloadEvent::UserData(test_wire(
-            b"stale",
-            100u16.wrapping_sub((cache.catchup_window() + 1) as u16),
-            SupportedProtocol::UDP,
-        ));
+        let catchup_window = sync_catchup_window(cfg.icmp_sync_pps);
+        let stale_seq = 100u16.wrapping_sub((catchup_window + 1) as u16);
+        let stale = test_user_event(b"stale", stale_seq, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &stale, &shared).is_ok());
         assert!(
-            classify_u2c(&cfg, &stale, PayloadOrigin::Wire, &shared, &mut cache)
+            validate_u2c_sync(&cfg, stale_seq, &shared, &mut cache)
                 .unwrap_err()
                 .to_string()
                 .contains("stale")
@@ -431,30 +229,32 @@ mod tests {
         let _guard = lock_sync_state();
         reset_request_counter();
         let cfg = test_config();
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
+
         shared.latest.seq.store(1025, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 1025;
-        cache.latest_valid = true;
+        cache.refresh_from_shared(&shared);
 
-        let stale = PayloadEvent::UserData(test_wire(b"stale", 0, SupportedProtocol::UDP));
+        let stale = test_user_event(b"stale", 0, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &stale, &shared).is_ok());
         assert!(
-            classify_u2c(&cfg, &stale, PayloadOrigin::Wire, &shared, &mut cache)
+            validate_u2c_sync(&cfg, 0, &shared, &mut cache)
                 .unwrap_err()
                 .to_string()
                 .contains("stale")
         );
 
-        let latest = PayloadEvent::UserData(test_wire(b"latest", 1025, SupportedProtocol::UDP));
+        let latest = test_user_event(b"latest", 1025, SupportedProtocol::UDP);
         assert_eq!(
-            classify_u2c(&cfg, &latest, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
+            classify_u2c_event(&cfg, &latest, &shared).unwrap(),
             U2cDecision::ForwardPayload
         );
+        assert!(validate_u2c_sync(&cfg, 1025, &shared, &mut cache).is_ok());
 
-        let dup = PayloadEvent::UserData(test_wire(b"latest", 1025, SupportedProtocol::UDP));
+        let dup = test_user_event(b"latest", 1025, SupportedProtocol::UDP);
         assert!(
-            classify_u2c(&cfg, &dup, PayloadOrigin::Wire, &shared, &mut cache)
+            classify_u2c_event(&cfg, &dup, &shared)
                 .unwrap_err()
                 .to_string()
                 .contains("duplicate")
@@ -466,16 +266,17 @@ mod tests {
         let _guard = lock_sync_state();
         reset_request_counter();
         let cfg = test_config();
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
+
         shared.latest.seq.store(5, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 5;
-        cache.latest_valid = true;
+        cache.refresh_from_shared(&shared);
 
-        let event = PayloadEvent::UserData(test_wire(b"future", 7, SupportedProtocol::UDP));
+        let event = test_user_event(b"future", 7, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &event, &shared).is_ok());
         assert!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache)
+            validate_u2c_sync(&cfg, 7, &shared, &mut cache)
                 .unwrap_err()
                 .to_string()
                 .contains("future")
@@ -487,119 +288,259 @@ mod tests {
         let _guard = lock_sync_state();
         reset_request_counter();
         let cfg = test_config();
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
+
         shared.latest.seq.store(1, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 1;
-        cache.latest_valid = true;
+        cache.refresh_from_shared(&shared);
 
-        let event = PayloadEvent::UserData(test_wire(b"wrap", u16::MAX, SupportedProtocol::UDP));
+        let event = test_user_event(b"wrap", u16::MAX, SupportedProtocol::UDP);
         assert_eq!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
             U2cDecision::ForwardPayload
         );
+        assert!(validate_u2c_sync(&cfg, u16::MAX, &shared, &mut cache).is_ok());
     }
 
     #[test]
-    fn classify_u2c_marks_empty_latest_reply_keepalive_only_for_udp_listener() {
+    fn classify_u2c_marks_empty_latest_reply_as_session_control_for_udp_listener() {
         let _guard = lock_sync_state();
         let cfg = test_config();
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
         shared.latest.seq.store(5, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 5;
-        cache.latest_valid = true;
+        cache.refresh_from_shared(&shared);
 
-        let event = PayloadEvent::SyncKeepalive(test_wire(&[], 5, SupportedProtocol::UDP));
+        let event = test_session_control_event(5, SupportedProtocol::UDP);
         assert_eq!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
-            U2cDecision::ConsumeKeepalive
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
+            U2cDecision::ConsumeSessionControl
         );
     }
 
     #[test]
-    fn classify_u2c_forwards_keepalive_reply_for_icmp_listener() {
+    fn classify_u2c_rejects_duplicate_session_control_sequence() {
         let _guard = lock_sync_state();
-        let mut cfg = test_config();
-        cfg.listen_proto = SupportedProtocol::ICMP;
-        cfg.listen_port_id = 2222;
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let cfg = test_config();
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
         shared.latest.seq.store(5, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 5;
-        cache.latest_valid = true;
+        cache.refresh_from_shared(&shared);
 
-        let event = PayloadEvent::SyncKeepalive(test_wire(&[], 5, SupportedProtocol::ICMP));
+        let control = test_session_control_event(5, SupportedProtocol::UDP);
         assert_eq!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
-            U2cDecision::ForwardKeepaliveReply
+            classify_u2c_event(&cfg, &control, &shared).unwrap(),
+            U2cDecision::ConsumeSessionControl
+        );
+
+        let duplicate = test_session_control_event(5, SupportedProtocol::UDP);
+        assert!(
+            classify_u2c_event(&cfg, &duplicate, &shared)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
         );
     }
 
     #[test]
-    fn classify_c2u_keepalive_replies_locally_when_upstream_is_not_icmp() {
+    fn classify_u2c_rejects_stale_session_control_sequence() {
+        let _guard = lock_sync_state();
+        let cfg = test_config();
+        let shared = SharedIcmpSequenceState::new();
+        let mut cache = shared.cache();
+        shared.latest.seq.store(1025, AtomOrdering::Relaxed);
+        shared.latest.valid.store(true, AtomOrdering::Relaxed);
+        cache.refresh_from_shared(&shared);
+
+        let stale = test_session_control_event(0, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &stale, &shared).is_ok());
+        assert!(
+            validate_u2c_sync(&cfg, 0, &shared, &mut cache)
+                .unwrap_err()
+                .to_string()
+                .contains("stale")
+        );
+    }
+
+    #[test]
+    fn classify_u2c_session_control_consumes_dedup_slot() {
+        let _guard = lock_sync_state();
+        let cfg = test_config();
+        let shared = SharedIcmpSequenceState::new();
+        let mut cache = shared.cache();
+        shared.latest.seq.store(5, AtomOrdering::Relaxed);
+        shared.latest.valid.store(true, AtomOrdering::Relaxed);
+        cache.refresh_from_shared(&shared);
+
+        let control = test_session_control_event(5, SupportedProtocol::UDP);
+        assert_eq!(
+            classify_u2c_event(&cfg, &control, &shared).unwrap(),
+            U2cDecision::ConsumeSessionControl
+        );
+
+        let payload = test_user_event(b"latest", 5, SupportedProtocol::UDP);
+        assert!(
+            classify_u2c_event(&cfg, &payload, &shared)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn prepare_send_assigns_distinct_sequences_to_negotiation_control_and_buffered_payload() {
+        let _guard = lock_sync_state();
+        reset_request_counter();
+        let _cfg = test_config();
+        let shared = SharedIcmpSequenceState::new();
+        let mut cache = shared.cache();
+
+        let control = test_reply_id_session_control_event(0, SupportedProtocol::ICMP, 2002);
+        let control_seq = allocate_send_sequence(true, &control, true, &shared, &mut cache)
+            .expect("session-control send should allocate ICMP sequence");
+
+        let buffered_payload = test_user_event(b"buffered", 0, SupportedProtocol::ICMP);
+        let payload_seq =
+            allocate_send_sequence(true, &buffered_payload, true, &shared, &mut cache)
+                .expect("buffered payload send should allocate ICMP sequence");
+
+        assert_ne!(control_seq, payload_seq);
+        assert_eq!(payload_seq, control_seq.wrapping_add(1));
+        assert_eq!(cache.latest_sent_seq, payload_seq);
+        assert_eq!(shared.latest.seq.load(AtomOrdering::Relaxed), payload_seq);
+    }
+
+    #[test]
+    fn classify_u2c_forwards_session_control_reply_for_icmp_listener() {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.listen_proto = SupportedProtocol::ICMP;
+        let shared = SharedIcmpSequenceState::new();
+        let mut cache = shared.cache();
+        shared.latest.seq.store(5, AtomOrdering::Relaxed);
+        shared.latest.valid.store(true, AtomOrdering::Relaxed);
+        cache.refresh_from_shared(&shared);
+
+        let event = test_session_control_event(5, SupportedProtocol::ICMP);
+        assert_eq!(
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
+            U2cDecision::ForwardSessionControl
+        );
+    }
+
+    #[test]
+    fn classify_c2u_session_control_replies_locally_when_upstream_is_not_icmp() {
+        let _guard = lock_sync_state();
+        let mut cfg = test_config();
         cfg.upstream_proto = SupportedProtocol::UDP;
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
-        let wire = test_wire(&[], 11, SupportedProtocol::UDP);
         assert_eq!(
-            classify_c2u_keepalive(&cfg, &wire, &shared, &mut cache).unwrap(),
-            C2uKeepaliveDecision::ReplyLocally
+            classify_c2u_session_control_event(
+                &cfg,
+                &test_session_control_event(11, SupportedProtocol::UDP),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
+            C2uSessionControlDecision::ReplyLocally
         );
     }
 
     #[test]
-    fn classify_c2u_keepalive_consumes_for_icmp_bridge() {
+    fn classify_c2u_reply_id_session_control_replies_locally_for_icmp_bridge_sync_path() {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.listen_proto = SupportedProtocol::ICMP;
         cfg.upstream_proto = SupportedProtocol::ICMP;
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
-        let wire = test_wire(&[], 11, SupportedProtocol::ICMP);
         assert_eq!(
-            classify_c2u_keepalive(&cfg, &wire, &shared, &mut cache).unwrap(),
-            C2uKeepaliveDecision::Consume
+            classify_c2u_session_control_event(
+                &cfg,
+                &test_session_control_event(11, SupportedProtocol::ICMP),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
+            C2uSessionControlDecision::ReplyLocally
         );
     }
 
     #[test]
-    fn classify_u2c_rejects_keepalive_when_sync_is_disabled() {
+    fn classify_c2u_reply_id_session_control_replies_locally_for_icmp_bridge() {
+        let _guard = lock_sync_state();
+        let mut cfg = test_config();
+        cfg.listen_proto = SupportedProtocol::ICMP;
+        cfg.upstream_proto = SupportedProtocol::ICMP;
+        let shared = SharedIcmpSequenceState::new();
+        let mut cache = shared.cache();
+        assert_eq!(
+            classify_c2u_session_control_event(
+                &cfg,
+                &test_reply_id_session_control_event(11, SupportedProtocol::ICMP, 2002),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
+            C2uSessionControlDecision::ReplyLocally
+        );
+    }
+
+    #[test]
+    fn classify_u2c_handles_session_control_when_sync_is_disabled() {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.icmp_sync_pps = 0;
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
-        let mut cache = shared.cache();
-        let event = PayloadEvent::SyncKeepalive(test_wire(&[], 5, SupportedProtocol::UDP));
-        assert!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache)
-                .unwrap_err()
-                .to_string()
-                .contains("sync mode is disabled")
+        let shared = SharedIcmpSequenceState::new();
+
+        let event1 = test_session_control_event(1, SupportedProtocol::UDP);
+        assert_eq!(
+            classify_u2c_event(&cfg, &event1, &shared).unwrap(),
+            U2cDecision::ConsumeSessionControl
+        );
+
+        cfg.listen_proto = SupportedProtocol::ICMP;
+        let event2 = test_session_control_event(2, SupportedProtocol::UDP);
+        assert_eq!(
+            classify_u2c_event(&cfg, &event2, &shared).unwrap(),
+            U2cDecision::ConsumeSessionControl // NOT Forwarded when sync is disabled
         );
     }
 
     #[test]
-    fn classify_c2u_rejects_keepalive_when_sync_is_disabled() {
+    fn classify_u2c_consumes_wire_cadence_packet() {
+        let _guard = lock_sync_state();
+        let cfg = test_config();
+        let shared = SharedIcmpSequenceState::new();
+        let event = PayloadEvent::cadence_packet(0x1234, 7);
+        assert_eq!(
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
+            U2cDecision::ConsumeCadence
+        );
+    }
+
+    #[test]
+    fn classify_c2u_handles_session_control_when_sync_is_disabled() {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.listen_proto = SupportedProtocol::ICMP;
         cfg.upstream_proto = SupportedProtocol::ICMP;
         cfg.icmp_sync_pps = 0;
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
-        let wire = test_wire(&[], 11, SupportedProtocol::ICMP);
-        assert!(
-            classify_c2u_keepalive(&cfg, &wire, &shared, &mut cache)
-                .unwrap_err()
-                .to_string()
-                .contains("sync mode is disabled")
+        assert_eq!(
+            classify_c2u_session_control_event(
+                &cfg,
+                &test_session_control_event(11, SupportedProtocol::ICMP),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
+            C2uSessionControlDecision::ReplyLocally // NOT Forwarded when sync is disabled
         );
     }
 
@@ -608,62 +549,92 @@ mod tests {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.icmp_sync_pps = 0;
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
-        let mut cache = shared.cache();
-        let event = PayloadEvent::UserData(test_wire(b"plain-icmp", 77, SupportedProtocol::UDP));
+        let shared = SharedIcmpSequenceState::new();
+        let event = test_user_event(b"plain-icmp", 77, SupportedProtocol::UDP);
         assert_eq!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
             U2cDecision::ForwardPayload
         );
+    }
+
+    #[test]
+    fn classify_u2c_rejects_duplicate_user_sequence_when_sync_is_disabled() {
+        let _guard = lock_sync_state();
+        let mut cfg = test_config();
+        cfg.icmp_sync_pps = 0;
+        let shared = SharedIcmpSequenceState::new();
+        let event = test_user_event(b"plain-icmp", 77, SupportedProtocol::UDP);
+        assert_eq!(
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
+            U2cDecision::ForwardPayload
+        );
+
+        let duplicate_error = classify_u2c_event(&cfg, &event, &shared)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(duplicate_error, "duplicate ICMP tunnel sequence");
+        assert!(!duplicate_error.contains("sync mode"));
+    }
+
+    #[test]
+    fn classify_u2c_rejects_duplicate_session_control_when_sync_is_disabled() {
+        let _guard = lock_sync_state();
+        let mut cfg = test_config();
+        cfg.icmp_sync_pps = 0;
+        let shared = SharedIcmpSequenceState::new();
+        let event = test_reply_id_session_control_event(77, SupportedProtocol::UDP, 4040);
+        assert_eq!(
+            classify_u2c_event(&cfg, &event, &shared).unwrap(),
+            U2cDecision::ConsumeSessionControl
+        );
+
+        let duplicate_error = classify_u2c_event(&cfg, &event, &shared)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(duplicate_error, "duplicate ICMP tunnel sequence");
+        assert!(!duplicate_error.contains("sync mode"));
     }
 
     #[test]
     fn session_reset_allows_same_sequence_again() {
         let _guard = lock_sync_state();
         let cfg = test_config();
-        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let shared = SharedIcmpSequenceState::new();
         let mut cache = shared.cache();
         shared.latest.seq.store(12, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 12;
-        cache.latest_valid = true;
-        let event = PayloadEvent::UserData(test_wire(b"first", 12, SupportedProtocol::UDP));
-        assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
-        reset_session(&shared, &mut cache);
+        cache.refresh_from_shared(&shared);
+        let event = test_user_event(b"first", 12, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &event, &shared).is_ok());
+
+        reset_sequence_state(false, &shared, &mut cache);
         shared.latest.seq.store(12, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache.latest_sent_seq = 12;
-        cache.latest_valid = true;
-        assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
+        cache.refresh_from_shared(&shared);
+        assert!(classify_u2c_event(&cfg, &event, &shared).is_ok());
     }
 
     #[test]
     fn single_flow_uses_independent_sync_states() {
         let _guard = lock_sync_state();
         let cfg = test_config();
-        let shared_a = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
-        let shared_b = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
-        let mut cache_a = shared_a.cache();
-        let mut cache_b = shared_b.cache();
-        shared_a.latest.seq.store(44, AtomOrdering::Relaxed);
-        shared_b.latest.seq.store(44, AtomOrdering::Relaxed);
-        shared_a.latest.valid.store(true, AtomOrdering::Relaxed);
-        shared_b.latest.valid.store(true, AtomOrdering::Relaxed);
-        cache_a.latest_sent_seq = 44;
-        cache_b.latest_sent_seq = 44;
-        cache_a.latest_valid = true;
-        cache_b.latest_valid = true;
+        let shared_a = SharedIcmpSequenceState::new();
+        let shared_b = SharedIcmpSequenceState::new();
 
-        let event = PayloadEvent::UserData(test_wire(b"a", 44, SupportedProtocol::UDP));
-        assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared_a, &mut cache_a).is_ok());
-        assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared_b, &mut cache_b).is_ok());
+        shared_a.latest.seq.store(44, AtomOrdering::Relaxed);
+        shared_a.latest.valid.store(true, AtomOrdering::Relaxed);
+        shared_b.latest.seq.store(44, AtomOrdering::Relaxed);
+        shared_b.latest.valid.store(true, AtomOrdering::Relaxed);
+
+        let event = test_user_event(b"a", 44, SupportedProtocol::UDP);
+        assert!(classify_u2c_event(&cfg, &event, &shared_a).is_ok());
+        assert!(classify_u2c_event(&cfg, &event, &shared_b).is_ok());
     }
 
     #[test]
     fn sync_catchup_window_clamps() {
         assert_eq!(sync_catchup_window(0), 8);
-        assert_eq!(sync_catchup_window(8), 8);
-        assert_eq!(sync_catchup_window(40), 10);
-        assert_eq!(sync_catchup_window(u32::from(u16::MAX)), 1024);
+        assert_eq!(sync_catchup_window(1000), 250);
+        assert_eq!(sync_catchup_window(100000), 1024);
     }
 }

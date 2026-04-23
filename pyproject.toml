@@ -1,0 +1,9 @@
+[tool.ruff]
+extend-exclude = [".artifacts", "cross-artifacts", "docker-artifacts", "target"]
+target-version = "py313"
+
+[tool.mypy]
+exclude = ["^\\.artifacts/", "^cross-artifacts/", "^docker-artifacts/", "^target/"]
+files = [".github/scripts", "docker"]
+python_version = "3.13"
+strict = true

@@ -1,5 +1,8 @@
+use crate::flow_state::FlowRuntimeState;
 use crate::net::sock_mgr::SocketManager;
+use crate::stats_support::{EWMA_LN_BETA, MAINT_TICK_MS};
 use serde_json::json;
+use socket2::Type;
 
 use std::io::Write;
 use std::process;
@@ -8,22 +11,19 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// EWMA decay constant: ln(beta) where beta = 2^(-1/H) and H is half-life in samples.
-const EWMA_LN_BETA: f64 = -std::f64::consts::LN_2 / 200_000.0; // H = 200k
-
 pub(crate) trait StatsSink {
     fn send_add(&self, c2u: bool, bytes: u64, start: Instant, end: Instant);
     fn drop_err(&self, c2u: bool);
     fn drop_oversize(&self, c2u: bool);
 }
 
-pub struct Stats {
+pub(crate) struct Stats {
     start: OnceLock<Instant>,
     spawned: AtomicBool,
     shards: Vec<Arc<StatsShard>>,
 }
 
-pub struct StatsShard {
+pub(crate) struct StatsShard {
     agg: Agg,
 }
 
@@ -63,11 +63,6 @@ struct Agg {
 }
 
 impl Stats {
-    #[cfg(test)]
-    pub fn new() -> Self {
-        Self::with_worker_shards(1)
-    }
-
     pub fn with_worker_shards(worker_pairs: usize) -> Self {
         let shard_count = worker_pairs.max(1);
         Self {
@@ -151,13 +146,15 @@ impl Stats {
     #[inline]
     fn safe_println(s: &str) {
         log_info!("{}", s);
-        let _ = std::io::stdout().flush();
+        if std::io::stdout().flush().is_err() {
+            // Stats output is best-effort; logging already handles broken stdout.
+        }
     }
 
     fn print_snapshot(
         &self,
-        sock_mgr: &SocketManager,
-        locked: &AtomicBool,
+        sock_mgrs: &[Arc<SocketManager>],
+        flow_states: &[Arc<FlowRuntimeState>],
         c2u_ewma_ns: u64,
         u2c_ewma_ns: u64,
     ) {
@@ -177,22 +174,65 @@ impl Stats {
         let u2c_us_ewma = u2c_ewma_ns / 1000;
         let c2u_us_max = snap.c2u_lat_max_ns / 1000;
         let u2c_us_max = snap.u2c_lat_max_ns / 1000;
-        let locked = locked.load(AtomOrdering::Relaxed);
-        let (client_addr_opt, _, client_proto) = {
-            let res = sock_mgr.get_client_dest();
-            (if locked { res.0 } else { None }, res.1, res.2)
-        };
-        let client_addr = client_addr_opt
-            .map(|x| x.to_string())
-            .unwrap_or_else(|| "null".to_string());
-        let (upstream_addr, _, upstream_proto) = sock_mgr.get_upstream_dest();
-        let line = json!({
+        let worker_flows: Vec<_> = sock_mgrs
+            .iter()
+            .zip(flow_states.iter())
+            .enumerate()
+            .map(|(worker_pair, (sock_mgr, state))| {
+                let snapshot = sock_mgr.snapshot_state();
+                let locked = state.is_locked();
+                let client_sock_type = match snapshot.listen_sock_type {
+                    Type::RAW => "RAW",
+                    Type::DGRAM => "DGRAM",
+                    _ => "OTHER",
+                };
+                let upstream_sock_type = match snapshot.upstream_sock_type {
+                    Type::RAW => "RAW",
+                    Type::DGRAM => "DGRAM",
+                    _ => "OTHER",
+                };
+                json!({
+                    "worker_pair": worker_pair,
+                    "locked": locked,
+                    "client_proto": snapshot.client_proto.to_str(),
+                    "client_sock_type": client_sock_type,
+                    "listener_connected": if locked { snapshot.listener_connected } else { false },
+                    "flow_key": if locked { snapshot.locked_flow.map(|key| key.to_string()) } else { None::<String> },
+                    "listener_flow_inbound": if locked { snapshot.listener_flow.inbound.map(|flow| format!("{} -> {}", flow.src.canonical(), flow.dst.canonical())) } else { None::<String> },
+                    "listener_flow_outbound": if locked { snapshot.listener_flow.outbound.map(|flow| format!("{} -> {}", flow.src.canonical(), flow.dst.canonical())) } else { None::<String> },
+                    "listen_local_filter_canonical": snapshot.listen_local_filter.to_string(),
+                    "listen_local_kernel_addr": snapshot.listen_local_kernel_addr.to_string(),
+                    "listen_socket_evidence": {
+                        "process_id": snapshot.listen_evidence_key.process_id,
+                        "role": "listener",
+                        "domain": if snapshot.listen_evidence_key.domain == socket2::Domain::IPV4 { "ipv4" } else { "ipv6" },
+                        "socket_slot": snapshot.listen_evidence_key.socket_slot,
+                        "generation": snapshot.listen_evidence_key.generation,
+                    },
+                    "upstream_remote_filter_canonical": snapshot.upstream_remote_filter.to_string(),
+                    "upstream_flow_inbound": snapshot.upstream_flow.inbound.map(|flow| format!("{} -> {}", flow.src.canonical(), flow.dst.canonical())),
+                    "upstream_flow_outbound": snapshot.upstream_flow.outbound.map(|flow| format!("{} -> {}", flow.src.canonical(), flow.dst.canonical())),
+                    "upstream_connected": snapshot.upstream_connected,
+                    "upstream_local_filter_canonical": snapshot.upstream_local_filter.to_string(),
+                    "upstream_local_kernel_addr": snapshot.upstream_local_kernel_addr.to_string(),
+                    "upstream_socket_evidence": {
+                        "process_id": snapshot.upstream_evidence_key.process_id,
+                        "role": "upstream",
+                        "domain": if snapshot.upstream_evidence_key.domain == socket2::Domain::IPV4 { "ipv4" } else { "ipv6" },
+                        "socket_slot": snapshot.upstream_evidence_key.socket_slot,
+                        "generation": snapshot.upstream_evidence_key.generation,
+                    },
+                    "upstream_proto": snapshot.upstream_proto.to_str(),
+                    "upstream_sock_type": upstream_sock_type,
+                })
+            })
+            .collect();
+        let locked_worker_pairs = flow_states.iter().filter(|state| state.is_locked()).count();
+        let line = crate::diagnostics::stamp(json!({
             "uptime_s": uptime,
-            "locked": locked,
-            "client_addr": client_addr,
-            "client_proto": client_proto.to_str(),
-            "upstream_addr": upstream_addr,
-            "upstream_proto": upstream_proto.to_str(),
+            "locked": locked_worker_pairs > 0,
+            "locked_worker_pairs": locked_worker_pairs,
+            "worker_flows": worker_flows,
             "c2u_pkts": snap.c2u_pkts,
             "c2u_bytes": snap.c2u_bytes,
             "c2u_bytes_max": snap.c2u_bytes_max,
@@ -209,14 +249,14 @@ impl Stats {
             "u2c_us_ewma": u2c_us_ewma,
             "u2c_us_max": u2c_us_max,
             "u2c_errs": snap.u2c_errs,
-        });
+        }));
         Self::safe_println(&line.to_string());
     }
 
     pub fn spawn_stats_printer(
         self: &Arc<Self>,
-        sock_mgr: Arc<SocketManager>,
-        locked: Arc<AtomicBool>,
+        sock_mgrs: Vec<Arc<SocketManager>>,
+        flow_states: Vec<Arc<FlowRuntimeState>>,
         start: Instant,
         every_secs: u64,
         exit_code_set: Arc<AtomicU32>,
@@ -230,9 +270,11 @@ impl Stats {
         {
             return false;
         }
-        let _ = stats.start.set(start);
+        if stats.start.set(start).is_err() {
+            self.spawned.store(false, AtomOrdering::Relaxed);
+            return false;
+        }
         thread::spawn(move || {
-            const MAINT_TICK_MS: u64 = 250;
             let mut prev = stats.load_snapshot();
             let mut c2u_ewma_ns = 0u64;
             let mut u2c_ewma_ns = 0u64;
@@ -244,19 +286,21 @@ impl Stats {
                 let d_u2c_pkts = snap.u2c_pkts.saturating_sub(prev.u2c_pkts);
                 let d_c2u_lat = snap.c2u_lat_sum_ns.saturating_sub(prev.c2u_lat_sum_ns);
                 let d_u2c_lat = snap.u2c_lat_sum_ns.saturating_sub(prev.u2c_lat_sum_ns);
-                if d_c2u_pkts > 0 {
-                    c2u_ewma_ns =
-                        Self::ewma_compute(c2u_ewma_ns, d_c2u_lat / d_c2u_pkts, d_c2u_pkts);
+                if let Some(avg_c2u_ns) = d_c2u_lat.checked_div(d_c2u_pkts)
+                    && d_c2u_pkts > 0
+                {
+                    c2u_ewma_ns = Self::ewma_compute(c2u_ewma_ns, avg_c2u_ns, d_c2u_pkts);
                 }
-                if d_u2c_pkts > 0 {
-                    u2c_ewma_ns =
-                        Self::ewma_compute(u2c_ewma_ns, d_u2c_lat / d_u2c_pkts, d_u2c_pkts);
+                if let Some(avg_u2c_ns) = d_u2c_lat.checked_div(d_u2c_pkts)
+                    && d_u2c_pkts > 0
+                {
+                    u2c_ewma_ns = Self::ewma_compute(u2c_ewma_ns, avg_u2c_ns, d_u2c_pkts);
                 }
                 prev = snap;
 
                 let now = Instant::now();
                 if now >= next_print_at {
-                    stats.print_snapshot(&sock_mgr, &locked, c2u_ewma_ns, u2c_ewma_ns);
+                    stats.print_snapshot(&sock_mgrs, &flow_states, c2u_ewma_ns, u2c_ewma_ns);
                     next_print_at += print_period;
                     if next_print_at <= now {
                         next_print_at = now + print_period;
@@ -265,7 +309,7 @@ impl Stats {
 
                 let exit = exit_code_set.load(AtomOrdering::Relaxed);
                 if exit >> 31 == 1 {
-                    stats.print_snapshot(&sock_mgr, &locked, c2u_ewma_ns, u2c_ewma_ns);
+                    stats.print_snapshot(&sock_mgrs, &flow_states, c2u_ewma_ns, u2c_ewma_ns);
                     process::exit((exit & 0xFF) as i32);
                 }
 
@@ -417,7 +461,8 @@ impl StatsSink for Stats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Stats, StatsSink};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn aggregated_snapshot_matches_sum_of_shards() {

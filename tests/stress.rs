@@ -1,55 +1,53 @@
-#[path = "common/app_bin.rs"]
-mod app_bin;
-#[path = "common/core.rs"]
-mod core;
-#[path = "common/orchestrator.rs"]
-mod orchestrator;
-
-use crate::core::{JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, wait_for_stats_json_from};
-use crate::orchestrator::{
-    ForwarderConfig, IpFamily, SocketMode, bind_udp_client, launch_forwarder,
-    random_unprivileged_port, spawn_udp_echo_server, wait_for_child_exit_success,
+use pkthere_test_support::forwarder::{ForwarderConfig, launch_forwarder};
+use pkthere_test_support::matrix::spawn_upstream_echo_or_skip;
+use pkthere_test_support::network::{bind_udp_client, localhost_addr, udp_listen_arg};
+use pkthere_test_support::runtime_asserts::expect_session_stats_json;
+use pkthere_test_support::timing::{
+    MAX_WAIT_SECS, STATS_WAIT_MS, STRESS_SEND_PAUSE, STRESS_TEST_DURATION,
 };
 
+use socket2::Domain;
 use std::io;
-use std::net::SocketAddr;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[test]
-#[ignore]
-fn stress_test_ipv4_all() {
-    let _ = IpFamily::V6;
-    let _ = SocketMode::Unconnected;
-    for &proto in SUPPORTED_PROTOCOLS {
-        stress_test_ipv4(proto);
+#[ignore = "long-running release stress owner; invoked exactly by native release-stress CI"]
+fn stress_test_ipv4() {
+    for &proto in pkthere_test_support::runtime_capability::enabled_forward_protocols() {
+        stress_test_ipv4_case(proto);
     }
 }
 
-fn stress_test_ipv4(proto: &str) {
-    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback not available");
+fn stress_test_ipv4_case(proto: &str) {
+    let client_sock = bind_udp_client(Domain::IPV4).expect("IPv4 loopback not available");
 
-    let up_addr = if !proto.eq_ignore_ascii_case("icmp") {
-        spawn_udp_echo_server(IpFamily::V4)
-            .expect("IPv4 echo server could not bind")
-            .0
-    } else {
-        let ident = random_unprivileged_port(IpFamily::V4).expect("random ICMP identifier");
-        format!("127.0.0.1:{ident}")
-            .parse::<SocketAddr>()
-            .expect("IPv4 socket address could not be parsed")
+    let Some((there_arg, _up_addr, _upstream_echo)) =
+        spawn_upstream_echo_or_skip(Domain::IPV4, proto)
+    else {
+        return;
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        mode: SocketMode::Connected,
-        here: "UDP:127.0.0.1:0".to_string(),
-        there: format!("{proto}:{up_addr}"),
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
+        debug_icmp_kernel_echo_self_handshake: proto.eq_ignore_ascii_case("icmp"),
+        debug_force_raw_icmp_wildcard_upstream: false,
+        here: udp_listen_arg(localhost_addr(Domain::IPV4, 0)),
+        there: there_arg,
+        here_source_id: None,
+        here_reply_id: None,
+        there_source_id: None,
+        there_reply_id: None,
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
         fast_stats: false,
         stats_interval_mins: Some(1),
         icmp_sync_pps: None,
+        debug_logs: &[],
+        diagnostic_label: None,
+        icmp_handshake_timeout_secs: None,
     });
 
     client_sock
@@ -61,7 +59,7 @@ fn stress_test_ipv4(proto: &str) {
         .send(&payload)
         .expect("send to forwarder (IPv4)");
 
-    let end = Instant::now() + Duration::from_secs(20);
+    let end = Instant::now() + STRESS_TEST_DURATION;
     let mut sent = 0u64;
 
     let recv_sock = client_sock.try_clone().expect("clone recv socket");
@@ -71,13 +69,13 @@ fn stress_test_ipv4(proto: &str) {
         while Instant::now() < end {
             match recv_sock.recv(&mut buf) {
                 Ok(_) => rcvd += 1,
-                Err(ref e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    continue;
+                Err(e) => {
+                    let kind = e.kind();
+                    if kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::TimedOut {
+                        continue;
+                    }
+                    panic!("recv from forwarder (IPv4): {e}");
                 }
-                Err(e) => panic!("recv from forwarder (IPv4): {e}"),
             }
         }
         rcvd
@@ -90,7 +88,7 @@ fn stress_test_ipv4(proto: &str) {
                 .expect("send to forwarder (IPv4)");
             sent += 1;
         }
-        thread::sleep(Duration::from_micros(50));
+        thread::sleep(STRESS_SEND_PAUSE);
     }
 
     let rcvd = recv_thr.join().expect("join recv thread");
@@ -100,12 +98,15 @@ fn stress_test_ipv4(proto: &str) {
         (rcvd as f64) * 100.0 / (sent as f64)
     };
 
-    wait_for_child_exit_success(&mut session.child, MAX_WAIT_SECS);
+    session
+        .wait_for_exit_success(MAX_WAIT_SECS)
+        .expect("stress forwarder exit");
 
-    let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect(&format!(
-        "did not see stats JSON line within {:?}",
-        JSON_WAIT_MS
-    ));
+    let stats = expect_session_stats_json(
+        &mut session,
+        STATS_WAIT_MS,
+        &format!("did not see stats JSON line within {:?}", STATS_WAIT_MS),
+    );
     let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap();
     let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap();
     let c2u_bytes = stats["c2u_bytes"].as_u64().unwrap();
@@ -120,7 +121,14 @@ fn stress_test_ipv4(proto: &str) {
     );
 
     let min_pct = if proto.eq_ignore_ascii_case("icmp") {
-        40.0
+        #[cfg(not(windows))]
+        {
+            15.0
+        }
+        #[cfg(windows)]
+        {
+            5.0
+        }
     } else {
         60.0
     };

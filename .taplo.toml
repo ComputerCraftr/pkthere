@@ -1,0 +1,9 @@
+include = ["**/*.toml"]
+exclude = ["target/**", ".artifacts/**", "cross-artifacts/**", "docker-artifacts/**"]
+
+[formatting]
+allowed_blank_lines = 1
+array_trailing_comma = true
+column_width = 100
+compact_arrays = true
+reorder_keys = false

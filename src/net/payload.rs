@@ -1,760 +1,472 @@
-use crate::cli::{Config, SupportedProtocol};
-use crate::net::checksum::{checksum16, checksum16_parts};
-use crate::stats::StatsSink;
-use socket2::{SockAddr, Socket, Type};
+use crate::cli::{RuntimeConfig, SupportedProtocol};
+use crate::net::framing_shim::ReplyIdNegotiation;
+use crate::net::icmp_sequence::{
+    IcmpSequenceCache, SharedIcmpSequenceState, admit_inbound_sequence, current_reply_seq,
+    remember_outbound_request_seq,
+};
+use crate::packet_trace::PacketTraceId;
+use std::io;
 
-use std::io::{self, IoSlice};
+#[path = "payload_send.rs"]
+mod payload_send;
 
-#[cfg(unix)]
-const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
-#[cfg(windows)]
-const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
+pub(crate) use payload_send::{outbound_payload_event, send_payload};
 
-const ICMP_SHIM_IS_DATA: u8 = 0x80;
-const ICMP_SHIM_HAS_PAYLOAD: u8 = 0x40;
-const ICMP_SHIM_ALLOWED_BITS: u8 = ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PayloadOrigin {
-    Wire,
-    SyntheticSyncKeepalive,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TunnelFlowIdentity {
+    pub(crate) remote_source_id: u16,
+    pub(crate) local_destination_id: u16,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum U2cDecision {
+    ForwardPayload,
+    ForwardSessionControl,
+    ConsumeSessionControl,
+    ConsumeCadence,
+}
+
+impl U2cDecision {
+    #[inline]
+    pub(crate) const fn should_send(self) -> bool {
+        matches!(self, Self::ForwardPayload | Self::ForwardSessionControl)
+    }
+
+    #[inline]
+    pub(crate) const fn requires_sync_validation(self) -> bool {
+        matches!(
+            self,
+            Self::ForwardPayload | Self::ForwardSessionControl | Self::ConsumeSessionControl
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum C2uSessionControlDecision {
+    Forward,
+    ReplyLocally,
+    Consume,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PayloadEvent<'a> {
-    UserData(WirePayload<'a>),
-    SyncKeepalive(WirePayload<'a>),
+    UserPayload {
+        dst_proto: SupportedProtocol,
+        bytes: &'a [u8],
+        icmp: Option<IcmpPayloadMeta>,
+    },
+    SessionControl {
+        dst_proto: SupportedProtocol,
+        bytes: &'a [u8],
+        icmp: IcmpPayloadMeta,
+    },
+    CadencePacket {
+        icmp: IcmpPayloadMeta,
+    },
 }
 
 impl<'a> PayloadEvent<'a> {
     #[inline]
-    pub(crate) const fn wire(&self) -> &WirePayload<'a> {
+    pub(crate) fn icmp_meta(&self) -> Option<&IcmpPayloadMeta> {
         match self {
-            Self::UserData(wire) | Self::SyncKeepalive(wire) => wire,
+            Self::UserPayload { icmp, .. } => icmp.as_ref(),
+            Self::SessionControl { icmp, .. } | Self::CadencePacket { icmp } => Some(icmp),
         }
     }
 
     #[inline]
-    pub(crate) const fn is_user_data(&self) -> bool {
-        matches!(self, Self::UserData(_))
+    pub(crate) const fn is_user_payload(&self) -> bool {
+        matches!(self, Self::UserPayload { .. })
     }
 
     #[inline]
-    pub(crate) const fn from_wire_parts(
-        is_user_data: bool,
-        src_seq: u16,
+    pub(crate) const fn is_session_control(&self) -> bool {
+        matches!(self, Self::SessionControl { .. })
+    }
+
+    #[inline]
+    pub(crate) const fn is_cadence_packet(&self) -> bool {
+        matches!(self, Self::CadencePacket { .. })
+    }
+
+    #[inline]
+    pub(crate) const fn payload_len(&self) -> usize {
+        match self {
+            Self::UserPayload { bytes, .. } | Self::SessionControl { bytes, .. } => bytes.len(),
+            Self::CadencePacket { .. } => 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn dst_proto(&self) -> SupportedProtocol {
+        match self {
+            Self::UserPayload { dst_proto, .. } | Self::SessionControl { dst_proto, .. } => {
+                *dst_proto
+            }
+            Self::CadencePacket { .. } => SupportedProtocol::ICMP,
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn user_payload(
+        remote_source_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
         dst_proto: SupportedProtocol,
-        payload: &'a [u8],
-        pub_len: usize,
+        bytes: &'a [u8],
     ) -> Self {
-        let wire = WirePayload {
-            src_is_icmp: true,
-            src_seq,
+        Self::UserPayload {
             dst_proto,
-            payload,
-            pub_len,
-        };
-        if is_user_data {
-            Self::UserData(wire)
-        } else {
-            Self::SyncKeepalive(wire)
+            bytes,
+            icmp: Some(IcmpPayloadMeta::new(
+                remote_source_id,
+                inbound_header_ident,
+                seq,
+                None,
+            )),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn icmp_user_payload(
+        remote_source_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        bytes: &'a [u8],
+    ) -> Self {
+        Self::UserPayload {
+            dst_proto,
+            bytes,
+            icmp: Some(IcmpPayloadMeta::new(
+                remote_source_id,
+                inbound_header_ident,
+                seq,
+                None,
+            )),
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn user_payload_plain(dst_proto: SupportedProtocol, bytes: &'a [u8]) -> Self {
+        Self::UserPayload {
+            dst_proto,
+            bytes,
+            icmp: None,
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn session_control(
+        remote_source_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        bytes: &'a [u8],
+        advertised_reply_id: Option<u16>,
+    ) -> Self {
+        Self::SessionControl {
+            dst_proto,
+            bytes,
+            icmp: IcmpPayloadMeta::new(
+                remote_source_id,
+                inbound_header_ident,
+                seq,
+                match advertised_reply_id {
+                    Some(reply_id) => Some(ReplyIdNegotiation {
+                        reply_id,
+                        negotiate: true,
+                        ack: false,
+                    }),
+                    None => None,
+                },
+            ),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn session_control_negotiation(
+        remote_source_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        reply_id: ReplyIdNegotiation,
+    ) -> Self {
+        Self::SessionControl {
+            dst_proto,
+            bytes: &[],
+            icmp: IcmpPayloadMeta::new(remote_source_id, inbound_header_ident, seq, Some(reply_id)),
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn cadence_packet(inbound_header_ident: u16, seq: u16) -> Self {
+        Self::CadencePacket {
+            icmp: IcmpPayloadMeta::new(inbound_header_ident, inbound_header_ident, seq, None),
         }
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct WirePayload<'a> {
-    pub(crate) src_is_icmp: bool,
-    pub(crate) src_seq: u16,
-    pub(crate) dst_proto: SupportedProtocol,
-    pub(crate) payload: &'a [u8],
-    pub(crate) pub_len: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct IcmpPayloadMeta {
+    flow_identity: TunnelFlowIdentity,
+    seq: u16,
+    reply_id_negotiation: Option<ReplyIdNegotiation>,
 }
 
-impl<'a> WirePayload<'a> {
+impl IcmpPayloadMeta {
     #[inline]
-    pub(crate) const fn len(&self) -> usize {
-        self.pub_len
+    pub(crate) const fn new(
+        remote_source_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
+        reply_id_negotiation: Option<ReplyIdNegotiation>,
+    ) -> Self {
+        Self {
+            flow_identity: TunnelFlowIdentity {
+                remote_source_id,
+                local_destination_id: inbound_header_ident,
+            },
+            seq,
+            reply_id_negotiation,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn flow_identity(self) -> TunnelFlowIdentity {
+        self.flow_identity
+    }
+
+    #[inline]
+    pub(crate) const fn inbound_header_ident(self) -> u16 {
+        self.flow_identity.local_destination_id
+    }
+
+    #[inline]
+    pub(crate) const fn seq(self) -> u16 {
+        self.seq
+    }
+
+    #[inline]
+    pub(crate) const fn reply_id_negotiation(self) -> Option<ReplyIdNegotiation> {
+        self.reply_id_negotiation
+    }
+
+    #[inline]
+    pub(crate) const fn advertised_reply_id(self) -> Option<u16> {
+        match self.reply_id_negotiation {
+            Some(negotiation) => Some(negotiation.reply_id),
+            None => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn negotiates_reply_id(self) -> bool {
+        matches!(
+            self.reply_id_negotiation,
+            Some(ReplyIdNegotiation {
+                negotiate: true,
+                ..
+            })
+        )
+    }
+
+    #[inline]
+    pub(crate) const fn acknowledges_reply_id(self) -> bool {
+        matches!(
+            self.reply_id_negotiation,
+            Some(ReplyIdNegotiation { ack: true, .. })
+        )
     }
 }
 
-#[inline(always)]
-const fn be16_16(b0: u8, b1: u8) -> u16 {
-    b1 as u16 | ((b0 as u16) << 8)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferedPayload {
+    dst_proto: SupportedProtocol,
+    bytes: Vec<u8>,
+    icmp: Option<IcmpPayloadMeta>,
+    trace: Option<PacketTraceId>,
+}
+
+impl BufferedPayload {
+    #[inline]
+    pub(crate) fn from_event(event: &PayloadEvent<'_>, trace: Option<PacketTraceId>) -> Self {
+        let (dst_proto, bytes, icmp) = match event {
+            PayloadEvent::UserPayload {
+                dst_proto,
+                bytes,
+                icmp,
+            } => (*dst_proto, *bytes, *icmp),
+            _ => unreachable!("only user payloads are buffered"),
+        };
+        Self {
+            dst_proto,
+            bytes: bytes.to_vec(),
+            icmp,
+            trace,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_event(&self) -> PayloadEvent<'_> {
+        PayloadEvent::UserPayload {
+            dst_proto: self.dst_proto,
+            bytes: &self.bytes,
+            icmp: self.icmp,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn payload_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    pub(crate) const fn trace(&self) -> Option<PacketTraceId> {
+        self.trace
+    }
 }
 
 #[inline]
-fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<'a>> {
-    if payload.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing ICMP tunnel shim header",
-        ));
+pub(crate) fn reply_id_negotiation_for_c2u(
+    event: &PayloadEvent<'_>,
+    reply_id_acked: bool,
+    advertised_local_reply_id: u16,
+) -> Option<ReplyIdNegotiation> {
+    let dst_proto = match event {
+        PayloadEvent::UserPayload { dst_proto, .. } => *dst_proto,
+        _ => return None,
+    };
+    if dst_proto != SupportedProtocol::ICMP || advertised_local_reply_id == 0 {
+        return None;
     }
 
-    let shim = payload[0];
-    if (shim & !ICMP_SHIM_ALLOWED_BITS) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid ICMP tunnel shim header",
-        ));
-    }
-
-    let user_payload = &payload[1..];
-    let is_data = (shim & ICMP_SHIM_IS_DATA) != 0;
-    let has_user_payload = (shim & ICMP_SHIM_HAS_PAYLOAD) != 0;
-
-    match (is_data, has_user_payload, user_payload.is_empty()) {
-        (true, true, false) => Ok(PayloadEvent::UserData(WirePayload {
-            src_is_icmp: true,
-            src_seq: 0,
-            dst_proto: SupportedProtocol::UDP,
-            payload: user_payload,
-            pub_len: user_payload.len(),
-        })),
-        (true, false, true) => Ok(PayloadEvent::UserData(WirePayload {
-            src_is_icmp: true,
-            src_seq: 0,
-            dst_proto: SupportedProtocol::UDP,
-            payload: &[],
-            pub_len: 0,
-        })),
-        (false, false, true) => Ok(PayloadEvent::SyncKeepalive(WirePayload {
-            src_is_icmp: true,
-            src_seq: 0,
-            dst_proto: SupportedProtocol::ICMP,
-            payload: &[],
-            pub_len: 0,
-        })),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMP tunnel shim payload flags mismatch",
-        )),
-    }
-}
-
-#[inline]
-pub(crate) fn validate_payload<'a>(
-    c2u: bool,
-    cfg: &Config,
-    stats: &dyn StatsSink,
-    buf: &'a [u8],
-    recv_port_id: u16,
-    origin: PayloadOrigin,
-) -> io::Result<PayloadEvent<'a>> {
-    let (src_proto, dst_proto) = if c2u {
-        (cfg.listen_proto, cfg.upstream_proto)
+    if reply_id_acked {
+        None
     } else {
-        (cfg.upstream_proto, cfg.listen_proto)
+        Some(ReplyIdNegotiation {
+            reply_id: advertised_local_reply_id,
+            negotiate: true,
+            ack: false,
+        })
+    }
+}
+
+#[inline]
+pub(crate) fn reply_id_negotiation_for_u2c_listener_reply(
+    event: &PayloadEvent<'_>,
+    advertised_local_reply_id: Option<u16>,
+) -> Option<ReplyIdNegotiation> {
+    let icmp = match event {
+        PayloadEvent::SessionControl { icmp, .. } => icmp,
+        _ => return None,
     };
 
-    if origin == PayloadOrigin::SyntheticSyncKeepalive {
-        if c2u && dst_proto == SupportedProtocol::ICMP && cfg.icmp_sync_pps > 0 {
-            return Ok(PayloadEvent::SyncKeepalive(WirePayload {
-                src_is_icmp: src_proto == SupportedProtocol::ICMP,
-                src_seq: 0,
-                dst_proto,
-                payload: &[],
-                pub_len: 0,
-            }));
+    if !icmp.negotiates_reply_id() {
+        return None;
+    }
+
+    let reply_id = match advertised_local_reply_id {
+        Some(id) => id,
+        None => icmp.flow_identity().remote_source_id,
+    };
+    if reply_id == 0 {
+        return None;
+    }
+
+    Some(ReplyIdNegotiation {
+        reply_id,
+        negotiate: false,
+        ack: true,
+    })
+}
+
+pub(crate) fn classify_u2c_event(
+    cfg: &RuntimeConfig,
+    event: &PayloadEvent<'_>,
+    sequence_state: &SharedIcmpSequenceState,
+) -> io::Result<U2cDecision> {
+    let icmp = match event {
+        PayloadEvent::UserPayload {
+            icmp: Some(icmp), ..
+        } => icmp,
+        PayloadEvent::UserPayload { icmp: None, .. } => return Ok(U2cDecision::ForwardPayload),
+        PayloadEvent::SessionControl { icmp, .. } => icmp,
+        PayloadEvent::CadencePacket { .. } => return Ok(U2cDecision::ConsumeCadence),
+    };
+
+    // Tracks duplicates globally for the flow.
+    admit_inbound_sequence(cfg.debug_logs.packets, sequence_state, icmp)?;
+
+    if event.is_session_control() {
+        if cfg.listen_proto == SupportedProtocol::ICMP && cfg.is_icmp_sync_enabled() {
+            Ok(U2cDecision::ForwardSessionControl)
         } else {
-            stats.drop_oversize(c2u);
+            Ok(U2cDecision::ConsumeSessionControl)
+        }
+    } else {
+        Ok(U2cDecision::ForwardPayload)
+    }
+}
+
+pub(crate) fn classify_c2u_session_control_event(
+    cfg: &RuntimeConfig,
+    event: &PayloadEvent<'_>,
+    sequence_state: &SharedIcmpSequenceState,
+    cache: &mut IcmpSequenceCache,
+) -> io::Result<C2uSessionControlDecision> {
+    let icmp = match event {
+        PayloadEvent::SessionControl { icmp, .. } => icmp,
+        _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "synthetic sync keepalive is only valid for ICMP sync sends",
+                "session-control classification requires a session-control event",
             ));
         }
-    }
-
-    let (src_is_icmp, icmp_success, payload, src_ident, src_seq, src_is_req) = match src_proto {
-        SupportedProtocol::ICMP => {
-            let res = parse_icmp_echo_header(buf);
-            (true, res.0, &res.1[res.2..res.3], res.4, res.5, res.6)
-        }
-        _ => (false, true, buf, recv_port_id, 0u16, c2u),
     };
 
-    if !icmp_success {
-        stats.drop_err(c2u);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid ICMP Echo header (missing or truncated)",
-        ));
-    }
+    // Tracks duplicates globally for the flow.
+    admit_inbound_sequence(false, sequence_state, icmp)?;
+    // Track remote's sequence for sync-mode lag calculation (generic feature).
+    crate::net::icmp_sequence::remember_request_seq(sequence_state, cache, icmp);
 
-    if c2u != src_is_req || src_ident != recv_port_id {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "ICMP Echo direction or identity mismatch: got (req={}, id={}), expected (req={})",
-                src_is_req, src_ident, c2u,
-            ),
-        ));
+    let dst_proto = match event {
+        PayloadEvent::SessionControl { dst_proto, .. } => *dst_proto,
+        _ => unreachable!(),
+    };
+    if icmp.negotiates_reply_id() {
+        return Ok(C2uSessionControlDecision::ReplyLocally);
     }
-
-    let decoded_event = if src_is_icmp {
-        let event = decode_icmp_tunnel_payload(payload)?;
-        let base = event.wire();
-        PayloadEvent::from_wire_parts(
-            event.is_user_data(),
-            src_seq,
-            dst_proto,
-            base.payload,
-            base.pub_len,
-        )
+    if icmp.acknowledges_reply_id() {
+        return Ok(C2uSessionControlDecision::Consume);
+    }
+    if dst_proto == SupportedProtocol::ICMP && cfg.is_icmp_sync_enabled() {
+        Ok(C2uSessionControlDecision::Forward)
     } else {
-        PayloadEvent::UserData(WirePayload {
-            src_is_icmp,
-            src_seq,
-            dst_proto,
-            payload,
-            pub_len: payload.len(),
-        })
-    };
-    let len = decoded_event.wire().len();
-    if len > cfg.max_payload {
-        stats.drop_oversize(c2u);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("payload length {} exceeds max {}", len, cfg.max_payload),
-        ));
+        Ok(C2uSessionControlDecision::Consume)
     }
-    Ok(decoded_event)
 }
 
-pub(crate) fn send_payload(
-    sock: &Socket,
-    sock_connected: bool,
-    sock_type: Type,
-    dest_sa: &SockAddr,
-    dest_port_id: u16,
-    event: &PayloadEvent<'_>,
+pub(crate) fn allocate_send_sequence(
     c2u: bool,
-    icmp_seq: Option<u16>,
-) -> io::Result<bool> {
-    let wire = event.wire();
-    let shim = match event {
-        PayloadEvent::UserData(wire) => {
-            [ICMP_SHIM_IS_DATA | (((wire.len() != 0) as u8) * ICMP_SHIM_HAS_PAYLOAD)]
-        }
-        PayloadEvent::SyncKeepalive(_) => [0u8],
-    };
-    let send_res = match wire.dst_proto {
-        SupportedProtocol::ICMP => send_icmp_echo(
-            sock,
-            sock_connected,
-            sock_type,
-            dest_sa,
-            dest_port_id,
-            icmp_seq.expect("missing ICMP sequence for ICMP destination"),
-            !c2u,
-            Some(&shim),
-            wire.payload,
-        ),
-        _ => {
-            if !event.is_user_data() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot send keepalive/control packet to non-ICMP destination",
-                ));
-            }
-            if sock_connected {
-                sock.send(wire.payload)
-            } else {
-                sock.send_to(wire.payload, dest_sa)
-            }
-        }
-    };
-
-    match send_res {
-        Ok(_) => Ok(true),
-        Err(e) if sock_connected && e.raw_os_error() == Some(DEST_ADDR_REQUIRED) => {
-            let retry_res = match wire.dst_proto {
-                SupportedProtocol::ICMP => send_icmp_echo(
-                    sock,
-                    false,
-                    sock_type,
-                    dest_sa,
-                    dest_port_id,
-                    icmp_seq.expect("missing ICMP sequence for ICMP destination"),
-                    !c2u,
-                    Some(&shim),
-                    wire.payload,
-                ),
-                _ => sock.send_to(wire.payload, dest_sa),
-            };
-
-            match retry_res {
-                Ok(_) => Ok(false),
-                Err(retry_err) => Err(retry_err),
-            }
-        }
-        Err(e) => Err(e),
+    event: &PayloadEvent<'_>,
+    will_forward: bool,
+    sequence_state: &SharedIcmpSequenceState,
+    cache: &mut IcmpSequenceCache,
+) -> Option<u16> {
+    let dst_proto = event.dst_proto();
+    if !will_forward || dst_proto != SupportedProtocol::ICMP {
+        return None;
     }
-}
-
-/// Some OSes (notably Linux for IPv4 raw sockets) deliver the full IP header
-/// followed by the ICMP message. Others deliver only the ICMP message.
-#[inline]
-const fn parse_icmp_echo_header(payload: &[u8]) -> (bool, &[u8], usize, usize, u16, u16, bool) {
-    const ZERO_ARRAY: [u8; 1] = [0];
-    let n = payload.len();
-
-    let has0 = (n >= 1) as usize;
-    let buf = if has0 != 0 { payload } else { &ZERO_ARRAY };
-    let has9 = (n >= 10) as usize;
-    let b9 = buf[9 * has9];
-    let b6 = buf[6 * has9];
-    let b0 = buf[0];
-
-    let ver = (b0 >> 4) as usize;
-    let ihl = ((b0 as usize) & 0x0F) << 2;
-
-    let is_v4 = (ver == 4) as usize;
-    let is_v6 = (ver == 6) as usize;
-
-    let sane_ihl = (ihl >= 20) as usize;
-    let proto_icmp = (b9 == 1) as usize;
-    let room_v4 = (n >= ihl + 8) as usize;
-
-    let next_icmp6 = (b6 == 58) as usize;
-    let room_v6 = (n >= 48) as usize;
-
-    let off_v4 = ihl * (is_v4 & sane_ihl & proto_icmp & room_v4);
-    let off_v6 = 40usize * (is_v6 & next_icmp6 & room_v6);
-    let off = off_v4 | off_v6;
-
-    let have_hdr = (n >= off + 8) as usize;
-    let icmp_code = buf[(off + 1) * have_hdr];
-    let icmp_type = buf[off * have_hdr];
-
-    let success_bool = have_hdr == 1 && icmp_code == 0 && matches!(icmp_type, 8 | 0 | 128 | 129);
-    let success = success_bool as usize;
-
-    let ident_b1 = buf[(off + 5) * success];
-    let ident_b0 = buf[(off + 4) * success];
-    let ident = be16_16(ident_b0, ident_b1);
-
-    let seq_b1 = buf[(off + 7) * success];
-    let seq_b0 = buf[(off + 6) * success];
-    let seq = be16_16(seq_b0, seq_b1);
-
-    let is_request = matches!(icmp_type, 8 | 128);
-
-    (
-        success_bool,
-        &buf,
-        (off + 8) * success,
-        n * success,
-        ident,
-        seq,
-        is_request,
-    )
-}
-
-fn send_icmp_echo(
-    sock: &Socket,
-    sock_connected: bool,
-    sock_type: Type,
-    dest_sa: &SockAddr,
-    ident: u16,
-    seq: u16,
-    reply: bool,
-    payload_prefix: Option<&[u8]>,
-    payload: &[u8],
-) -> io::Result<usize> {
-    let mut hdr = [0u8; 8];
-
-    let idb = ident.to_be_bytes();
-    let sqb = seq.to_be_bytes();
-
-    hdr[4] = idb[0];
-    hdr[5] = idb[1];
-    hdr[6] = sqb[0];
-    hdr[7] = sqb[1];
-
-    let cksum = match (dest_sa, sock_type) {
-        (sa, _) if sa.is_ipv6() => {
-            hdr[0] = 128u8 | (reply as u8);
-            0u16
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        _ => {
-            hdr[0] = 8u8 * (!reply as u8);
-            match payload_prefix {
-                Some(prefix) => checksum16_parts(&hdr, prefix, payload),
-                None => checksum16(&hdr, payload),
-            }
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        (_, ty) if ty == Type::RAW => {
-            hdr[0] = 8u8 * (!reply as u8);
-            match payload_prefix {
-                Some(prefix) => checksum16_parts(&hdr, prefix, payload),
-                None => checksum16(&hdr, payload),
-            }
-        }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        _ => {
-            hdr[0] = 8u8 * (!reply as u8);
-            0u16
-        }
-    };
-
-    hdr[2] = (cksum >> 8) as u8;
-    hdr[3] = (cksum & 0xFF) as u8;
-
-    let prefix = payload_prefix.unwrap_or(&[]);
-    let iov = [
-        IoSlice::new(&hdr),
-        IoSlice::new(prefix),
-        IoSlice::new(payload),
-    ];
-    if sock_connected {
-        sock.send_vectored(&iov)
+    if c2u {
+        Some(remember_outbound_request_seq(sequence_state, cache))
     } else {
-        sock.send_to_vectored(&iov, dest_sa)
+        Some(current_reply_seq(sequence_state, cache))
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::stats::Stats;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-
-    fn test_config(listen_proto: SupportedProtocol, upstream_proto: SupportedProtocol) -> Config {
-        Config {
-            listen_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
-            listen_port_id: 1234,
-            listen_proto,
-            listen_str: String::from("test-listen"),
-            workers: 1,
-            worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,
-            upstream_proto,
-            upstream_str: String::from("test-upstream"),
-            timeout_secs: 10,
-            on_timeout: crate::cli::TimeoutAction::Drop,
-            stats_interval_mins: 0,
-            max_payload: 1500,
-            icmp_sync_pps: 10,
-            reresolve_secs: 0,
-            reresolve_mode: crate::cli::ReresolveMode::Upstream,
-            #[cfg(unix)]
-            run_as_user: None,
-            #[cfg(unix)]
-            run_as_group: None,
-            debug_no_connect: false,
-            debug_log_drops: false,
-            debug_log_handles: false,
-            debug_fast_stats: false,
-        }
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_accepts_ipv4_with_ip_header() {
-        let icmp_payload = [0xDEu8, 0xAD, 0xBE];
-        let mut buf = vec![0u8; 20 + 8 + icmp_payload.len()];
-        buf[0] = 0x45;
-        buf[8] = 64;
-        buf[9] = 1;
-        buf[20] = 8;
-        buf[22] = 0;
-        buf[23] = 0;
-        buf[24] = 0x12;
-        buf[25] = 0x34;
-        buf[26] = 0x00;
-        buf[27] = 0x02;
-        buf[28..].copy_from_slice(&icmp_payload);
-
-        let (ok, raw, start, end, ident, seq, is_req) = parse_icmp_echo_header(&buf);
-        assert!(ok);
-        assert_eq!(start, 28);
-        assert_eq!(end, 28 + icmp_payload.len());
-        assert_eq!(ident, 0x1234);
-        assert_eq!(seq, 0x0002);
-        assert!(is_req);
-        assert_eq!(&raw[start..end], &icmp_payload);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_accepts_ipv6_with_ip_header() {
-        let icmp_payload = [0xCAu8, 0xFE, 0xBA, 0xBE];
-        let mut buf = vec![0u8; 40 + 8 + icmp_payload.len()];
-        buf[0] = 0x60;
-        buf[6] = 58;
-        buf[40] = 129;
-        buf[44] = 0xBE;
-        buf[45] = 0xEF;
-        buf[46] = 0x00;
-        buf[47] = 0x2A;
-        buf[48..].copy_from_slice(&icmp_payload);
-
-        let (ok, raw, start, end, ident, seq, is_req) = parse_icmp_echo_header(&buf);
-        assert!(ok);
-        assert_eq!(start, 48);
-        assert_eq!(end, 48 + icmp_payload.len());
-        assert_eq!(ident, 0xBEEF);
-        assert_eq!(seq, 0x002A);
-        assert!(!is_req);
-        assert_eq!(&raw[start..end], &icmp_payload);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_accepts_headerless_icmp() {
-        let payload = [0xABu8, 0xCD];
-        let mut buf = Vec::with_capacity(8 + payload.len());
-        buf.extend_from_slice(&[8, 0, 0, 0, 0x01, 0x02, 0x03, 0x04]);
-        buf.extend_from_slice(&payload);
-
-        let (ok, raw, start, end, ident, seq, is_req) = parse_icmp_echo_header(&buf);
-        assert!(ok);
-        assert_eq!(start, 8);
-        assert_eq!(end, 8 + payload.len());
-        assert_eq!(ident, 0x0102);
-        assert_eq!(seq, 0x0304);
-        assert!(is_req);
-        assert_eq!(&raw[start..end], &payload);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_rejects_truncated_input() {
-        let buf = [0u8; 4];
-        let (ok, _raw, start, end, _ident, _seq, _is_req) = parse_icmp_echo_header(&buf);
-
-        assert!(!ok);
-        assert_eq!(start, 0);
-        assert_eq!(end, 0);
-    }
-
-    #[test]
-    fn validate_payload_accepts_zero_len_udp_wire_and_synthetic_sync_keepalive() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
-        let stats = Stats::new();
-
-        let wire = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &[],
-            cfg.listen_port_id,
-            PayloadOrigin::Wire,
-        )
-        .expect("wire zero-length UDP must be treated as user data");
-        assert!(matches!(wire, PayloadEvent::UserData(_)));
-        assert_eq!(wire.wire().len(), 0);
-
-        let synthetic = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &[],
-            cfg.listen_port_id,
-            PayloadOrigin::SyntheticSyncKeepalive,
-        )
-        .expect("synthetic sync keepalive should be accepted");
-        assert!(matches!(synthetic, PayloadEvent::SyncKeepalive(_)));
-        assert_eq!(synthetic.wire().len(), 0);
-    }
-
-    #[test]
-    fn validate_payload_classifies_wire_zero_len_icmp_as_keepalive() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let stats = Stats::new();
-        // 0x00 is now keepalive
-        let buf = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09, 0x00];
-
-        let event = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &buf,
-            cfg.listen_port_id,
-            PayloadOrigin::Wire,
-        )
-        .expect("wire ICMP keepalive header should decode");
-        assert!(matches!(event, PayloadEvent::SyncKeepalive(_)));
-        assert_eq!(event.wire().src_seq, 9);
-    }
-
-    fn encode_icmp_payload(shim: Option<u8>, payload: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + shim.map_or(0, |_| 1) + payload.len());
-        buf.extend_from_slice(&[8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
-        if let Some(shim) = shim {
-            buf.push(shim);
-        }
-        buf.extend_from_slice(payload);
-        buf
-    }
-
-    #[test]
-    fn validate_payload_decodes_zero_len_icmp_user_datagram() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let stats = Stats::new();
-        let buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
-
-        let event = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &buf,
-            cfg.listen_port_id,
-            PayloadOrigin::Wire,
-        )
-        .expect("ICMP shim should decode zero-length user data");
-        assert!(matches!(event, PayloadEvent::UserData(_)));
-        assert_eq!(event.wire().len(), 0);
-    }
-
-    #[test]
-    fn validate_payload_decodes_non_empty_icmp_user_datagram() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let stats = Stats::new();
-        let buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abc");
-
-        let event = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &buf,
-            cfg.listen_port_id,
-            PayloadOrigin::Wire,
-        )
-        .expect("ICMP shim should decode non-empty user data");
-        assert!(matches!(event, PayloadEvent::UserData(_)));
-        assert_eq!(event.wire().payload, b"abc");
-    }
-
-    #[test]
-    fn validate_payload_rejects_invalid_icmp_shim() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let stats = Stats::new();
-        let bad_empty = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09];
-        let bad_reserved = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | 0x01), &[]);
-        // Keepalive (0x00) but has_payload (0x40) set
-        let bad_keepalive_with_flag = encode_icmp_payload(Some(ICMP_SHIM_HAS_PAYLOAD), &[]);
-        // Keepalive (0x00) but has actual data bytes
-        let bad_keepalive_with_payload = encode_icmp_payload(Some(0x00), b"x");
-        // Data (0x80) with has_payload bit (0x40) but no bytes
-        let bad_data_missing_payload =
-            encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), &[]);
-        // Data (0x80) without has_payload bit but has bytes
-        let bad_data_with_unexpected_payload = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), b"x");
-
-        for bad in [
-            bad_empty.to_vec(),
-            bad_reserved,
-            bad_keepalive_with_flag,
-            bad_keepalive_with_payload,
-            bad_data_missing_payload,
-            bad_data_with_unexpected_payload,
-        ] {
-            assert!(
-                validate_payload(
-                    true,
-                    &cfg,
-                    &stats,
-                    &bad,
-                    cfg.listen_port_id,
-                    PayloadOrigin::Wire,
-                )
-                .is_err(),
-                "shim {:02X} should be rejected",
-                bad.get(8).cloned().unwrap_or(0xFF)
-            );
-        }
-    }
-
-    #[test]
-    fn validate_payload_max_payload_zero_allows_empty_data() {
-        let mut cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
-        cfg.max_payload = 0;
-        let stats = Stats::new();
-
-        // UDP: 0 bytes OK, 1 byte Fail
-        assert!(
-            validate_payload(
-                true,
-                &cfg,
-                &stats,
-                &[],
-                cfg.listen_port_id,
-                PayloadOrigin::Wire
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_payload(
-                true,
-                &cfg,
-                &stats,
-                &[0],
-                cfg.listen_port_id,
-                PayloadOrigin::Wire
-            )
-            .is_err()
-        );
-
-        // ICMP: 1 byte shim (no payload) OK, 2 bytes (shim + 1 byte payload) Fail
-        let mut cfg_icmp = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        cfg_icmp.max_payload = 0;
-
-        let ok_icmp = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
-        let over_icmp = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), &[0]);
-
-        assert!(
-            validate_payload(
-                true,
-                &cfg_icmp,
-                &stats,
-                &ok_icmp,
-                cfg_icmp.listen_port_id,
-                PayloadOrigin::Wire
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_payload(
-                true,
-                &cfg_icmp,
-                &stats,
-                &over_icmp,
-                cfg_icmp.listen_port_id,
-                PayloadOrigin::Wire
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn validate_payload_max_payload_excludes_icmp_shim_byte() {
-        let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        cfg.max_payload = 3;
-        let stats = Stats::new();
-        let ok = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abc");
-        let over = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abcd");
-
-        assert!(
-            validate_payload(
-                true,
-                &cfg,
-                &stats,
-                &ok,
-                cfg.listen_port_id,
-                PayloadOrigin::Wire,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_payload(
-                true,
-                &cfg,
-                &stats,
-                &over,
-                cfg.listen_port_id,
-                PayloadOrigin::Wire,
-            )
-            .is_err()
-        );
-    }
-}
+#[path = "payload_tests.rs"]
+mod tests;

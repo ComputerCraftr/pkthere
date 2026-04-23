@@ -10,12 +10,113 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  quality:
+    name: Formatting, Lints, and Types
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Rust workspace
+        run: cargo check --locked --workspace --all-targets
+
+      - name: Check Rust lints
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Install Python check runner
+        run: python -m pip install --disable-pip-version-check pipx==1.16.2
+
+      - name: Check Python formatting
+        run: pipx run ruff==0.15.22 format --check .
+
+      - name: Check Python lint
+        run: pipx run ruff==0.15.22 check .
+
+      - name: Check Python types
+        run: pipx run mypy==2.3.0 --strict
+
+      - name: Install TOML formatter and validator
+        run: cargo install taplo-cli --version 0.10.0 --locked
+
+      - name: Check TOML formatting
+        run: taplo fmt --check
+
+      - name: Validate TOML
+        run: taplo check
+
+      - name: Check YAML formatting
+        run: npx --yes prettier@3.9.6 --check "**/*.{yml,yaml}"
+
+      - name: Check CI shell scripts
+        run: shellcheck .github/scripts/*.sh
+
+      - name: Check CI shell formatting
+        uses: docker://mvdan/shfmt:v3.12.0-alpine
+        with:
+          args: -d -ci .github/scripts
+
+      - name: Check workflow YAML style
+        run: >-
+          pipx run yamllint==1.38.0
+          -d '{extends: default, rules: {line-length: disable, truthy: disable, document-start: disable}}'
+          .github/workflows
+
+      - name: Validate GitHub Actions semantics
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+      - name: Run Alpine harness unit tests
+        run: python -m unittest discover -s docker/alpine/tests -v
+
+      - name: Compile benchmarks without running them
+        run: cargo bench --locked --workspace --no-run
+
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            label: Linux
+            raw_icmp_override: 1
+            app_source: target/debug/pkthere
+            test_app: target/debug/pkthere-priv
+          - os: macos-latest
+            platform: macos
+            label: macOS
+            raw_icmp_override: 0
+            app_source: target/debug/pkthere
+            test_app: target/debug/pkthere-priv
+          - os: windows-latest
+            platform: windows
+            label: Windows
+            raw_icmp_override: 1
+            app_source: target/debug/pkthere.exe
+            test_app: target/debug/pkthere.exe
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 30
+    env:
+      PKTHERE_ALLOW_RAW_ICMP: ${{ matrix.raw_icmp_override }}
+      TEST_APP_BIN: ${{ github.workspace }}/${{ matrix.test_app }}
     steps:
       - uses: actions/checkout@v6
 
@@ -24,27 +125,73 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Enable ICMP ping sockets
         if: runner.os == 'Linux'
-        run: |
-          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 
       - name: Build
-        run: cargo test --no-run --verbose
+        run: cargo test --locked --workspace --lib --bins --tests --no-run --verbose
 
-      - name: Run tests
-        run: cargo test --verbose
+      - name: Prepare privileged native binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: .github/scripts/grant_raw_capability.sh "${{ matrix.app_source }}" "$TEST_APP_BIN"
+
+      - name: Run complete native test manifest
+        run: >-
+          python .github/scripts/ci_test_runner.py native
+          --log native-tests-${{ matrix.platform }}.log
+
+      - name: Run privileged RAW socket reality manifest
+        run: >-
+          python .github/scripts/ci_test_runner.py raw-reality
+          --log raw-reality-${{ matrix.platform }}.log
+
+      - name: Upload native socket reality evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.platform }}
+          path: |
+            native-tests-*.log
+            raw-reality-*.log
+          if-no-files-found: warn
 
   stress-release:
-    name: Stress Regression (Release)
+    name: Release Stress (${{ matrix.label }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            label: Linux
+            raw_icmp_override: 1
+            app_source: target/release/pkthere
+            test_app: target/release/pkthere-priv
+          - os: macos-latest
+            platform: macos
+            label: macOS
+            raw_icmp_override: 0
+            app_source: target/release/pkthere
+            test_app: target/release/pkthere-priv
+          - os: windows-latest
+            platform: windows
+            label: Windows
+            raw_icmp_override: 0
+            app_source: target/release/pkthere.exe
+            test_app: target/release/pkthere.exe
     runs-on: ${{ matrix.os }}
-
+    timeout-minutes: 15
+    env:
+      PKTHERE_ALLOW_RAW_ICMP: ${{ matrix.raw_icmp_override }}
+      TEST_APP_BIN: ${{ github.workspace }}/${{ matrix.test_app }}
     steps:
       - uses: actions/checkout@v6
 
@@ -61,8 +208,101 @@ jobs:
         run: |
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
 
-      - name: Build release test binaries
-        run: cargo test --release --tests --no-run --verbose
+      - name: Build only the release stress target
+        run: cargo test --locked --release --test stress --no-run
 
-      - name: Run release stress regression tests
-        run: cargo test --release stress_test_ipv4_all -- --ignored --nocapture
+      - name: Prepare privileged release binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: .github/scripts/grant_raw_capability.sh "${{ matrix.app_source }}" "$TEST_APP_BIN"
+
+      - name: Execute exact release stress owner
+        run: cargo test --locked --release --test stress stress_test_ipv4 -- --exact --ignored --nocapture
+
+  aarch64-musl:
+    name: Portable aarch64 musl artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: aarch64-musl-cross
+
+      - name: Install pinned cross
+        run: >-
+          cargo install cross
+          --git https://github.com/cross-rs/cross
+          --rev 88f49ff79e777bef6d3564531636ee4d3cc2f8d2
+          --locked
+
+      - name: Build and inspect aarch64 musl artifact
+        run: >-
+          python3 -m docker.alpine.portable_build aarch64
+          --evidence-dir cross-artifacts
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: aarch64-musl
+          path: cross-artifacts
+          if-no-files-found: error
+
+  alpine-socket-reality:
+    name: Alpine Privileged Socket Reality
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PKTHERE_ALLOW_RAW_ICMP: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: alpine-musl
+
+      - name: Install musl linker
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+
+      - name: Enable ICMP ping sockets
+        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+
+      - name: Build exact Alpine executables
+        run: >-
+          python3 -m docker.alpine.portable_build x86_64
+          --evidence-dir docker-artifacts
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build Alpine reality image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/alpine/Dockerfile
+          load: true
+          network: host
+          tags: pkthere-alpine-reality
+          cache-from: type=gha,scope=alpine-reality
+          cache-to: type=gha,mode=max,scope=alpine-reality
+
+      - name: Run privileged Alpine profiles
+        run: python3 -m docker.alpine.ci all --artifact-dir docker-artifacts
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: alpine
+          path: docker-artifacts
+          if-no-files-found: error

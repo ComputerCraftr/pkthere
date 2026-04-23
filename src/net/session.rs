@@ -1,87 +1,126 @@
-use crate::cli::Config;
 use crate::net::payload::PayloadEvent;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
-use crate::stats::StatsSink;
+use crate::net::socket_errors::DEST_ADDR_REQUIRED;
+use crate::packet_trace::PacketTraceId;
+use crate::worker_support::PacketContext;
+use crate::worker_support::{PacketDisposition, log_packet_send_disposition};
 use socket2::SockAddr;
 
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
+use std::sync::Arc;
 use std::time::Instant;
 
-#[cfg(unix)]
-const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
-#[cfg(windows)]
-const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
+pub(crate) struct SendOutcome<'a, 'b> {
+    pub(crate) result: &'a io::Result<bool>,
+    pub(crate) socket_connected: bool,
+    pub(crate) destination: &'a SockAddr,
+    pub(crate) disconnect: Option<(&'b mut SocketHandles, &'b SocketManager)>,
+    pub(crate) trace: Option<PacketTraceId>,
+    pub(crate) trace_kind: SendTraceKind,
+}
 
-#[inline]
-pub(crate) fn counts_as_session_activity(event: &PayloadEvent<'_>, will_forward: bool) -> bool {
-    will_forward && event.is_user_data()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SendTraceKind {
+    Forward,
+    ReplySessionControl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandledSendOutcome {
+    Sent { retried_unconnected: bool },
+    Failed,
 }
 
 pub(crate) fn handle_send_result(
+    context: PacketContext<'_>,
     c2u: bool,
-    worker_id: usize,
-    t_start: Instant,
-    t_recv: Instant,
-    cfg: &Config,
-    stats: &dyn StatsSink,
-    last_seen_s: &AtomicU64,
-    payload_len: usize,
-    counts_as_session_activity: bool,
-    send_res: &io::Result<bool>,
-    sock_connected: bool,
-    dest_sa: &SockAddr,
-    disconnect_ctx: Option<(&mut SocketHandles, &SocketManager)>,
-) {
-    if counts_as_session_activity {
-        let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
-        last_seen_s.store(last_seen, AtomOrdering::Relaxed);
-    }
+    event: &PayloadEvent<'_>,
+    outcome: SendOutcome<'_, '_>,
+) -> HandledSendOutcome {
+    let PacketContext {
+        worker_id,
+        t_event: t_recv,
+        cfg,
+        stats,
+        ..
+    } = context;
+    let SendOutcome {
+        result: send_res,
+        socket_connected: sock_connected,
+        destination: dest_sa,
+        disconnect: disconnect_ctx,
+        trace,
+        trace_kind,
+    } = outcome;
+    log_debug!(
+        cfg.debug_logs.packets,
+        "[handle_send_result] worker {} c2u={} is_user_payload={} payload_len={}",
+        worker_id,
+        c2u,
+        event.is_user_payload(),
+        event.payload_len()
+    );
 
     match send_res {
         Ok(res) => {
-            if cfg.stats_interval_mins != 0 {
+            if cfg.stats_interval_mins != 0 && event.is_user_payload() {
                 let t_send = Instant::now();
-                stats.send_add(c2u, payload_len as u64, t_recv, t_send);
+                stats.send_add(c2u, event.payload_len() as u64, t_recv, t_send);
             }
 
-            if !*res {
-                if let Some((handles, sock_mgr)) = disconnect_ctx {
-                    if handles.client_connected {
-                        let prev_ver = handles.version;
-                        log_warn_dir!(
-                            worker_id,
-                            c2u,
-                            "send_payload error (EDESTADDRREQ); disconnecting client socket"
-                        );
-                        handles.client_connected = false;
-                        handles.version = match sock_mgr.set_client_sock_disconnected(
-                            handles.client_addr,
-                            false,
-                            prev_ver,
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_warn_dir!(worker_id, c2u, "disconnect_socket failed: {}", e);
-                                prev_ver
-                            }
-                        };
-                        log_debug_dir!(
-                            cfg.debug_log_handles,
-                            worker_id,
-                            c2u,
-                            "publish disconnect: addr={:?} ver {}->{}",
-                            handles.client_addr,
-                            prev_ver,
-                            handles.version
-                        );
+            if !*res
+                && let Some((handles, sock_mgr)) = disconnect_ctx
+                && handles.listener.listener_connected
+            {
+                let prev_ver = handles.version;
+                log_warn_dir!(
+                    worker_id,
+                    c2u,
+                    "send_payload error (EDESTADDRREQ); disconnecting client socket"
+                );
+                Arc::make_mut(&mut handles.listener).listener_connected = false;
+                handles.version = match sock_mgr.set_client_sock_disconnected(
+                    handles.listener.flow,
+                    handles.listener.listener_flow,
+                    false,
+                    prev_ver,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log_warn_dir!(worker_id, c2u, "disconnect_socket failed: {}", e);
+                        prev_ver
                     }
-                }
+                };
+                log_debug_dir!(
+                    cfg.debug_logs.handles,
+                    worker_id,
+                    c2u,
+                    "publish disconnect: addr={:?} ver {}->{}",
+                    handles.listener.flow,
+                    prev_ver,
+                    handles.version
+                );
+            }
+            if let Some(trace) = trace {
+                log_packet_send_disposition(
+                    cfg,
+                    trace,
+                    match trace_kind {
+                        SendTraceKind::Forward => PacketDisposition::Forwarded,
+                        SendTraceKind::ReplySessionControl => {
+                            PacketDisposition::ReplySessionControl
+                        }
+                    },
+                    !*res,
+                );
+            }
+            HandledSendOutcome::Sent {
+                retried_unconnected: !*res,
             }
         }
         Err(e) => {
             log_debug_dir!(
-                cfg.debug_log_drops,
+                cfg.debug_logs.drops,
                 worker_id,
                 c2u,
                 "send_payload error ({} on dest_sa '{:?}'): {}",
@@ -94,35 +133,73 @@ pub(crate) fn handle_send_result(
                 e
             );
             stats.drop_err(c2u);
+            if let Some(trace) = trace {
+                log_packet_send_disposition(
+                    cfg,
+                    trace,
+                    match trace_kind {
+                        SendTraceKind::Forward => PacketDisposition::SendFailed,
+                        SendTraceKind::ReplySessionControl => PacketDisposition::ReplyFailed,
+                    },
+                    false,
+                );
+            }
+            HandledSendOutcome::Failed
         }
-    };
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::counts_as_session_activity;
     use crate::cli::SupportedProtocol;
-    use crate::net::payload::{PayloadEvent, WirePayload};
+    use crate::net::payload::PayloadEvent;
 
     #[test]
-    fn forwarded_user_data_counts_as_activity_even_when_zero_length() {
-        let zero = PayloadEvent::UserData(WirePayload {
-            src_is_icmp: false,
-            src_seq: 0,
-            dst_proto: SupportedProtocol::UDP,
-            payload: &[],
-            pub_len: 0,
-        });
-        let keepalive = PayloadEvent::SyncKeepalive(WirePayload {
-            src_is_icmp: true,
-            src_seq: 1,
-            dst_proto: SupportedProtocol::ICMP,
-            payload: &[],
-            pub_len: 0,
-        });
+    fn test_handle_send_result_failed() {
+        use crate::flow_state::FlowRuntimeState;
+        use crate::net::session::{
+            HandledSendOutcome, PacketContext, SendOutcome, SendTraceKind, handle_send_result,
+        };
+        use crate::stats::Stats;
+        use crate::worker_support::PacketTraceId;
+        use socket2::SockAddr;
+        use std::io;
+        use std::net::SocketAddr;
+        use std::str::FromStr;
+        use std::time::Instant;
 
-        assert!(counts_as_session_activity(&zero, true));
-        assert!(!counts_as_session_activity(&zero, false));
-        assert!(!counts_as_session_activity(&keepalive, true));
+        let cfg = crate::worker_support::admission_test_support::test_config(
+            crate::cli::IcmpReplyIdRequest::Default,
+        );
+        let stats = Stats::with_worker_shards(1);
+        let flow_state = FlowRuntimeState::new();
+        let context = PacketContext {
+            worker_id: 1,
+            t_start: Instant::now(),
+            t_event: Instant::now(),
+            cfg: &cfg,
+            stats: &stats,
+            flow_state: &flow_state,
+        };
+        let event = PayloadEvent::user_payload_plain(SupportedProtocol::UDP, &[]);
+        let err_res: io::Result<bool> = Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "test error",
+        ));
+        let outcome = SendOutcome {
+            result: &err_res,
+            socket_connected: false,
+            destination: &SockAddr::from(SocketAddr::from_str("127.0.0.1:0").unwrap()),
+            disconnect: None,
+            trace: Some(PacketTraceId {
+                worker_id: 1,
+                c2u: true,
+                packet_id: 100,
+            }),
+            trace_kind: SendTraceKind::Forward,
+        };
+
+        let res = handle_send_result(context, true, &event, outcome);
+        assert_eq!(res, HandledSendOutcome::Failed);
     }
 }

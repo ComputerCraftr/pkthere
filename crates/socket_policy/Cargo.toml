@@ -1,0 +1,8 @@
+[package]
+name = "pkthere-socket-policy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pkthere-wire = { path = "../wire" }
+socket2 = { version = "0.6.5", features = ["all"] }

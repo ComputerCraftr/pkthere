@@ -1,7 +1,11 @@
-mod checksum;
-pub mod params;
-pub mod payload;
-pub mod session;
-pub mod sock_mgr;
-pub mod socket;
-pub mod sync_icmp;
+pub(crate) mod framing_shim;
+pub(crate) mod icmp_sequence;
+pub(crate) mod icmp_support;
+pub(crate) mod packet_headers;
+pub(crate) mod params;
+pub(crate) mod payload;
+pub(crate) mod session;
+pub(crate) mod sock_mgr;
+pub(crate) mod socket;
+mod socket_errors;
+pub(crate) mod sync_icmp;

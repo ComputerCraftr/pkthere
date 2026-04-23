@@ -1,0 +1,32 @@
+[package]
+name = "pkthere-test-support"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pkthere-wire = { path = "../../crates/wire" }
+pkthere-socket-policy = { path = "../../crates/socket_policy" }
+bytemuck = { version = "1.25.2", features = ["must_cast"] }
+ctrlc = { version = "3.5.2", features = ["termination"] }
+libc = "0.2.189"
+nix = { version = "0.31.3", features = ["user"] }
+serde = "1.0.229"
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+socket2 = { version = "0.6.5", features = ["all"] }
+wide = { version = "1.5.0", features = ["serde"] }
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Storage_FileSystem",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
+[[bin]]
+name = "harness-child"
+path = "src/bin/harness_child.rs"
+
+[[bin]]
+name = "topology-verifier"
+path = "src/bin/topology_verifier.rs"

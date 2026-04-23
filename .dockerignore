@@ -1,0 +1,7 @@
+.git
+.artifacts/*
+!.artifacts/alpine
+!.artifacts/alpine/**
+cross-artifacts
+target
+docker-artifacts
