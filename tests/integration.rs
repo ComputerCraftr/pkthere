@@ -245,9 +245,10 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         .expect("IPv4 loopback upstream bind");
     let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
 
+    let node3_ip = std::net::Ipv4Addr::new(127, 0, 0, 3);
     let node3 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
+        here: default_test_icmp_upstream_arg(node3_ip.into()),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
         timeout_secs: None,
@@ -257,14 +258,12 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         icmp_sync_pps: None,
     })
     .expect("could not launch ICMP endpoint node on raw-capable host");
+
+    let node2_ip = "127.0.0.2";
     let node2 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: format!(
-            "ICMP:{}:{}",
-            localhost_addr(IpFamily::V4, 0).ip(),
-            icmp_port_2
-        ),
-        there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
+        here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
+        there: default_test_icmp_upstream_arg(node3_ip.into()),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -273,14 +272,11 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         icmp_sync_pps: Some(5),
     })
     .expect("could not launch pure ICMP middle node");
+
     let mut node1 = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: IpFamily::V4.listen_arg().to_string(),
-        there: format!(
-            "ICMP:{}:{}",
-            localhost_addr(IpFamily::V4, 0).ip(),
-            icmp_port_2
-        ),
+        there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
