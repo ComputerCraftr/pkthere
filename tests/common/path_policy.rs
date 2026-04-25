@@ -2,11 +2,12 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub fn platform_executable_name(base: &str) -> OsString {
-    if cfg!(windows) && !base.ends_with(".exe") {
-        OsString::from(format!("{base}.exe"))
-    } else {
-        OsString::from(base)
+    #[cfg(windows)]
+    if !base.ends_with(".exe") {
+        return OsString::from(format!("{base}.exe"));
     }
+
+    OsString::from(base)
 }
 
 pub fn render_test_path(path: &Path) -> String {
@@ -54,11 +55,11 @@ mod tests {
     #[test]
     fn platform_executable_name_matches_current_platform_policy() {
         let exe = platform_executable_name("pkthere");
-        if cfg!(windows) {
-            assert_eq!(exe, "pkthere.exe");
-        } else {
-            assert_eq!(exe, "pkthere");
-        }
+        #[cfg(windows)]
+        assert_eq!(exe, "pkthere.exe");
+
+        #[cfg(not(windows))]
+        assert_eq!(exe, "pkthere");
     }
 
     #[test]

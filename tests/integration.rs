@@ -7,11 +7,11 @@ mod orchestrator;
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
     CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS,
-    MatrixCase, SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client,
-    default_test_icmp_upstream_arg, default_test_upstream_arg, expect_no_echo, json_addr,
-    launch_forwarder, localhost_addr, random_unprivileged_port, raw_icmp_test_supported,
-    run_matrix_cases, send_until_locked, skip_unless_raw_icmp_supported, spawn_echo_or_skip,
-    spawn_udp_echo_server, try_launch_forwarder, wait_for_child_exit_success,
+    MatrixCase, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip,
+    bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg, expect_no_echo,
+    json_addr, launch_forwarder, localhost_addr, random_unprivileged_port, run_matrix_cases,
+    send_until_locked, skip_unless_kernel_echo_supported, skip_unless_raw_icmp_supported,
+    spawn_echo_or_skip, spawn_udp_echo_server, try_launch_forwarder, wait_for_child_exit_success,
     wait_for_locked_client_from, wait_for_stats_matching,
 };
 
@@ -34,9 +34,7 @@ fn locked_worker_flow<'a>(stats: &'a serde_json::Value) -> &'a serde_json::Value
 
 #[test]
 fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
-    if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
-        && !raw_icmp_test_supported()
-    {
+    if skip_unless_kernel_echo_supported("icmp_sync_mode_forwards_payload_and_tracks_bytes") {
         return;
     }
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
@@ -93,8 +91,7 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
 
 #[test]
 fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
-    if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
-        && !raw_icmp_test_supported()
+    if skip_unless_kernel_echo_supported("icmp_sync_keepalive_replies_do_not_prevent_timeout_exit")
     {
         return;
     }
@@ -187,9 +184,7 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
 
 #[test]
 fn zero_len_udp_client_payload_round_trips_over_icmp() {
-    if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp()
-        && !raw_icmp_test_supported()
-    {
+    if skip_unless_kernel_echo_supported("zero_len_udp_client_payload_round_trips_over_icmp") {
         return;
     }
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
@@ -245,7 +240,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         .expect("IPv4 loopback upstream bind");
     let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
 
-    let node3_ip = std::net::Ipv4Addr::new(127, 0, 0, 3);
+    let node3_ip = NODE3_IPV4;
     let node3 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: default_test_icmp_upstream_arg(node3_ip.into()),
@@ -259,7 +254,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     })
     .expect("could not launch ICMP endpoint node on raw-capable host");
 
-    let node2_ip = "127.0.0.2";
+    let node2_ip = NODE2_IPV4_STR;
     let node2 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
@@ -295,12 +290,11 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         stats2["worker_flows"][0]["client_sock_type"], "RAW",
         "middle node listener must be RAW"
     );
-    let expected_middle_upstream =
-        if crate::orchestrator::platform_requires_raw_privilege_for_any_icmp() {
-            "RAW"
-        } else {
-            "DGRAM"
-        };
+    let expected_middle_upstream = if crate::orchestrator::platform_supports_dgram_icmp() {
+        "DGRAM"
+    } else {
+        "RAW"
+    };
     assert_eq!(
         stats2["worker_flows"][0]["upstream_sock_type"], expected_middle_upstream,
         "middle node upstream must be {expected_middle_upstream}"

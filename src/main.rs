@@ -123,9 +123,13 @@ fn main() -> io::Result<()> {
 
     // Disconnect does not work for raw listen sockets and FreeBSD UDP
     // disconnect is unreliable; keep sockets unconnected so we can relock.
-    if requested_cfg.on_timeout == TimeoutAction::Drop
-        && (requested_cfg.listen_proto == SupportedProtocol::ICMP || cfg!(target_os = "freebsd"))
-    {
+    #[cfg(not(target_os = "freebsd"))]
+    let broken_disconnect = requested_cfg.listen_proto == SupportedProtocol::ICMP;
+
+    #[cfg(target_os = "freebsd")]
+    let broken_disconnect = true;
+
+    if requested_cfg.on_timeout == TimeoutAction::Drop && broken_disconnect {
         requested_cfg.debug_behavior.no_connect = true;
     }
 

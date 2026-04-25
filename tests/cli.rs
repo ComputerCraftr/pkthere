@@ -10,7 +10,8 @@ mod orchestrator;
 use crate::common::{assert_cli_rejects, assert_cli_runs, render_app_bin_path};
 use crate::common::{run_cli_args_expect_running_with_stdout, run_cli_args_with_stdout};
 use crate::orchestrator::{
-    IpFamily, default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
+    IpFamily, NODE1_IPV4_STR, default_test_icmp_upstream_arg, default_test_upstream_arg,
+    localhost_addr,
 };
 use std::time::Duration;
 
@@ -118,7 +119,12 @@ fn rejects_invalid_reresolve_mode() {
 fn rejects_invalid_here_value() {
     let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 53));
     assert_cli_rejects(
-        &["--here", "XYZ:127.0.0.1:abc", "--there", &there],
+        &[
+            "--here",
+            &format!("XYZ:{}:abc", NODE1_IPV4_STR),
+            "--there",
+            &there,
+        ],
         &["--here"],
     );
 }

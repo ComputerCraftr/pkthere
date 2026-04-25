@@ -16,13 +16,14 @@ pub use forwarder::{
     wait_for_child_exit_success,
 };
 pub use matrix::{
-    IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, SOCKET_MODES, bind_client_or_skip, bind_udp_client,
+    IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, NODE1_IPV4, NODE1_IPV4_STR, NODE2_IPV4,
+    NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR, SOCKET_MODES, bind_client_or_skip, bind_udp_client,
     default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
     random_unprivileged_port, run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server,
 };
 pub use raw_icmp::{
-    platform_requires_raw_privilege_for_any_icmp, raw_icmp_test_supported,
-    skip_unless_raw_icmp_supported,
+    kernel_echo_reply_supported, platform_supports_dgram_icmp, raw_icmp_test_supported,
+    skip_unless_kernel_echo_supported, skip_unless_raw_icmp_supported,
 };
 pub use runtime_asserts::{
     CLIENT_WAIT_MS, expect_no_echo, json_addr, send_until_locked, wait_for_locked_client_from,

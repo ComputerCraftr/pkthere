@@ -8,34 +8,39 @@ pub fn raw_icmp_test_supported() -> bool {
     {
         return linux_binary_has_raw_capability();
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
     {
-        return macos_binary_has_raw_capability();
+        return setuid_binary_has_raw_capability();
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
     {
         return fallback_binary_has_raw_capability();
     }
 }
 
-pub fn platform_requires_raw_privilege_for_fixed_icmp() -> bool {
-    // macOS DGRAM sockets can bind to a fixed ID, so it does not require raw privileges.
-    if cfg!(target_os = "macos") {
-        return false;
-    }
-    // Everything else (Linux/Android ignores DGRAM bind ID, others lack DGRAM entirely)
-    // requires raw sockets for fixed IDs.
-    true
-}
-
-pub fn platform_requires_raw_privilege_for_any_icmp() -> bool {
-    // If we can't create a DGRAM ICMP socket, we MUST use RAW for any ICMP.
+pub fn platform_supports_dgram_icmp() -> bool {
     socket2::Socket::new(
         socket2::Domain::IPV4,
         socket2::Type::DGRAM,
         Some(socket2::Protocol::ICMPV4),
     )
-    .is_err()
+    .is_ok()
 }
 
 pub fn skip_unless_raw_icmp_supported(test_name: &str) -> bool {
@@ -45,6 +50,107 @@ pub fn skip_unless_raw_icmp_supported(test_name: &str) -> bool {
 
     eprintln!(
         "skipping {test_name}: raw ICMP test support unavailable on this host (requires cap_net_raw on Linux, setuid root on macOS, or Administrator on Windows/others)"
+    );
+    true
+}
+
+pub fn kernel_echo_reply_supported() -> bool {
+    // Try to send an ICMP Echo Request to localhost and wait for a reply.
+    // This ensures the kernel actually responds to pings, which is required for some tests.
+    let sock = if platform_supports_dgram_icmp() {
+        socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::ICMPV4),
+        )
+    } else {
+        socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::RAW,
+            Some(socket2::Protocol::ICMPV4),
+        )
+    };
+
+    let Ok(sock) = sock else {
+        return false;
+    };
+
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+
+    // ICMP Echo Request: type 8, code 0, checksum 0 (for now), id 0, seq 0
+    let mut request = [
+        8u8, 0, 0, 0, // type, code, checksum
+        0, 0, 0, 0, // id, seq
+        b'p', b'k', b't', b'h', b'e', b'r', b'e', // payload
+    ];
+
+    // Simple RFC1071 checksum calculation
+    let mut sum = 0u32;
+    let (chunks, remainder) = request.as_chunks::<2>();
+    for chunk in chunks {
+        sum += u16::from_be_bytes(*chunk) as u32;
+    }
+    if let [last] = remainder {
+        sum += (*last as u32) << 8;
+    }
+    sum = (sum & 0xffff) + (sum >> 16);
+    sum = (sum & 0xffff) + (sum >> 16);
+    let checksum = !(sum as u16);
+    let checksum_bytes = checksum.to_be_bytes();
+    request[2] = checksum_bytes[0];
+    request[3] = checksum_bytes[1];
+
+    let dest = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    ));
+
+    if sock.send_to(&request, &dest.into()).is_err() {
+        return false;
+    }
+
+    let mut recv_buf = [std::mem::MaybeUninit::uninit(); 2048];
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_millis(500) {
+        match sock.recv(&mut recv_buf) {
+            Ok(n) => {
+                if n < 8 {
+                    continue;
+                }
+                // Safety: recv returned Ok(n), so at least n bytes are initialized.
+                let buf = unsafe {
+                    &*(&recv_buf[..n] as *const [std::mem::MaybeUninit<u8>] as *const [u8])
+                };
+
+                // DGRAM sockets return the ICMP message directly.
+                // RAW sockets return the IPv4 header followed by the ICMP message.
+                let mut icmp_start = 0;
+                if (buf[0] >> 4) == 4 {
+                    let ip_header_len = (buf[0] & 0x0f) as usize * 4;
+                    if n >= ip_header_len + 8 {
+                        icmp_start = ip_header_len;
+                    }
+                }
+
+                // ICMP Echo Reply is type 0, code 0
+                if buf[icmp_start] == 0 && buf[icmp_start + 1] == 0 {
+                    return true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    false
+}
+
+pub fn skip_unless_kernel_echo_supported(test_name: &str) -> bool {
+    if kernel_echo_reply_supported() {
+        return false;
+    }
+
+    eprintln!(
+        "skipping {test_name}: kernel does not provide ICMP echo replies on localhost or ICMP socket support unavailable"
     );
     true
 }
@@ -67,8 +173,15 @@ fn linux_binary_has_raw_capability() -> bool {
     stdout.contains("cap_net_raw")
 }
 
-#[cfg(target_os = "macos")]
-fn macos_binary_has_raw_capability() -> bool {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
+fn setuid_binary_has_raw_capability() -> bool {
     use std::os::unix::fs::MetadataExt;
     let Some(bin) = find_app_bin() else {
         return false;
@@ -81,7 +194,16 @@ fn macos_binary_has_raw_capability() -> bool {
     false
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)))]
 fn fallback_binary_has_raw_capability() -> bool {
     // If we can open a raw ICMP socket in the test runner, the spawned binary can too.
     socket2::Socket::new(
@@ -100,19 +222,32 @@ fn linux_binary_has_raw_capability() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        platform_requires_raw_privilege_for_fixed_icmp, raw_icmp_test_supported,
+        kernel_echo_reply_supported, raw_icmp_test_supported, skip_unless_kernel_echo_supported,
         skip_unless_raw_icmp_supported,
     };
 
     #[test]
-    fn raw_icmp_support_check_is_never_true_without_matching_platform_policy() {
-        if !platform_requires_raw_privilege_for_fixed_icmp() {
-            let _ = raw_icmp_test_supported();
-        }
+    fn raw_icmp_support_check_returns_bool_without_panicking() {
+        let _ = raw_icmp_test_supported();
     }
 
     #[test]
     fn skip_helper_returns_bool_without_panicking() {
         let _ = skip_unless_raw_icmp_supported("raw-icmp-smoke");
+    }
+
+    #[test]
+    fn kernel_echo_check_returns_bool_without_panicking() {
+        let _ = kernel_echo_reply_supported();
+    }
+
+    #[test]
+    fn kernel_echo_skip_helper_returns_bool_without_panicking() {
+        let _ = skip_unless_kernel_echo_supported("kernel-echo-smoke");
+    }
+
+    #[test]
+    fn platform_dgram_support_check_returns_bool_without_panicking() {
+        let _ = super::platform_supports_dgram_icmp();
     }
 }

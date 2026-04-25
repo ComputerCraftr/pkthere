@@ -11,6 +11,13 @@ pub enum IpFamily {
     V6,
 }
 
+pub const NODE1_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+pub const NODE1_IPV4_STR: &str = "127.0.0.1";
+pub const NODE2_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+pub const NODE2_IPV4_STR: &str = "127.0.0.2";
+pub const NODE3_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
+pub const NODE3_IPV4_STR: &str = "127.0.0.3";
+
 fn bind_udp_client_impl(addr: SocketAddr) -> io::Result<UdpSocket> {
     let sock = UdpSocket::bind(addr)?;
     sock.set_read_timeout(Some(Duration::from_millis(1000)))?;
@@ -101,25 +108,31 @@ mod tests {
     use super::{
         IpFamily, default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
     };
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
 
     #[test]
     fn default_test_upstream_arg_uses_dynamic_icmp_id() {
         let addr = localhost_addr(IpFamily::V4, 4444);
-        assert_eq!(default_test_upstream_arg("ICMP", addr), "ICMP:127.0.0.1:0");
+        assert_eq!(
+            default_test_upstream_arg("ICMP", addr),
+            format!("ICMP:{}:0", super::NODE1_IPV4_STR)
+        );
     }
 
     #[test]
     fn default_test_upstream_arg_preserves_udp_socket_addr() {
         let addr = localhost_addr(IpFamily::V4, 4444);
-        assert_eq!(default_test_upstream_arg("UDP", addr), "UDP:127.0.0.1:4444");
+        assert_eq!(
+            default_test_upstream_arg("UDP", addr),
+            format!("UDP:{}:4444", super::NODE1_IPV4_STR)
+        );
     }
 
     #[test]
     fn default_test_icmp_upstream_arg_uses_zero_id() {
         assert_eq!(
-            default_test_icmp_upstream_arg(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            "ICMP:127.0.0.1:0"
+            default_test_icmp_upstream_arg(IpAddr::V4(super::NODE1_IPV4)),
+            format!("ICMP:{}:0", super::NODE1_IPV4_STR)
         );
     }
 }
