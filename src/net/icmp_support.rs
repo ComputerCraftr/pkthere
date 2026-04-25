@@ -96,7 +96,9 @@ pub(crate) fn choose_effective_local_icmp_id(
     actual_local_port: u16,
     for_upstream: bool,
 ) -> (u16, IcmpLocalIdSource) {
-    if actual_local_port != 0 {
+    // Linux raw sockets for IPPROTO_ICMP often return 1 (the protocol number)
+    // from getsockname. We must ignore this as it's not a valid ICMP identity.
+    if actual_local_port != 0 && actual_local_port != 1 {
         if requested_id != 0 && requested_id != actual_local_port {
             log_debug!(
                 cfg!(test),
