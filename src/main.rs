@@ -143,7 +143,13 @@ fn main() -> io::Result<()> {
     )?;
 
     let listen_effective_id = if requested_cfg.listen_proto == SupportedProtocol::ICMP {
-        choose_effective_local_icmp_id(requested_cfg.listen_request.id, actual_listen.id, false).0
+        choose_effective_local_icmp_id(
+            requested_cfg.listen_request.id,
+            actual_listen.id,
+            listen_sock_type == socket2::Type::RAW,
+            false,
+        )
+        .0
     } else {
         actual_listen.id
     };

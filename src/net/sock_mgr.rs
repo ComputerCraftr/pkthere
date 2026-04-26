@@ -364,7 +364,7 @@ impl SocketManager {
 
         let (ret_sock, cflow, cpeer, cconn, laddr, eff_id) = if fam_flip || changed {
             log_info!("{context}: listen {fresh} (listener swapped)");
-            let (new_sock, mut local_canonical, _new_type) = make_socket(
+            let (new_sock, mut local_canonical, new_type) = make_socket(
                 fresh,
                 self.listen_proto,
                 1000,
@@ -373,7 +373,13 @@ impl SocketManager {
             )?;
 
             let effective_listen_id = if self.listen_proto == SupportedProtocol::ICMP {
-                choose_effective_local_icmp_id(self.listen_request.id, local_canonical.id, false).0
+                choose_effective_local_icmp_id(
+                    self.listen_request.id,
+                    local_canonical.id,
+                    new_type == Type::RAW,
+                    false,
+                )
+                .0
             } else {
                 local_canonical.id
             };

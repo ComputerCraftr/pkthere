@@ -75,6 +75,14 @@ pub fn kernel_echo_reply_supported() -> bool {
         return false;
     };
 
+    let bind_sa = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        0,
+    ));
+    if sock.bind(&bind_sa.into()).is_err() {
+        return false;
+    }
+
     let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
 
     // ICMP Echo Request: type 8, code 0, checksum 0 (for now), id 0, seq 0
@@ -122,18 +130,26 @@ pub fn kernel_echo_reply_supported() -> bool {
                     &*(&recv_buf[..n] as *const [std::mem::MaybeUninit<u8>] as *const [u8])
                 };
 
-                // DGRAM sockets return the ICMP message directly.
-                // RAW sockets return the IPv4 header followed by the ICMP message.
+                // Detect if the packet starts with an IPv4 or IPv6 header.
+                // RAW sockets typically return the IP header, while DGRAM sockets do not.
                 let mut icmp_start = 0;
-                if (buf[0] >> 4) == 4 {
-                    let ip_header_len = (buf[0] & 0x0f) as usize * 4;
-                    if n >= ip_header_len + 8 {
-                        icmp_start = ip_header_len;
+                let version = buf[0] >> 4;
+                if version == 4 {
+                    let ihl = (buf[0] & 0x0f) as usize * 4;
+                    if n >= ihl + 8 {
+                        icmp_start = ihl;
+                    }
+                } else if version == 6 {
+                    // IPv6 header is a fixed 40 bytes.
+                    if n >= 40 + 8 {
+                        icmp_start = 40;
                     }
                 }
 
-                // ICMP Echo Reply is type 0, code 0
-                if buf[icmp_start] == 0 && buf[icmp_start + 1] == 0 {
+                // ICMP Echo Reply: Type 0 (v4) or 129 (v6), Code 0
+                let icmp_type = buf[icmp_start];
+                let icmp_code = buf[icmp_start + 1];
+                if (icmp_type == 0 || icmp_type == 129) && icmp_code == 0 {
                     return true;
                 }
             }

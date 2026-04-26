@@ -138,20 +138,26 @@ pub fn make_upstream_socket_for(
     let dest_sa = dest.as_sock_addr();
     sock.connect(&dest_sa)?;
 
+    let actual_local_sa = sock.local_addr()?.as_socket().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
+    })?;
+
     // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
-    let final_local_port = sock
-        .local_addr()?
-        .as_socket()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname"))?
-        .port();
+    let final_local_port = actual_local_sa.port();
 
     let effective_local_id = if proto == SupportedProtocol::ICMP {
-        choose_effective_local_icmp_id(requested_port_id, final_local_port, true).0
+        choose_effective_local_icmp_id(
+            requested_port_id,
+            final_local_port,
+            sock_type == Type::RAW,
+            true,
+        )
+        .0
     } else {
         final_local_port
     };
 
-    let local = CanonicalAddr::new(bind_addr, effective_local_id);
+    let local = CanonicalAddr::new(actual_local_sa, effective_local_id);
     Ok((sock, dest, local, sock_type))
 }
 
