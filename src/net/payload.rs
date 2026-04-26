@@ -1,5 +1,6 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::net::checksum::{checksum16, checksum16_parts};
+use crate::net::icmp_parse::parse_icmp_echo_header;
 use crate::net::payload_support::{
     DEST_ADDR_REQUIRED, ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_IS_DATA,
 };
@@ -97,11 +98,6 @@ impl<'a> WirePayload<'a> {
     pub(crate) const fn len(&self) -> usize {
         self.pub_len
     }
-}
-
-#[inline(always)]
-const fn be16_16(b0: u8, b1: u8) -> u16 {
-    b1 as u16 | ((b0 as u16) << 8)
 }
 
 #[inline]
@@ -318,65 +314,6 @@ pub(crate) fn send_payload(
         }
         Err(e) => Err(e),
     }
-}
-
-/// Some OSes (notably Linux for IPv4 raw sockets) deliver the full IP header
-/// followed by the ICMP message. Others deliver only the ICMP message.
-#[inline]
-const fn parse_icmp_echo_header(payload: &[u8]) -> (bool, &[u8], usize, usize, u16, u16, bool) {
-    const ZERO_ARRAY: [u8; 1] = [0];
-    let n = payload.len();
-
-    let has0 = (n >= 1) as usize;
-    let buf = if has0 != 0 { payload } else { &ZERO_ARRAY };
-    let has9 = (n >= 10) as usize;
-    let b9 = buf[9 * has9];
-    let b6 = buf[6 * has9];
-    let b0 = buf[0];
-
-    let ver = (b0 >> 4) as usize;
-    let ihl = ((b0 as usize) & 0x0F) << 2;
-
-    let is_v4 = (ver == 4) as usize;
-    let is_v6 = (ver == 6) as usize;
-
-    let sane_ihl = (ihl >= 20) as usize;
-    let proto_icmp = (b9 == 1) as usize;
-    let room_v4 = (n >= ihl + 8) as usize;
-
-    let next_icmp6 = (b6 == 58) as usize;
-    let room_v6 = (n >= 48) as usize;
-
-    let off_v4 = ihl * (is_v4 & sane_ihl & proto_icmp & room_v4);
-    let off_v6 = 40usize * (is_v6 & next_icmp6 & room_v6);
-    let off = off_v4 | off_v6;
-
-    let have_hdr = (n >= off + 8) as usize;
-    let icmp_code = buf[(off + 1) * have_hdr];
-    let icmp_type = buf[off * have_hdr];
-
-    let success_bool = have_hdr == 1 && icmp_code == 0 && matches!(icmp_type, 8 | 0 | 128 | 129);
-    let success = success_bool as usize;
-
-    let ident_b1 = buf[(off + 5) * success];
-    let ident_b0 = buf[(off + 4) * success];
-    let ident = be16_16(ident_b0, ident_b1);
-
-    let seq_b1 = buf[(off + 7) * success];
-    let seq_b0 = buf[(off + 6) * success];
-    let seq = be16_16(seq_b0, seq_b1);
-
-    let is_request = matches!(icmp_type, 8 | 128);
-
-    (
-        success_bool,
-        &buf,
-        (off + 8) * success,
-        n * success,
-        ident,
-        seq,
-        is_request,
-    )
 }
 
 fn send_icmp_echo(

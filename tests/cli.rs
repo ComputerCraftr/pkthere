@@ -392,7 +392,14 @@ fn startup_logs_clarify_single_flow_with_one_worker() {
 }
 
 #[test]
+#[cfg_attr(
+    not(supports_kernel_icmp_echo),
+    ignore = "kernel ICMP echo tests require build-time ICMP support or PKTHERE_ALLOW_KERNEL_ICMP_ECHO=1"
+)]
 fn startup_logs_clarify_dynamic_icmp_upstream_mode() {
+    crate::orchestrator::require_kernel_echo_reply_supported()
+        .expect("ICMP test was enabled, but runtime ICMP support is missing");
+
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 0));
     let there = default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip());
     let (early_code, out, err) =
@@ -413,7 +420,14 @@ fn startup_logs_clarify_dynamic_icmp_upstream_mode() {
 }
 
 #[test]
+#[cfg_attr(
+    not(supports_kernel_icmp_echo),
+    ignore = "kernel ICMP echo tests require build-time ICMP support or PKTHERE_ALLOW_KERNEL_ICMP_ECHO=1"
+)]
 fn startup_logs_clarify_global_icmp_sync_budget() {
+    crate::orchestrator::require_kernel_echo_reply_supported()
+        .expect("ICMP test was enabled, but runtime ICMP support is missing");
+
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 0));
     let there = default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip());
     let (early_code, out, err) = run_cli_args_expect_running_with_stdout(

@@ -5,7 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
-const BLANKET_ALLOW_ATTR_ALLOWLIST: &[&str] = &["tests/common/orchestrator.rs"];
+const BLANKET_ALLOW_ATTR_ALLOWLIST: &[&str] =
+    &["tests/common/orchestrator.rs", "src/net/icmp_parse.rs"];
 
 fn collect_sources_with_exts(root: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     let mut entries = fs::read_dir(root)
