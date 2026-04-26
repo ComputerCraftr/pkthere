@@ -4,6 +4,8 @@ mod app_bin;
 mod child_guard;
 #[path = "path_policy.rs"]
 mod path_policy;
+#[path = "user_policy.rs"]
+mod user_policy;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -19,8 +21,11 @@ pub fn app_bin_path() -> PathBuf {
 
 pub fn run_cli_args(args: &[&str]) -> (Option<i32>, String) {
     let bin = app_bin_path();
-    let child = Command::new(&bin)
-        .args(args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args);
+    user_policy::apply_root_user_args(&mut cmd);
+
+    let child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -37,8 +42,11 @@ pub fn run_cli_args(args: &[&str]) -> (Option<i32>, String) {
 
 pub fn run_cli_args_with_stdout(args: &[&str]) -> (Option<i32>, String, String) {
     let bin = app_bin_path();
-    let child = Command::new(&bin)
-        .args(args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args);
+    user_policy::apply_root_user_args(&mut cmd);
+
+    let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -62,8 +70,11 @@ pub fn run_cli_args_expect_running_with_stdout(
     wait: Duration,
 ) -> (Option<i32>, String, String) {
     let bin = app_bin_path();
-    let child = Command::new(&bin)
-        .args(args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args);
+    user_policy::apply_root_user_args(&mut cmd);
+
+    let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

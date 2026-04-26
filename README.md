@@ -55,6 +55,19 @@ Run examples:
 - `./target/release/pkthere --here ICMP:0.0.0.0:0 --there UDP:1.1.1.1:53`
 - `./target/release/pkthere --here UDP:127.0.0.1:5354 --there ICMP:8.8.8.8:0`
 
+Running Raw ICMP Tests Locally:
+
+Integration tests require `pkthere` to have raw socket privileges (e.g. `setcap` on Linux or `setuid root` on macOS) to test fixed ICMP IDs. However, Cargo's freshness checks (triggered by code changes or environment variables like `PKTHERE_ALLOW_RAW_ICMP=1`) will overwrite the binary in `target/` and strip these privileges.
+
+To run these tests reliably without Cargo interfering, copy the binary to an isolated name in the repository and use `TEST_APP_BIN`:
+
+```bash
+cargo build --release
+cp target/release/pkthere target/release/pkthere-priv
+sudo chown root target/release/pkthere-priv && sudo chmod u+s target/release/pkthere-priv
+TEST_APP_BIN=target/release/pkthere-priv cargo test --release --test integration
+```
+
 Tests:
 
 - CLI validation: `cargo test --test cli`

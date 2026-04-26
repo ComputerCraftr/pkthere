@@ -22,7 +22,16 @@ fn stress_test_ipv4_all() {
     let _ = IpFamily::V6;
     let _ = SocketMode::Unconnected;
     for &proto in SUPPORTED_PROTOCOLS {
-        stress_test_ipv4(proto);
+        if !proto.eq_ignore_ascii_case("icmp") {
+            stress_test_ipv4(proto);
+        } else {
+            #[cfg(supports_kernel_icmp_echo)]
+            {
+                orchestrator::require_kernel_echo_reply_supported()
+                    .expect("ICMP stress case enabled but runtime ICMP support is missing");
+                stress_test_ipv4(proto);
+            }
+        }
     }
 }
 

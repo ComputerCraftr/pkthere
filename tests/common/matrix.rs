@@ -48,12 +48,14 @@ pub fn run_matrix_cases<'a>(
 ) {
     for &family in families {
         for &proto in protos {
-            if proto == "ICMP" && !crate::orchestrator::kernel_echo_reply_supported() {
+            #[cfg(not(supports_kernel_icmp_echo))]
+            if proto.eq_ignore_ascii_case("icmp") {
                 eprintln!(
                     "skipping ICMP matrix cases: ICMP socket support or kernel echo response unavailable"
                 );
                 continue;
             }
+
             for &mode in modes {
                 run(MatrixCase {
                     family,

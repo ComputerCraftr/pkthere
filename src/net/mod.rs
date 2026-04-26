@@ -1,4 +1,5 @@
 mod checksum;
+pub(crate) mod icmp_parse;
 pub(crate) mod icmp_support;
 pub mod params;
 pub mod payload;

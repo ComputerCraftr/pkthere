@@ -1,6 +1,3 @@
-#[cfg(unix)]
-use nix::unistd;
-
 use crate::app_bin::find_app_bin;
 use crate::core::{ChildGuard, take_child_stdout, wait_for_listen_addr_from};
 use crate::orchestrator::{MAX_WAIT_SECS, TIMEOUT_SECS};
@@ -81,10 +78,7 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
 
     cfg.mode.apply(&mut cmd);
 
-    #[cfg(unix)]
-    if unistd::geteuid().is_root() {
-        cmd.arg("--user").arg("nobody");
-    }
+    crate::orchestrator::user_policy::apply_root_user_args(&mut cmd);
 
     let mut child = ChildGuard::new(cmd.spawn()?);
     let mut out =

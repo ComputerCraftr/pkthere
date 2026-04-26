@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PKTHERE_ALLOW_RAW_ICMP: 1
+  PKTHERE_ALLOW_KERNEL_ICMP_ECHO: 1
 
 jobs:
   test:
@@ -35,27 +37,31 @@ jobs:
       - name: Build
         run: cargo test --no-run --verbose
 
-      - name: Grant raw ICMP capability to debug binary
+      - name: Grant raw ICMP capability to debug binary (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo setcap cap_net_raw+ep target/debug/pkthere
-          getcap target/debug/pkthere
+          cp target/debug/pkthere target/debug/pkthere-priv
+          sudo setcap cap_net_raw+ep target/debug/pkthere-priv
+          getcap target/debug/pkthere-priv
 
       - name: Grant raw ICMP capability to debug binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          sudo chown root target/debug/pkthere
-          sudo chmod u+s target/debug/pkthere
-          ls -l target/debug/pkthere
+          cp target/debug/pkthere target/debug/pkthere-priv
+          sudo chown root target/debug/pkthere-priv
+          sudo chmod u+s target/debug/pkthere-priv
+          ls -l target/debug/pkthere-priv
 
       - name: Run tests
+        env:
+          TEST_APP_BIN: target/debug/pkthere-priv
         run: cargo test --verbose
 
   stress-release:
     name: Stress Regression (Release)
     strategy:
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -77,18 +83,22 @@ jobs:
       - name: Build release test binaries
         run: cargo test --release --tests --no-run --verbose
 
-      - name: Grant raw ICMP capability to release binary
+      - name: Grant raw ICMP capability to release binary (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo setcap cap_net_raw+ep target/release/pkthere
-          getcap target/release/pkthere
+          cp target/release/pkthere target/release/pkthere-priv
+          sudo setcap cap_net_raw+ep target/release/pkthere-priv
+          getcap target/release/pkthere-priv
 
       - name: Grant raw ICMP capability to release binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          sudo chown root target/release/pkthere
-          sudo chmod u+s target/release/pkthere
-          ls -l target/release/pkthere
+          cp target/release/pkthere target/release/pkthere-priv
+          sudo chown root target/release/pkthere-priv
+          sudo chmod u+s target/release/pkthere-priv
+          ls -l target/release/pkthere-priv
 
       - name: Run release stress regression tests
+        env:
+          TEST_APP_BIN: target/release/pkthere-priv
         run: cargo test --release stress_test_ipv4_all -- --ignored --nocapture

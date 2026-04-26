@@ -10,9 +10,8 @@ use crate::orchestrator::{
     MatrixCase, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip,
     bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg, expect_no_echo,
     json_addr, launch_forwarder, localhost_addr, random_unprivileged_port, run_matrix_cases,
-    send_until_locked, skip_unless_kernel_echo_supported, skip_unless_raw_icmp_supported,
-    spawn_echo_or_skip, spawn_udp_echo_server, try_launch_forwarder, wait_for_child_exit_success,
-    wait_for_locked_client_from, wait_for_stats_matching,
+    send_until_locked, spawn_echo_or_skip, spawn_udp_echo_server, try_launch_forwarder,
+    wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_matching,
 };
 
 use std::io::ErrorKind;
@@ -33,10 +32,14 @@ fn locked_worker_flow<'a>(stats: &'a serde_json::Value) -> &'a serde_json::Value
 }
 
 #[test]
+#[cfg_attr(
+    not(supports_kernel_icmp_echo),
+    ignore = "kernel ICMP echo tests require build-time ICMP support or PKTHERE_ALLOW_KERNEL_ICMP_ECHO=1"
+)]
 fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
-    if skip_unless_kernel_echo_supported("icmp_sync_mode_forwards_payload_and_tracks_bytes") {
-        return;
-    }
+    crate::orchestrator::require_kernel_echo_reply_supported()
+        .expect("ICMP test was enabled, but runtime ICMP support is missing");
+
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let mut session = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
@@ -90,11 +93,14 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
 }
 
 #[test]
+#[cfg_attr(
+    not(supports_kernel_icmp_echo),
+    ignore = "kernel ICMP echo tests require build-time ICMP support or PKTHERE_ALLOW_KERNEL_ICMP_ECHO=1"
+)]
 fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
-    if skip_unless_kernel_echo_supported("icmp_sync_keepalive_replies_do_not_prevent_timeout_exit")
-    {
-        return;
-    }
+    crate::orchestrator::require_kernel_echo_reply_supported()
+        .expect("ICMP test was enabled, but runtime ICMP support is missing");
+
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let mut session = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
@@ -183,10 +189,14 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
 }
 
 #[test]
+#[cfg_attr(
+    not(supports_kernel_icmp_echo),
+    ignore = "kernel ICMP echo tests require build-time ICMP support or PKTHERE_ALLOW_KERNEL_ICMP_ECHO=1"
+)]
 fn zero_len_udp_client_payload_round_trips_over_icmp() {
-    if skip_unless_kernel_echo_supported("zero_len_udp_client_payload_round_trips_over_icmp") {
-        return;
-    }
+    crate::orchestrator::require_kernel_echo_reply_supported()
+        .expect("ICMP test was enabled, but runtime ICMP support is missing");
+
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let mut session = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
@@ -227,12 +237,13 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
 }
 
 #[test]
+#[cfg_attr(
+    not(supports_raw_icmp_capability),
+    ignore = "raw ICMP tests require build-time ICMP support or PKTHERE_ALLOW_RAW_ICMP=1"
+)]
 fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
-    if skip_unless_raw_icmp_supported(
-        "icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node",
-    ) {
-        return;
-    }
+    crate::orchestrator::require_raw_icmp_supported()
+        .expect("ICMP multihop test was enabled, but runtime raw ICMP capability is missing");
 
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let (udp_up_addr, _udp_up_thread) = IpFamily::V4
@@ -477,7 +488,7 @@ fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
     assert_eq!(stats_client, client_local, "stats client_addr mismatch");
     assert_eq!(
         worker["upstream_canonical"].as_str().unwrap_or_default(),
-        if case.proto == "ICMP" {
+        if case.proto.eq_ignore_ascii_case("icmp") {
             format!("{}:0", up_addr.ip())
         } else {
             format!("{}:{}", up_addr.ip(), up_addr.port())
@@ -548,7 +559,7 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: format!("UDP:{}", localhost_addr(IpFamily::V4, here_port)),
-        there: if case.proto == "ICMP" {
+        there: if case.proto.eq_ignore_ascii_case("icmp") {
             default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip())
         } else {
             format!("{}:{up_addr}", case.proto)
