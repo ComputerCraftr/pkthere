@@ -19,13 +19,6 @@ pub struct CanonicalAddr {
     pub id: u16, // Finalized OS port or ICMP Identifier
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IcmpHeaderIdSource {
-    None,
-    Local,
-    Remote,
-}
-
 impl CanonicalAddr {
     pub fn new(addr: SocketAddr, id: u16) -> Self {
         Self { addr, id }

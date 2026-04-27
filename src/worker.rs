@@ -18,7 +18,6 @@ use crate::worker_support::{
     buffer_sync_event, handle_c2u_keepalive, sync_session_on_lock_transition,
     wait_socket_until_readable,
 };
-use socket2::SockAddr;
 
 use std::io;
 use std::sync::Arc;
@@ -299,7 +298,10 @@ pub fn run_client_to_upstream_thread(
                             cfg,
                             stats,
                             &[],
-                            IcmpIdPolicy::Exact(handles.listen.id),
+                            handles.client_peer.map_or_else(
+                                || IcmpIdPolicy::Any,
+                                |peer| IcmpIdPolicy::Exact(peer.id),
+                            ),
                             PayloadOrigin::SyntheticSyncKeepalive,
                         )
                         .unwrap_or_else(|e| {
@@ -494,7 +496,10 @@ pub fn run_client_to_upstream_thread(
                             cfg,
                             stats,
                             &[],
-                            IcmpIdPolicy::Exact(handles.listen.id),
+                            handles.client_peer.map_or_else(
+                                || IcmpIdPolicy::Any,
+                                |peer| IcmpIdPolicy::Exact(peer.id),
+                            ),
                             PayloadOrigin::SyntheticSyncKeepalive,
                         )
                         .unwrap_or_else(|e| {
@@ -654,7 +659,6 @@ pub fn run_client_to_upstream_thread(
                         reset_session(sync_state, &mut sync_cache);
                         flow_state.set_locked(true);
                         was_locked = true;
-                        let src_sa_clean = SockAddr::from(src);
                         let peer_canonical = if let Some(ident) = flow.icmp_ident() {
                             CanonicalAddr::new(flow.display_addr(), ident)
                         } else {
@@ -665,7 +669,7 @@ pub fn run_client_to_upstream_thread(
                         handles.client_connected = false;
                         if cfg.debug_behavior.no_connect {
                             log_info!("Locked to single client {} (not connected)", src);
-                        } else if let Err(e) = handles.client_sock.connect(&src_sa_clean) {
+                        } else if let Err(e) = handles.client_sock.connect(&src_sa) {
                             log_warn!("connect client_sock to {} failed: {}", src, e);
                             log_info!("Locked to single client {} (not connected)", src);
                         } else {
@@ -696,7 +700,7 @@ pub fn run_client_to_upstream_thread(
                                         Some(flow),
                                         peer_addr,
                                         handles.client_connected,
-                                        &src_sa_clean,
+                                        &src_sa,
                                         0,
                                     );
                                 }

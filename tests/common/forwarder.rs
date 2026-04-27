@@ -75,6 +75,10 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
     if cfg.fast_stats {
         cmd.arg("--debug-fast-stats");
     }
+    cmd.arg("--debug-log")
+        .arg("drops")
+        .arg("--debug-log")
+        .arg("handles");
 
     cfg.mode.apply(&mut cmd);
 

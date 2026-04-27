@@ -217,10 +217,10 @@ pub(crate) fn sync_session_on_lock_transition(
 mod tests {
     use super::BufferedSyncPayload;
     use crate::cli::SupportedProtocol;
-    use crate::net::params::{CanonicalAddr, IcmpHeaderIdSource};
+    use crate::net::params::CanonicalAddr;
     use crate::net::payload::{PayloadEvent, WirePayload};
     use crate::net::sock_mgr::SocketHandles;
-    use crate::worker_support::cache::{CachedClientState, IcmpSendPolicy};
+    use crate::worker_support::cache::CachedClientState;
     use socket2::{Socket, Type};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
@@ -241,8 +241,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
                 3333,
             ),
-            listen_sock_type: Type::DGRAM,
-            listen_icmp_header_source: IcmpHeaderIdSource::Local,
+            listen_sock_type: Type::DGRAM, // UDP sockets are always DGRAM
             upstream: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4444)),
                 4444,
@@ -252,7 +251,6 @@ mod tests {
                 5555,
             ),
             upstream_sock_type: Type::DGRAM,
-            upstream_icmp_header_source: IcmpHeaderIdSource::Local,
             upstream_connected: true,
             upstream_sock: udp_socket_clone(),
             version: 0,
@@ -284,14 +282,12 @@ mod tests {
 
     #[test]
     fn local_keepalive_reply_route_uses_destination_peer_id_for_raw_listener() {
-        let mut handles = test_handles();
-        handles.listen_icmp_header_source = IcmpHeaderIdSource::Remote;
+        let handles = test_handles();
         let dest = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
             9999,
         );
         let route = CachedClientState::build_local_keepalive_reply_route(&handles, dest);
-        assert_eq!(route.icmp_send_policy, IcmpSendPolicy::UseRemoteCanonicalId);
         assert_eq!(route.icmp_header_id, 9999);
         assert_eq!(
             route.dest_sa.as_socket().expect("cached keepalive dest"),
@@ -302,7 +298,6 @@ mod tests {
     #[test]
     fn local_keepalive_reply_route_uses_realized_listen_id_for_dgram_listener() {
         let mut handles = test_handles();
-        handles.listen_icmp_header_source = IcmpHeaderIdSource::Local;
         handles.listen = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
             3333,
@@ -312,8 +307,7 @@ mod tests {
             9999,
         );
         let route = CachedClientState::build_local_keepalive_reply_route(&handles, dest);
-        assert_eq!(route.icmp_send_policy, IcmpSendPolicy::UseLocalCanonicalId);
-        assert_eq!(route.icmp_header_id, 3333);
+        assert_eq!(route.icmp_header_id, 9999);
         assert_eq!(
             route.dest_sa.as_socket().expect("cached keepalive dest"),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999))

@@ -1,7 +1,7 @@
 use crate::cli::SupportedProtocol;
 use crate::flow_key::ClientFlowKey;
 use crate::net::icmp_support::listener_requires_raw_icmp;
-use crate::net::params::{CanonicalAddr, IcmpHeaderIdSource};
+use crate::net::params::CanonicalAddr;
 use crate::net::socket::{
     disconnect_socket, family_changed, make_socket, make_upstream_socket_for, resolve_first,
 };
@@ -19,11 +19,9 @@ pub struct SocketHandles {
     pub client_sock: Socket,
     pub listen: CanonicalAddr,
     pub listen_sock_type: Type,
-    pub listen_icmp_header_source: IcmpHeaderIdSource,
     pub upstream: CanonicalAddr,
     pub upstream_local: CanonicalAddr,
     pub upstream_sock_type: Type,
-    pub upstream_icmp_header_source: IcmpHeaderIdSource,
     pub upstream_connected: bool,
     pub upstream_sock: Socket,
     pub version: u64,
@@ -50,6 +48,7 @@ struct ClientListenState {
     peer: Option<CanonicalAddr>,
     connected: bool,
     sock: Socket,
+    sock_type: Type,
 }
 
 struct UpstreamState {
@@ -67,26 +66,17 @@ struct UpstreamState {
 /// 2. `upstream`
 pub struct SocketManager {
     client_listen: Mutex<ClientListenState>, // cold-path updates only
-    listen_sock_type: Type,
-    listen_target: String,           // unresolved --here host:port
-    listen_proto: SupportedProtocol, // never changes
-    upstream_target: String,         // unresolved --there host:port
+    listen_target: String,                   // unresolved --here host:port
+    listen_proto: SupportedProtocol,         // never changes
+    upstream_target: String,                 // unresolved --there host:port
     upstream_request: CanonicalAddr,
-    upstream: Mutex<UpstreamState>, // cold-path updates only
+    upstream_local_reuses_remote_id: bool,
+    upstream: Mutex<UpstreamState>,    // cold-path updates only
     upstream_proto: SupportedProtocol, // never changes
     version: AtomicU64,                // increments on any change
 }
 
 impl SocketManager {
-    #[inline]
-    fn icmp_header_source(proto: SupportedProtocol, sock_type: Type) -> IcmpHeaderIdSource {
-        match proto {
-            SupportedProtocol::UDP => IcmpHeaderIdSource::None,
-            SupportedProtocol::ICMP if sock_type == Type::DGRAM => IcmpHeaderIdSource::Local,
-            SupportedProtocol::ICMP => IcmpHeaderIdSource::Remote,
-        }
-    }
-
     pub fn new(
         client_sock: Socket,
         listen: CanonicalAddr,
@@ -97,8 +87,8 @@ impl SocketManager {
         upstream_target: String,
         upstream_proto: SupportedProtocol,
     ) -> io::Result<Self> {
-        let (sock, upstream_remote, upstream_local, upstream_sock_type) =
-            make_upstream_socket_for(upstream, upstream_proto, upstream.id)?;
+        let (sock, upstream_local, upstream_remote, upstream_sock_type) =
+            make_upstream_socket_for(upstream, upstream_proto, 0, true)?;
         Ok(Self {
             client_listen: Mutex::new(ClientListenState {
                 listen,
@@ -106,12 +96,13 @@ impl SocketManager {
                 peer: None,
                 connected: false,
                 sock: client_sock,
+                sock_type: listen_sock_type,
             }),
-            listen_sock_type,
             listen_target,
             listen_proto,
             upstream_target,
             upstream_request: upstream,
+            upstream_local_reuses_remote_id: true,
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
@@ -248,7 +239,7 @@ impl SocketManager {
             client_connected: cl.connected,
             client_proto: self.listen_proto,
             listen: cl.listen,
-            listen_sock_type: self.listen_sock_type,
+            listen_sock_type: cl.sock_type,
             upstream: up.remote,
             upstream_local: up.local,
             upstream_connected: up.connected,
@@ -284,20 +275,28 @@ impl SocketManager {
         let (ret_sock, eff_remote, eff_local, eff_type) = if fam_flip {
             log_info!("{context}: upstream {fresh} (family changed; upstream socket swapped)");
             // Family changed: create a new **connected** upstream socket and swap it in.
-            let (new_sock, remote, local, new_type) =
-                make_upstream_socket_for(fresh, self.upstream_proto, self.upstream_request.id)?;
+            let (new_sock, local, remote, new_type) = make_upstream_socket_for(
+                fresh,
+                self.upstream_proto,
+                0,
+                self.upstream_local_reuses_remote_id,
+            )?;
             up_guard.local = local;
-            up_guard.remote = fresh;
+            up_guard.remote = remote;
             up_guard.connected = true;
             up_guard.sock = new_sock.try_clone()?;
             up_guard.sock_type = new_type;
             (new_sock, remote, local, new_type)
         } else if changed {
             log_info!("{context}: upstream {fresh}");
-            let (new_sock, remote, local, new_type) =
-                make_upstream_socket_for(fresh, self.upstream_proto, self.upstream_request.id)?;
+            let (new_sock, local, remote, new_type) = make_upstream_socket_for(
+                fresh,
+                self.upstream_proto,
+                0,
+                self.upstream_local_reuses_remote_id,
+            )?;
             up_guard.local = local;
-            up_guard.remote = fresh;
+            up_guard.remote = remote;
             up_guard.connected = true;
             up_guard.sock = new_sock.try_clone()?;
             up_guard.sock_type = new_type;
@@ -327,8 +326,8 @@ impl SocketManager {
         Option<CanonicalAddr>,
         bool,
         CanonicalAddr,
-        u16,
         bool,
+        Type,
     )> {
         let fresh = resolve_first(&self.listen_target)?;
 
@@ -345,9 +344,9 @@ impl SocketManager {
             (fam_flip, changed)
         };
 
-        let (ret_sock, cflow, cpeer, cconn, laddr, eff_id) = if fam_flip || changed {
+        let (ret_sock, cflow, cpeer, cconn, laddr, ltype) = if fam_flip || changed {
             log_info!("{context}: listen {fresh} (listener swapped)");
-            let (new_sock, local_canonical, _new_type) = make_socket(
+            let (new_sock, local_canonical, new_type) = make_socket(
                 fresh,
                 self.listen_proto,
                 1000,
@@ -360,7 +359,8 @@ impl SocketManager {
             cl_guard.peer = None;
             cl_guard.connected = false;
             cl_guard.sock = new_sock.try_clone()?;
-            (new_sock, None, None, false, cl_guard.listen, cl_guard.listen.id)
+            cl_guard.sock_type = new_type;
+            (new_sock, None, None, false, cl_guard.listen, new_type)
         } else {
             (
                 cl_guard.sock.try_clone()?,
@@ -368,7 +368,7 @@ impl SocketManager {
                 cl_guard.peer,
                 cl_guard.connected,
                 cl_guard.listen,
-                cl_guard.listen.id,
+                cl_guard.sock_type,
             )
         };
 
@@ -378,8 +378,8 @@ impl SocketManager {
             cpeer,
             cconn,
             laddr,
-            eff_id,
             fam_flip || changed,
+            ltype,
         ))
     }
 
@@ -402,8 +402,8 @@ impl SocketManager {
             client_peer,
             client_connected,
             listen_canonical,
-            _listen_local_id,
             listen_changed,
+            listen_sock_type,
         ) = if allow_listen_rebind {
             let res = self.reresolve_listen(context)?;
             (res.0, res.1, res.2, res.3, res.4, res.5, res.6)
@@ -415,8 +415,8 @@ impl SocketManager {
                 cl.peer,
                 cl.connected,
                 cl.listen,
-                cl.listen.id,
                 false,
+                cl.sock_type,
             )
         };
 
@@ -451,18 +451,10 @@ impl SocketManager {
             client_connected,
             client_sock,
             listen: listen_canonical,
-            listen_sock_type: self.listen_sock_type,
-            listen_icmp_header_source: Self::icmp_header_source(
-                self.listen_proto,
-                self.listen_sock_type,
-            ),
+            listen_sock_type,
             upstream: upstream_remote,
             upstream_local,
             upstream_sock_type,
-            upstream_icmp_header_source: Self::icmp_header_source(
-                self.upstream_proto,
-                upstream_sock_type,
-            ),
             upstream_connected,
             upstream_sock,
             version,
@@ -484,18 +476,10 @@ impl SocketManager {
             client_connected: cl.connected,
             client_sock: cl.sock.try_clone().expect("clone client socket"),
             listen: cl.listen,
-            listen_sock_type: self.listen_sock_type,
-            listen_icmp_header_source: Self::icmp_header_source(
-                self.listen_proto,
-                self.listen_sock_type,
-            ),
+            listen_sock_type: cl.sock_type,
             upstream: up.remote,
             upstream_local: up.local,
             upstream_sock_type: up.sock_type,
-            upstream_icmp_header_source: Self::icmp_header_source(
-                self.upstream_proto,
-                up.sock_type,
-            ),
             upstream_connected: up.connected,
             upstream_sock: up.sock.try_clone().expect("clone upstream socket"),
             version: self.get_version(),

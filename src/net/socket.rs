@@ -1,5 +1,5 @@
 use crate::cli::SupportedProtocol;
-use crate::net::icmp_support::{choose_upstream_icmp_id, upstream_requires_raw_icmp};
+use crate::net::icmp_support::{choose_upstream_icmp_ids, upstream_requires_raw_icmp};
 use crate::net::params::CanonicalAddr;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
@@ -112,7 +112,8 @@ fn make_icmp_socket(
 pub fn make_upstream_socket_for(
     dest: CanonicalAddr,
     proto: SupportedProtocol,
-    requested_port_id: u16,
+    req_local_id: u16,
+    reuse_remote_id: bool,
 ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type)> {
     let (domain, proto_id) = match dest.addr {
         SocketAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
@@ -120,7 +121,7 @@ pub fn make_upstream_socket_for(
     };
 
     let is_icmp = proto == SupportedProtocol::ICMP;
-    let force_raw = is_icmp && upstream_requires_raw_icmp(requested_port_id);
+    let force_raw = is_icmp && upstream_requires_raw_icmp(dest.id);
 
     let (sock, sock_type) = if is_icmp {
         if force_raw {
@@ -152,14 +153,25 @@ pub fn make_upstream_socket_for(
     // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
     let final_local_port = actual_local_sa.port();
 
-    let effective_local_id = if is_icmp {
-        choose_upstream_icmp_id(requested_port_id, final_local_port, sock_type == Type::RAW)
+    let (local_id, remote_id) = if is_icmp {
+        choose_upstream_icmp_ids(
+            req_local_id,
+            dest.id,
+            final_local_port,
+            reuse_remote_id,
+            sock_type == Type::RAW,
+        )
     } else {
-        final_local_port
+        (final_local_port, dest.id)
     };
 
-    let local = CanonicalAddr::new(actual_local_sa, effective_local_id);
-    Ok((sock, dest, local, sock_type))
+    let local = CanonicalAddr::new(actual_local_sa, local_id);
+    let dest = if is_icmp {
+        CanonicalAddr::new(dest.addr, remote_id)
+    } else {
+        dest
+    };
+    Ok((sock, local, dest, sock_type))
 }
 
 #[inline]
@@ -293,8 +305,8 @@ mod tests {
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let proto = SupportedProtocol::UDP;
 
-        let (sock, _remote, local, sock_type) =
-            make_upstream_socket_for(dest, proto, 0).expect("make_upstream_socket_for failed");
+        let (sock, local, _remote, sock_type) = make_upstream_socket_for(dest, proto, 0, false)
+            .expect("make_upstream_socket_for failed");
 
         assert_ne!(local.id, 0, "Local port should be assigned after connect");
         assert_eq!(
