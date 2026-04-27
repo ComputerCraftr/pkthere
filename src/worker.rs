@@ -52,98 +52,71 @@ pub fn run_watchdog_thread(
     loop {
         thread::sleep(period);
         let now_s = Instant::now().saturating_duration_since(t_start).as_secs();
-        match cfg.worker_flow_mode {
-            crate::cli::WorkerFlowMode::SharedFlow => {
-                let flow_state = &flow_states[0];
-                if !flow_state.is_locked() {
-                    continue;
-                }
-                let last_s = flow_state.last_seen_s();
-                if last_s == 0 || now_s.saturating_sub(last_s) < cfg.timeout_secs {
-                    continue;
-                }
-                match cfg.on_timeout {
-                    TimeoutAction::Drop => {
-                        log_warn!(
-                            "Idle timeout reached ({}s): dropping locked client; waiting for a new client",
-                            cfg.timeout_secs
-                        );
-                        for sock_mgr in sock_mgrs {
-                            let prev = sock_mgr.get_version();
-                            let ver = match sock_mgr.clear_client_lock(prev) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    log_error!("watchdog disconnect_socket failed: {}", e);
-                                    exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
-                                    return;
-                                }
-                            };
-                            log_debug!(
-                                cfg.debug_logs.handles,
-                                "watchdog publish disconnect: ver {}->{}",
-                                prev,
-                                ver
-                            );
-                        }
-                        flow_state.reset();
-                    }
-                    _ => {
-                        log_warn!(
-                            "Idle timeout reached ({}s): exiting cleanly",
-                            cfg.timeout_secs
-                        );
-                        exit_code_set.store(1 << 31, AtomOrdering::Relaxed);
-                        return;
-                    }
-                }
+
+        for (worker_pair_id, (sock_mgr, flow_state)) in
+            sock_mgrs.iter().zip(flow_states.iter()).enumerate()
+        {
+            if !flow_state.is_locked() {
+                continue;
             }
-            crate::cli::WorkerFlowMode::SingleFlow => {
-                for (worker_pair_id, (sock_mgr, flow_state)) in
-                    sock_mgrs.iter().zip(flow_states.iter()).enumerate()
-                {
-                    if !flow_state.is_locked() {
-                        continue;
-                    }
-                    let last_s = flow_state.last_seen_s();
-                    if last_s == 0 || now_s.saturating_sub(last_s) < cfg.timeout_secs {
-                        continue;
-                    }
-                    match cfg.on_timeout {
-                        TimeoutAction::Drop => {
-                            let locked_flow = sock_mgr.get_client_dest().0;
-                            log_warn!(
-                                "Idle timeout reached ({}s): dropping locked client on worker pair",
-                                cfg.timeout_secs
-                            );
-                            let prev = sock_mgr.get_version();
-                            let ver = match sock_mgr.clear_client_lock(prev) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    log_error!("watchdog disconnect_socket failed: {}", e);
-                                    exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
-                                    return;
-                                }
-                            };
-                            log_debug!(
-                                cfg.debug_logs.handles,
-                                "watchdog publish disconnect: ver {}->{}",
-                                prev,
-                                ver
-                            );
-                            flow_state.reset();
-                            if let (Some(flow_claims), Some(flow)) = (flow_claims, locked_flow) {
-                                flow_claims.release(flow, worker_pair_id);
+            let last_s = flow_state.last_seen_s();
+            if last_s == 0 || now_s.saturating_sub(last_s) < cfg.timeout_secs {
+                continue;
+            }
+
+            match cfg.on_timeout {
+                TimeoutAction::Drop => {
+                    let locked_flow = sock_mgr.get_client_dest().0;
+                    log_warn!(
+                        "Idle timeout reached ({}s): dropping locked client on worker pair {}",
+                        cfg.timeout_secs,
+                        worker_pair_id
+                    );
+
+                    // In SharedFlow mode, we must clear ALL managers because they share a single flow_state.
+                    // In SingleFlow mode, we only clear the specific manager.
+                    let managers_to_clear: Vec<_> =
+                        if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SharedFlow {
+                            sock_mgrs.iter().collect()
+                        } else {
+                            vec![sock_mgr]
+                        };
+
+                    for mgr in managers_to_clear {
+                        let prev = mgr.get_version();
+                        let ver = match mgr.clear_client_lock(prev) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log_error!("watchdog disconnect_socket failed: {}", e);
+                                exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
+                                return;
                             }
-                        }
-                        _ => {
-                            log_warn!(
-                                "Idle timeout reached ({}s): exiting cleanly",
-                                cfg.timeout_secs
-                            );
-                            exit_code_set.store(1 << 31, AtomOrdering::Relaxed);
-                            return;
-                        }
+                        };
+                        log_debug!(
+                            cfg.debug_logs.handles,
+                            "watchdog publish disconnect: ver {}->{}",
+                            prev,
+                            ver
+                        );
                     }
+
+                    flow_state.reset();
+                    if let (Some(flow_claims), Some(flow)) = (flow_claims, locked_flow) {
+                        flow_claims.release(flow, worker_pair_id);
+                    }
+
+                    // If we were in SharedFlow mode, we've handled all workers by clearing all managers.
+                    if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SharedFlow {
+                        break;
+                    }
+                }
+                _ => {
+                    log_warn!(
+                        "Idle timeout reached ({}s): exiting cleanly",
+                        cfg.timeout_secs
+                    );
+                    exit_code_set.store(1 << 31, AtomOrdering::Relaxed);
+                    return;
                 }
             }
         }

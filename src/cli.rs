@@ -186,6 +186,13 @@ pub fn realize_config(
         )));
     }
 
+    if listen.addr == requested.upstream_request.addr {
+        return Err(io::Error::other(format!(
+            "Port conflict: listener address {} is identical to upstream destination address {}; they must be different to avoid loops",
+            listen.addr, requested.upstream_request.addr
+        )));
+    }
+
     Ok(RuntimeConfig {
         listen,
         listen_proto: requested.listen_proto,
@@ -596,6 +603,18 @@ mod tests {
             debug_behavior: DebugBehavior::default(),
             debug_logs: DebugLogs::default(),
         }
+    }
+
+    #[test]
+    fn realize_config_rejects_port_conflict() {
+        let mut cfg = test_requested_config();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
+        cfg.upstream_request = CanonicalAddr::new(addr, 8888);
+        let listen = CanonicalAddr::new(addr, 8888);
+
+        let res = realize_config(cfg, listen);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().to_string().contains("Port conflict"));
     }
 
     #[test]
