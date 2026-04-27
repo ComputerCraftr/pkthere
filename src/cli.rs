@@ -57,9 +57,9 @@ pub enum WorkerFlowMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IcmpListenMode {
-    FixedId,
-    WildcardLearn,
+pub enum ListenMode {
+    Fixed,
+    Dynamic, // WildcardLearn for ICMP, Ephemeral for UDP
 }
 
 impl WorkerFlowMode {
@@ -124,7 +124,7 @@ pub struct DebugLogs {
 pub struct RequestedConfig {
     pub listen_request: CanonicalAddr, // CLI UDP port or ICMP listener id
     pub listen_proto: SupportedProtocol, // UDP | ICMP
-    pub listen_icmp_mode: IcmpListenMode, // FixedId | WildcardLearn
+    pub listen_mode: ListenMode,       // Fixed or Dynamic (:0)
     pub listen_str: String,            // original --here host:port string
     pub workers: usize,                // listener/upstream worker pairs
     pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
@@ -148,22 +148,21 @@ pub struct RequestedConfig {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
-    pub listen: CanonicalAddr,        // actual bound UDP port or ICMP local id
-    pub listen_bind_is_dynamic: bool, // true when --here UDP:host:0 was requested
+    pub listen: CanonicalAddr, // actual bound UDP port or ICMP local id
     pub listen_proto: SupportedProtocol, // UDP | ICMP
-    pub listen_icmp_mode: IcmpListenMode, // FixedId | WildcardLearn
-    pub listen_str: String,           // original --here host:port string
-    pub workers: usize,               // listener/upstream worker pairs
+    pub listen_mode: ListenMode, // Fixed or Dynamic (:0)
+    pub listen_str: String,    // original --here host:port string
+    pub workers: usize,        // listener/upstream worker pairs
     pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
-    pub upstream: CanonicalAddr,      // remote UDP port or ICMP peer/listener id
+    pub upstream: CanonicalAddr, // remote UDP port or ICMP peer/listener id
     pub upstream_proto: SupportedProtocol, // UDP | ICMP
-    pub upstream_str: String,         // FQDN:port or IP:port
-    pub timeout_secs: u64,            // idle timeout for single client
-    pub on_timeout: TimeoutAction,    // Drop | Exit
-    pub stats_interval_mins: u32,     // JSON stats print interval (0 disables stats thread)
-    pub max_payload: usize,           // optional user-specified MTU/payload limit
-    pub icmp_sync_pps: u32,           // 0 = disabled; >0 targets a best-effort ICMP request rate
-    pub reresolve_secs: u64,          // 0 = disabled
+    pub upstream_str: String,  // FQDN:port or IP:port
+    pub timeout_secs: u64,     // idle timeout for single client
+    pub on_timeout: TimeoutAction, // Drop | Exit
+    pub stats_interval_mins: u32, // JSON stats print interval (0 disables stats thread)
+    pub max_payload: usize,    // optional user-specified MTU/payload limit
+    pub icmp_sync_pps: u32,    // 0 = disabled; >0 targets a best-effort ICMP request rate
+    pub reresolve_secs: u64,   // 0 = disabled
     pub reresolve_mode: ReresolveMode, // which side(s) to re-resolve
     #[cfg(unix)]
     pub run_as_user: Option<String>,
@@ -178,7 +177,7 @@ pub fn realize_config(
     listen: CanonicalAddr,
 ) -> io::Result<RuntimeConfig> {
     if requested.listen_proto == SupportedProtocol::ICMP
-        && matches!(requested.listen_icmp_mode, IcmpListenMode::FixedId)
+        && requested.listen_mode == ListenMode::Fixed
         && requested.listen_request.id != listen.id
     {
         return Err(io::Error::other(format!(
@@ -189,10 +188,8 @@ pub fn realize_config(
 
     Ok(RuntimeConfig {
         listen,
-        listen_bind_is_dynamic: requested.listen_proto == SupportedProtocol::UDP
-            && requested.listen_request.id == 0,
         listen_proto: requested.listen_proto,
-        listen_icmp_mode: requested.listen_icmp_mode,
+        listen_mode: requested.listen_mode,
         listen_str: requested.listen_str,
         workers: requested.workers,
         worker_flow_mode: requested.worker_flow_mode,
@@ -498,10 +495,10 @@ pub fn parse_args() -> RequestedConfig {
     let worker_flow_mode = worker_flow_mode.unwrap_or(WorkerFlowMode::SharedFlow);
     let reresolve_secs = reresolve_secs.unwrap_or(0);
     let reresolve_mode = reresolve_mode.unwrap_or(ReresolveMode::Upstream);
-    let listen_icmp_mode = if listen_proto == SupportedProtocol::ICMP && listen_request.id == 0 {
-        IcmpListenMode::WildcardLearn
+    let listen_mode = if listen_request.id == 0 {
+        ListenMode::Dynamic
     } else {
-        IcmpListenMode::FixedId
+        ListenMode::Fixed
     };
 
     let absolute_max_payload = if listen_request.addr.is_ipv4() || upstream_request.addr.is_ipv4() {
@@ -532,7 +529,7 @@ pub fn parse_args() -> RequestedConfig {
     RequestedConfig {
         listen_request,
         listen_proto,
-        listen_icmp_mode,
+        listen_mode,
         listen_str,
         workers,
         worker_flow_mode,
@@ -558,20 +555,24 @@ pub fn parse_args() -> RequestedConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugBehavior, DebugLogs, IcmpListenMode, RequestedConfig, ReresolveMode,
-        SupportedProtocol, TimeoutAction, WorkerFlowMode, realize_config,
+        DebugBehavior, DebugLogs, ListenMode, RequestedConfig, ReresolveMode, SupportedProtocol,
+        TimeoutAction, WorkerFlowMode, realize_config,
     };
     use crate::net::params::CanonicalAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-    fn requested_icmp_listener(id: u16, mode: IcmpListenMode) -> RequestedConfig {
+    fn requested_icmp_listener(id: u16) -> RequestedConfig {
         RequestedConfig {
             listen_request: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, id)),
                 id,
             ),
             listen_proto: SupportedProtocol::ICMP,
-            listen_icmp_mode: mode,
+            listen_mode: if id == 0 {
+                ListenMode::Dynamic
+            } else {
+                ListenMode::Fixed
+            },
             listen_str: format!("127.0.0.1:{id}"),
             workers: 1,
             worker_flow_mode: WorkerFlowMode::SharedFlow,
@@ -599,7 +600,7 @@ mod tests {
 
     #[test]
     fn realize_config_rejects_fixed_id_listener_mismatch() {
-        let requested = requested_icmp_listener(4242, IcmpListenMode::FixedId);
+        let requested = requested_icmp_listener(4242);
         let listen = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
             1111,
@@ -614,7 +615,7 @@ mod tests {
 
     #[test]
     fn realize_config_rejects_fixed_id_listener_with_zero_realized_id() {
-        let requested = requested_icmp_listener(4242, IcmpListenMode::FixedId);
+        let requested = requested_icmp_listener(4242);
         let listen = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
             0,
@@ -630,13 +631,13 @@ mod tests {
 
     #[test]
     fn realize_config_accepts_wildcard_listener_with_dynamic_realized_id() {
-        let requested = requested_icmp_listener(0, IcmpListenMode::WildcardLearn);
+        let requested = requested_icmp_listener(0);
         let listen = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             7777,
         );
         let runtime = realize_config(requested, listen).expect("wildcard listener must realize");
         assert_eq!(runtime.listen.id, 7777);
-        assert_eq!(runtime.listen_icmp_mode, IcmpListenMode::WildcardLearn);
+        assert_eq!(runtime.listen_mode, ListenMode::Dynamic);
     }
 }

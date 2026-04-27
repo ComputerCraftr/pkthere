@@ -18,24 +18,24 @@ use std::time::{Duration, Instant};
 
 #[test]
 #[ignore]
-fn stress_test_ipv4_all() {
+fn stress_test_ipv4() {
     let _ = IpFamily::V6;
     let _ = SocketMode::Unconnected;
     for &proto in SUPPORTED_PROTOCOLS {
         if !proto.eq_ignore_ascii_case("icmp") {
-            stress_test_ipv4(proto);
+            stress_test_ipv4_case(proto);
         } else {
             #[cfg(supports_kernel_icmp_echo)]
             {
                 orchestrator::require_kernel_echo_reply_supported()
                     .expect("ICMP stress case enabled but runtime ICMP support is missing");
-                stress_test_ipv4(proto);
+                stress_test_ipv4_case(proto);
             }
         }
     }
 }
 
-fn stress_test_ipv4(proto: &str) {
+fn stress_test_ipv4_case(proto: &str) {
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback not available");
 
     let up_addr = if !proto.eq_ignore_ascii_case("icmp") {

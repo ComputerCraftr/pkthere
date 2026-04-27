@@ -281,7 +281,7 @@ pub(crate) fn prepare_send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DebugBehavior, DebugLogs, ReresolveMode, TimeoutAction};
+    use crate::cli::{DebugBehavior, DebugLogs, ListenMode, ReresolveMode, TimeoutAction};
     use crate::net::params::CanonicalAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
@@ -295,9 +295,8 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
                 1234,
             ),
-            listen_bind_is_dynamic: false,
             listen_proto: SupportedProtocol::UDP,
-            listen_icmp_mode: crate::cli::IcmpListenMode::FixedId,
+            listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
             workers: 1,
             worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,

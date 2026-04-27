@@ -397,7 +397,7 @@ fn test_icmp_echo_header(ident: u16, seq: u16) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DebugBehavior, DebugLogs};
+    use crate::cli::{DebugBehavior, DebugLogs, ListenMode, RuntimeConfig, SupportedProtocol};
     use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -411,9 +411,8 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
                 1234,
             ),
-            listen_bind_is_dynamic: false,
             listen_proto,
-            listen_icmp_mode: crate::cli::IcmpListenMode::FixedId,
+            listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
             workers: 1,
             worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,

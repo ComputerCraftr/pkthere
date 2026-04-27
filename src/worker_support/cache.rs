@@ -1,4 +1,4 @@
-use crate::cli::{IcmpListenMode, RuntimeConfig, SupportedProtocol};
+use crate::cli::{ListenMode, RuntimeConfig, SupportedProtocol};
 use crate::net::params::{CanonicalAddr, IcmpHeaderIdSource};
 use crate::net::payload::IcmpIdPolicy;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
@@ -54,9 +54,9 @@ impl CachedClientState {
         if cfg.listen_proto != SupportedProtocol::ICMP {
             IcmpIdPolicy::Exact(0)
         } else {
-            match cfg.listen_icmp_mode {
-                IcmpListenMode::FixedId => IcmpIdPolicy::Exact(cfg.listen.id),
-                IcmpListenMode::WildcardLearn => handles
+            match cfg.listen_mode {
+                ListenMode::Fixed => IcmpIdPolicy::Exact(cfg.listen.id),
+                ListenMode::Dynamic => handles
                     .locked_flow
                     .and_then(|flow| flow.icmp_ident())
                     .map_or(IcmpIdPolicy::Any, IcmpIdPolicy::Exact),
@@ -231,7 +231,7 @@ impl CachedClientState {
 mod tests {
     use super::{CachedClientState, IcmpSendPolicy};
     use crate::cli::{
-        DebugBehavior, DebugLogs, IcmpListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
+        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
         TimeoutAction, WorkerFlowMode,
     };
     use crate::flow_key::ClientFlowKey;
@@ -250,9 +250,8 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1111)),
                 1111,
             ),
-            listen_bind_is_dynamic: false,
             listen_proto,
-            listen_icmp_mode: IcmpListenMode::FixedId,
+            listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
             workers: 1,
             worker_flow_mode: WorkerFlowMode::SharedFlow,
@@ -280,7 +279,7 @@ mod tests {
 
     fn wildcard_icmp_config() -> RuntimeConfig {
         let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        cfg.listen_icmp_mode = IcmpListenMode::WildcardLearn;
+        cfg.listen_mode = ListenMode::Dynamic;
         cfg
     }
 

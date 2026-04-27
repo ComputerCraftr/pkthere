@@ -4,7 +4,7 @@ use crate::net::params::CanonicalAddr;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -154,7 +154,6 @@ pub fn make_upstream_socket_for(
 
     let effective_local_id = if is_icmp {
         choose_upstream_icmp_id(requested_port_id, final_local_port, sock_type == Type::RAW)
-            .0
     } else {
         final_local_port
     };

@@ -17,7 +17,6 @@ use cli::{
 use flow_claim::FlowClaimTable;
 use flow_state::FlowRuntimeState;
 use net::icmp_support::listener_requires_raw_icmp;
-use net::params::CanonicalAddr;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
 use net::sync_icmp::SharedSyncIcmpState;
@@ -71,22 +70,20 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
             }
         }
     }
-    if cfg.listen_bind_is_dynamic {
-        log_info!("UDP listener bind: dynamic local port requested with --here UDP:host:0");
-    }
-    if cfg.listen_proto == SupportedProtocol::ICMP {
-        match cfg.listen_icmp_mode {
-            cli::IcmpListenMode::FixedId => {
-                log_info!(
-                    "ICMP listener mode: fixed-id (effective local id {})",
-                    cfg.listen.id
-                );
-            }
-            cli::IcmpListenMode::WildcardLearn => {
-                log_info!(
-                    "ICMP listener mode: wildcard-learn (--here ICMP:host:0 learns the peer ICMP id on first lock)"
-                );
-            }
+    if cfg.listen_mode == cli::ListenMode::Dynamic {
+        if cfg.listen_proto == SupportedProtocol::UDP {
+            log_info!("UDP listener bind: dynamic local port requested with --here UDP:host:0");
+        } else {
+            log_info!(
+                "ICMP listener mode: wildcard-learn (--here ICMP:host:0 learns the peer ICMP id on first lock)"
+            );
+        }
+    } else {
+        if cfg.listen_proto == SupportedProtocol::ICMP {
+            log_info!(
+                "ICMP listener mode: fixed-id (effective local id {})",
+                cfg.listen.id
+            );
         }
     }
     if cfg.upstream_proto == SupportedProtocol::UDP {

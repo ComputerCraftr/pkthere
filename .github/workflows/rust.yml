@@ -101,4 +101,4 @@ jobs:
       - name: Run release stress regression tests
         env:
           TEST_APP_BIN: target/release/pkthere-priv
-        run: cargo test --release stress_test_ipv4_all -- --ignored --nocapture
+        run: cargo test --release stress_test_ipv4 -- --ignored --nocapture

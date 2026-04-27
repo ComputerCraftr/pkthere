@@ -360,19 +360,19 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 }
 
 #[test]
-fn enforce_max_payload_all() {
+fn enforce_max_payload() {
     for (family, max_payload, recv_buf_len) in [
         (IpFamily::V4, 0usize, 2048usize),
         (IpFamily::V4, 548usize, 2048usize),
         (IpFamily::V6, 1232usize, 4096usize),
     ] {
         run_matrix_cases(&[family], SUPPORTED_PROTOCOLS, &SOCKET_MODES, |case| {
-            run_enforce_max_payload(case, max_payload, recv_buf_len);
+            enforce_max_payload_case(case, max_payload, recv_buf_len);
         });
     }
 }
 
-fn run_enforce_max_payload(case: MatrixCase<'_>, max_payload: usize, recv_buf_len: usize) {
+fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_len: usize) {
     let Some(client_sock) = bind_client_or_skip(case.family) else {
         return;
     };
@@ -423,18 +423,18 @@ fn run_enforce_max_payload(case: MatrixCase<'_>, max_payload: usize, recv_buf_le
 }
 
 #[test]
-fn single_client_forwarding_all() {
+fn single_client_forwarding() {
     for (family, payload) in [
         (IpFamily::V4, b"hello-through-forwarder".as_slice()),
         (IpFamily::V6, b"hello-through-forwarder-v6".as_slice()),
     ] {
         run_matrix_cases(&[family], SUPPORTED_PROTOCOLS, &SOCKET_MODES, |case| {
-            run_single_client_forwarding(case, payload);
+            single_client_forwarding_case(case, payload);
         });
     }
 }
 
-fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
+fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
     const COUNT: usize = 5;
 
     let Some(client_sock) = bind_client_or_skip(case.family) else {
@@ -537,7 +537,7 @@ fn run_single_client_forwarding(case: MatrixCase<'_>, payload: &[u8]) {
 }
 
 #[test]
-fn relock_after_timeout_drop_all() {
+fn relock_after_timeout_drop_ipv4() {
     run_matrix_cases(
         &IPV4_ONLY_FAMILIES,
         SUPPORTED_PROTOCOLS,
@@ -650,13 +650,13 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
 }
 
 #[test]
-fn timeout_drop_relocks_after_forward_errors_udp() {
+fn timeout_drop_relocks_after_forward_errors_udp_ipv4() {
     run_matrix_cases(&IPV4_ONLY_FAMILIES, &["UDP"], &SOCKET_MODES, |case| {
-        timeout_drop_relocks_after_forward_errors_udp_case(case);
+        timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case);
     });
 }
 
-fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase<'_>) {
+fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>) {
     let client_a = bind_udp_client(IpFamily::V4).expect("client_a IPv4 loopback not available");
     let client_b = bind_udp_client(IpFamily::V4).expect("client_b IPv4 loopback not available");
     let dead_upstream_port = random_unprivileged_port(IpFamily::V4).expect("dead upstream port");
@@ -726,80 +726,83 @@ fn unconnected_udp_listener_rejects_payloads_from_wrong_port() {
         &["UDP"],
         &[crate::orchestrator::SocketMode::Unconnected],
         |case| {
-            let client_a = bind_udp_client(case.family).expect("client_a loopback not available");
-            let client_b = bind_udp_client(case.family).expect("client_b loopback not available");
-            let (up_addr, _up_thread) =
-                spawn_echo_or_skip(case.family).expect("echo server could not bind");
-            let here_port =
-                random_unprivileged_port(case.family).expect("ephemeral listen port");
-
-            let mut session = launch_forwarder(ForwarderConfig {
-                mode: case.mode,
-                here: format!("UDP:{}", localhost_addr(case.family, here_port)),
-                there: default_test_upstream_arg(case.proto, up_addr),
-                timeout_action: "exit",
-                timeout_secs: None,
-                max_payload: None,
-                fast_stats: true,
-                stats_interval_mins: None,
-                icmp_sync_pps: None,
-            });
-
-            client_a
-                .connect(session.listen_addr)
-                .expect("connect A -> forwarder");
-            client_b
-                .connect(session.listen_addr)
-                .expect("connect B -> forwarder");
-
-            // 1. Lock to client A
-            let payload_a = b"client-a-payload";
-            client_a.send(payload_a).expect("send A");
-            let a_locked = wait_for_locked_client_from(&mut session.out, MAX_WAIT_SECS)
-                .expect("did not see lock line for client A");
-            assert_eq!(
-                a_locked,
-                client_a.local_addr().expect("client A local addr")
-            );
-
-            // Ensure A receives echo
-            let mut buf = [0u8; 2048];
-            let n = client_a.recv(&mut buf).expect("recv echo A");
-            assert_eq!(&buf[..n], payload_a);
-
-            // 2. Client B sends payload.
-            // Since forwarder is in Unconnected mode, it will receive B's packet via recv_from.
-            // It should manually drop it because it is locked to A.
-            let payload_b = b"client-b-imposter";
-            client_b.send(payload_b).expect("send B");
-
-            // Verify B does not receive echo (timeout)
-            client_b
-                .set_read_timeout(Some(CLIENT_WAIT_MS))
-                .expect("set timeout B");
-            assert!(
-                client_b.recv(&mut buf).is_err(),
-                "imposter client B should not receive echo"
-            );
-
-            // 3. Client A sends another payload and receives echo
-            let payload_a_2 = b"client-a-payload-2";
-            client_a.send(payload_a_2).expect("send A 2");
-            let n = client_a.recv(&mut buf).expect("recv echo A 2");
-            assert_eq!(&buf[..n], payload_a_2);
-
-            // Shutdown and check stats
-            wait_for_child_exit_success(&mut session.child, MAX_WAIT_SECS);
-
-            let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect("node1 stats");
-
-            // c2u_pkts should be 2 (only client_a's 2 packets forwarded).
-            // client_b's packet should have been dropped by the manual flow key check.
-            assert_eq!(
-                stats["c2u_pkts"].as_u64().unwrap_or(0),
-                2,
-                "only client A's packets should be forwarded"
-            );
+            unconnected_udp_listener_rejects_payloads_from_wrong_port_case(case);
         },
+    );
+}
+
+fn unconnected_udp_listener_rejects_payloads_from_wrong_port_case(case: MatrixCase<'_>) {
+    let client_a = bind_udp_client(case.family).expect("client_a loopback not available");
+    let client_b = bind_udp_client(case.family).expect("client_b loopback not available");
+    let (up_addr, _up_thread) =
+        spawn_echo_or_skip(case.family).expect("echo server could not bind");
+    let here_port = random_unprivileged_port(case.family).expect("ephemeral listen port");
+
+    let mut session = launch_forwarder(ForwarderConfig {
+        mode: case.mode,
+        here: format!("UDP:{}", localhost_addr(case.family, here_port)),
+        there: default_test_upstream_arg(case.proto, up_addr),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+    });
+
+    client_a
+        .connect(session.listen_addr)
+        .expect("connect A -> forwarder");
+    client_b
+        .connect(session.listen_addr)
+        .expect("connect B -> forwarder");
+
+    // 1. Lock to client A
+    let payload_a = b"client-a-payload";
+    client_a.send(payload_a).expect("send A");
+    let a_locked = wait_for_locked_client_from(&mut session.out, MAX_WAIT_SECS)
+        .expect("did not see lock line for client A");
+    assert_eq!(
+        a_locked,
+        client_a.local_addr().expect("client A local addr")
+    );
+
+    // Ensure A receives echo
+    let mut buf = [0u8; 2048];
+    let n = client_a.recv(&mut buf).expect("recv echo A");
+    assert_eq!(&buf[..n], payload_a);
+
+    // 2. Client B sends payload.
+    // Since forwarder is in Unconnected mode, it will receive B's packet via recv_from.
+    // It should manually drop it because it is locked to A.
+    let payload_b = b"client-b-imposter";
+    client_b.send(payload_b).expect("send B");
+
+    // Verify B does not receive echo (timeout)
+    client_b
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .expect("set timeout B");
+    assert!(
+        client_b.recv(&mut buf).is_err(),
+        "imposter client B should not receive echo"
+    );
+
+    // 3. Client A sends another payload and receives echo
+    let payload_a_2 = b"client-a-payload-2";
+    client_a.send(payload_a_2).expect("send A 2");
+    let n = client_a.recv(&mut buf).expect("recv echo A 2");
+    assert_eq!(&buf[..n], payload_a_2);
+
+    // Shutdown and check stats
+    wait_for_child_exit_success(&mut session.child, MAX_WAIT_SECS);
+
+    let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect("node1 stats");
+
+    // c2u_pkts should be 2 (only client_a's 2 packets forwarded).
+    // client_b's packet should have been dropped by the manual flow key check.
+    assert_eq!(
+        stats["c2u_pkts"].as_u64().unwrap_or(0),
+        2,
+        "only client A's packets should be forwarded"
     );
 }

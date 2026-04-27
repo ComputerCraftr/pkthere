@@ -72,10 +72,9 @@ pub struct SocketManager {
     client_sock: Mutex<Socket>,                // shared listener socket
     listen: Mutex<CanonicalAddr>,              // current bound address + effective ID
     listen_sock_type: Type,
-    listen_request: CanonicalAddr, // requested bind address + requested id
-    listen_target: String,         // unresolved --here host:port
+    listen_target: String,           // unresolved --here host:port
     listen_proto: SupportedProtocol, // never changes
-    upstream_target: String,       // unresolved --there host:port
+    upstream_target: String,         // unresolved --there host:port
     upstream_request: CanonicalAddr,
     upstream_addr_connected: Mutex<UpstreamState>, // cold-path updates only
     upstream_proto: SupportedProtocol,             // never changes
@@ -115,7 +114,6 @@ impl SocketManager {
             client_sock: Mutex::new(client_sock),
             listen: Mutex::new(listen),
             listen_sock_type,
-            listen_request: listen,
             listen_target,
             listen_proto,
             upstream_target,
