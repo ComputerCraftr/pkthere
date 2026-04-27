@@ -338,9 +338,7 @@ mod tests {
     }
 
     fn lock_sync_state() -> MutexGuard<'static, ()> {
-        SYNC_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        SYNC_TEST_LOCK.lock().unwrap()
     }
 
     #[test]

@@ -151,15 +151,6 @@ pub fn run_watchdog_thread(
     }
 }
 
-#[inline]
-fn extract_client_flow_key(
-    cfg: &RuntimeConfig,
-    src_sa: &SockAddr,
-    event: &PayloadEvent<'_>,
-) -> Option<ClientFlowKey> {
-    ClientFlowKey::from_wire(src_sa, cfg.listen_proto, event)
-}
-
 pub fn run_upstream_to_client_thread(
     t_start: Instant,
     cfg: &RuntimeConfig,
@@ -562,6 +553,16 @@ pub fn run_client_to_upstream_thread(
                 }
                 match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
                     Ok((len, src_sa)) => {
+                        let Some(src) = src_sa.as_socket() else {
+                            log_warn_dir!(
+                                worker_id,
+                                C2U,
+                                "recv_from client non-IP address family (ignored): {:?}",
+                                src_sa
+                            );
+                            continue;
+                        };
+
                         let event = match validate_payload(
                             C2U,
                             cfg,
@@ -582,7 +583,8 @@ pub fn run_client_to_upstream_thread(
                                 continue;
                             }
                         };
-                        if extract_client_flow_key(cfg, &src_sa, &event) == handles.locked_flow {
+                        let flow_key = ClientFlowKey::from_wire(src, cfg.listen_proto, &event);
+                        if Some(flow_key) == handles.locked_flow {
                             latest_sync_payload = buffer_sync_event(
                                 worker_id,
                                 t_start,
@@ -613,17 +615,17 @@ pub fn run_client_to_upstream_thread(
             match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
                 Ok((len, src_sa)) => {
                     let t_recv = Instant::now();
-                    if !flow_state.is_locked() {
-                        let Some(src) = src_sa.as_socket() else {
-                            log_warn_dir!(
-                                worker_id,
-                                C2U,
-                                "recv_from client non-IP address family (ignored): {:?}",
-                                src_sa
-                            );
-                            continue;
-                        };
+                    let Some(src) = src_sa.as_socket() else {
+                        log_warn_dir!(
+                            worker_id,
+                            C2U,
+                            "recv_from client non-IP address family (ignored): {:?}",
+                            src_sa
+                        );
+                        continue;
+                    };
 
+                    if !flow_state.is_locked() {
                         let event = result_or_log_continue!(
                             validate_payload(
                                 C2U,
@@ -639,9 +641,7 @@ pub fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let Some(flow) = extract_client_flow_key(cfg, &src_sa, &event) else {
-                            continue;
-                        };
+                        let flow = ClientFlowKey::from_wire(src, cfg.listen_proto, &event);
 
                         if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SingleFlow
                             && flow_claims.is_some_and(|flow_claims| {
@@ -773,7 +773,9 @@ pub fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        if extract_client_flow_key(cfg, &src_sa, &event) != handles.locked_flow {
+                        if Some(ClientFlowKey::from_wire(src, cfg.listen_proto, &event))
+                            != handles.locked_flow
+                        {
                             continue;
                         }
                         match event {

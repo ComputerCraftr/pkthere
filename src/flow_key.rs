@@ -1,7 +1,5 @@
 use crate::cli::SupportedProtocol;
 use crate::net::payload::PayloadEvent;
-use socket2::SockAddr;
-
 use std::fmt;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
@@ -22,14 +20,13 @@ pub enum ClientFlowKey {
 
 impl ClientFlowKey {
     pub fn from_wire(
-        src_sa: &SockAddr,
+        src: SocketAddr,
         listen_proto: SupportedProtocol,
         event: &PayloadEvent<'_>,
-    ) -> Option<Self> {
-        let src = src_sa.as_socket()?;
+    ) -> Self {
         match listen_proto {
-            SupportedProtocol::UDP => Some(Self::Udp(src)),
-            SupportedProtocol::ICMP => Some(match src {
+            SupportedProtocol::UDP => Self::Udp(src),
+            SupportedProtocol::ICMP => match src {
                 SocketAddr::V4(addr) => Self::IcmpV4 {
                     ip: *addr.ip(),
                     ident: event.wire().src_ident,
@@ -40,7 +37,7 @@ impl ClientFlowKey {
                     flowinfo: addr.flowinfo(),
                     scope_id: addr.scope_id(),
                 },
-            }),
+            },
         }
     }
 

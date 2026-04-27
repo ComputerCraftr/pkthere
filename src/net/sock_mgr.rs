@@ -44,43 +44,37 @@ pub struct SocketStateSnapshot {
     pub upstream_sock_type: Type,
 }
 
-#[derive(Clone, Copy)]
-struct ClientState {
+struct ClientListenState {
+    listen: CanonicalAddr,
     flow: Option<ClientFlowKey>,
     peer: Option<CanonicalAddr>,
     connected: bool,
+    sock: Socket,
 }
 
-#[derive(Clone, Copy)]
 struct UpstreamState {
     remote: CanonicalAddr,
     local: CanonicalAddr,
     connected: bool,
+    sock: Socket,
+    sock_type: Type,
 }
 
 /// Manages both local and upstream sockets and publishes versioned updates.
 ///
 /// **STRICT LOCK ORDER**:
-/// 1. `listen`
-/// 2. `client_addr_connected`
-/// 3. `client_sock`
-/// 4. `upstream_addr_connected`
-/// 5. `upstream_sock`
-/// 6. `upstream_sock_type`
+/// 1. `client_listen`
+/// 2. `upstream`
 pub struct SocketManager {
-    client_addr_connected: Mutex<ClientState>, // cold-path updates only
-    client_sock: Mutex<Socket>,                // shared listener socket
-    listen: Mutex<CanonicalAddr>,              // current bound address + effective ID
+    client_listen: Mutex<ClientListenState>, // cold-path updates only
     listen_sock_type: Type,
     listen_target: String,           // unresolved --here host:port
     listen_proto: SupportedProtocol, // never changes
     upstream_target: String,         // unresolved --there host:port
     upstream_request: CanonicalAddr,
-    upstream_addr_connected: Mutex<UpstreamState>, // cold-path updates only
-    upstream_proto: SupportedProtocol,             // never changes
-    upstream_sock: Mutex<Socket>,                  // cold-path replacement only
-    upstream_sock_type: Mutex<Type>,
-    version: AtomicU64, // increments on any change
+    upstream: Mutex<UpstreamState>, // cold-path updates only
+    upstream_proto: SupportedProtocol, // never changes
+    version: AtomicU64,                // increments on any change
 }
 
 impl SocketManager {
@@ -106,26 +100,26 @@ impl SocketManager {
         let (sock, upstream_remote, upstream_local, upstream_sock_type) =
             make_upstream_socket_for(upstream, upstream_proto, upstream.id)?;
         Ok(Self {
-            client_addr_connected: Mutex::new(ClientState {
+            client_listen: Mutex::new(ClientListenState {
+                listen,
                 flow: None,
                 peer: None,
                 connected: false,
+                sock: client_sock,
             }),
-            client_sock: Mutex::new(client_sock),
-            listen: Mutex::new(listen),
             listen_sock_type,
             listen_target,
             listen_proto,
             upstream_target,
             upstream_request: upstream,
-            upstream_addr_connected: Mutex::new(UpstreamState {
+            upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
                 connected: true,
+                sock,
+                sock_type: upstream_sock_type,
             }),
             upstream_proto,
-            upstream_sock: Mutex::new(sock),
-            upstream_sock_type: Mutex::new(upstream_sock_type),
             version: AtomicU64::new(0),
         })
     }
@@ -149,7 +143,7 @@ impl SocketManager {
     /// Whether the listener socket is currently connected to a client.
     #[inline]
     pub fn get_client_connected(&self) -> bool {
-        self.client_addr_connected.lock().unwrap().connected
+        self.client_listen.lock().unwrap().connected
     }
 
     /// Update the locked client address/connected state and publish a new version.
@@ -165,11 +159,10 @@ impl SocketManager {
         connected: bool,
         prev_ver: u64,
     ) -> u64 {
-        *self.client_addr_connected.lock().unwrap() = ClientState {
-            flow,
-            peer,
-            connected,
-        };
+        let mut cl_guard = self.client_listen.lock().unwrap();
+        cl_guard.flow = flow;
+        cl_guard.peer = peer;
+        cl_guard.connected = connected;
         self.publish_version(true);
         prev_ver + 1
     }
@@ -184,16 +177,13 @@ impl SocketManager {
         client_sa: &SockAddr,
         prev_ver: u64,
     ) -> io::Result<u64> {
-        let mut client_guard = self.client_addr_connected.lock().unwrap();
-        let client_sock_guard = self.client_sock.lock().unwrap();
-        *client_guard = ClientState {
-            flow,
-            peer,
-            connected,
-        };
+        let mut cl_guard = self.client_listen.lock().unwrap();
+        cl_guard.flow = flow;
+        cl_guard.peer = peer;
+        cl_guard.connected = connected;
         self.publish_version(true);
         if connected {
-            client_sock_guard.connect(client_sa)?;
+            cl_guard.sock.connect(client_sa)?;
         }
         Ok(prev_ver + 1)
     }
@@ -207,17 +197,14 @@ impl SocketManager {
         connected: bool,
         prev_ver: u64,
     ) -> io::Result<u64> {
-        let mut client_guard = self.client_addr_connected.lock().unwrap();
-        let client_sock_guard = self.client_sock.lock().unwrap();
-        *client_guard = ClientState {
-            flow,
-            peer,
-            connected,
-        };
+        let mut cl_guard = self.client_listen.lock().unwrap();
+        cl_guard.flow = flow;
+        cl_guard.peer = peer;
+        cl_guard.connected = connected;
         self.publish_version(true);
         if !connected {
             // Use a clone because the original may not be marked as connected
-            disconnect_socket(&client_sock_guard.try_clone()?)?;
+            disconnect_socket(&cl_guard.sock.try_clone()?)?;
         }
         Ok(prev_ver + 1)
     }
@@ -234,41 +221,39 @@ impl SocketManager {
     /// Current listen bind address.
     #[inline]
     pub fn get_listen_addr(&self) -> CanonicalAddr {
-        *self.listen.lock().unwrap()
+        self.client_listen.lock().unwrap().listen
     }
 
     /// Snapshot the current client destination/connected state and protocol.
     #[inline]
     pub fn get_client_dest(&self) -> (Option<ClientFlowKey>, bool, SupportedProtocol) {
-        let state = *self.client_addr_connected.lock().unwrap();
-        (state.flow, state.connected, self.listen_proto)
+        let cl = self.client_listen.lock().unwrap();
+        (cl.flow, cl.connected, self.listen_proto)
     }
 
     /// Snapshot the current upstream destination and protocol.
     #[inline]
     pub fn get_upstream_dest(&self) -> (CanonicalAddr, bool, SupportedProtocol) {
-        let state = *self.upstream_addr_connected.lock().unwrap();
-        (state.remote, state.connected, self.upstream_proto)
+        let up = self.upstream.lock().unwrap();
+        (up.remote, up.connected, self.upstream_proto)
     }
 
     #[inline]
     pub fn snapshot_state(&self) -> SocketStateSnapshot {
-        let listen_guard = self.listen.lock().unwrap();
-        let client_guard = self.client_addr_connected.lock().unwrap();
-        let upstream_guard = self.upstream_addr_connected.lock().unwrap();
-        let upstream_sock_type = *self.upstream_sock_type.lock().unwrap();
+        let cl = self.client_listen.lock().unwrap();
+        let up = self.upstream.lock().unwrap();
         SocketStateSnapshot {
-            locked_flow: client_guard.flow,
-            client_peer: client_guard.peer,
-            client_connected: client_guard.connected,
+            locked_flow: cl.flow,
+            client_peer: cl.peer,
+            client_connected: cl.connected,
             client_proto: self.listen_proto,
-            listen: *listen_guard,
+            listen: cl.listen,
             listen_sock_type: self.listen_sock_type,
-            upstream: upstream_guard.remote,
-            upstream_local: upstream_guard.local,
-            upstream_connected: upstream_guard.connected,
+            upstream: up.remote,
+            upstream_local: up.local,
+            upstream_connected: up.connected,
             upstream_proto: self.upstream_proto,
-            upstream_sock_type,
+            upstream_sock_type: up.sock_type,
         }
     }
 
@@ -282,12 +267,12 @@ impl SocketManager {
         );
 
         // Compare against previous before updating to compute correct family flip
-        let mut upstream_guard = self.upstream_addr_connected.lock().unwrap();
+        let mut up_guard = self.upstream.lock().unwrap();
         let (fam_flip, changed) = {
-            let prev_addr = upstream_guard.remote;
+            let prev_addr = up_guard.remote;
             let changed = prev_addr != fresh;
             let fam_flip = if changed {
-                upstream_guard.remote = fresh;
+                up_guard.remote = fresh;
                 family_changed(prev_addr.addr, fresh.addr)
             } else {
                 false
@@ -301,27 +286,27 @@ impl SocketManager {
             // Family changed: create a new **connected** upstream socket and swap it in.
             let (new_sock, remote, local, new_type) =
                 make_upstream_socket_for(fresh, self.upstream_proto, self.upstream_request.id)?;
-            upstream_guard.local = local;
-            upstream_guard.remote = remote;
-            upstream_guard.connected = true;
-            *self.upstream_sock.lock().unwrap() = new_sock.try_clone()?;
-            *self.upstream_sock_type.lock().unwrap() = new_type;
+            up_guard.local = local;
+            up_guard.remote = fresh;
+            up_guard.connected = true;
+            up_guard.sock = new_sock.try_clone()?;
+            up_guard.sock_type = new_type;
             (new_sock, remote, local, new_type)
         } else if changed {
             log_info!("{context}: upstream {fresh}");
             let (new_sock, remote, local, new_type) =
                 make_upstream_socket_for(fresh, self.upstream_proto, self.upstream_request.id)?;
-            upstream_guard.local = local;
-            upstream_guard.remote = remote;
-            upstream_guard.connected = true;
-            *self.upstream_sock.lock().unwrap() = new_sock.try_clone()?;
-            *self.upstream_sock_type.lock().unwrap() = new_type;
+            up_guard.local = local;
+            up_guard.remote = fresh;
+            up_guard.connected = true;
+            up_guard.sock = new_sock.try_clone()?;
+            up_guard.sock_type = new_type;
             (new_sock, remote, local, new_type)
         } else {
             // No change: just return a clone of the current socket
-            let s = self.upstream_sock.lock().unwrap().try_clone()?;
-            let t = *self.upstream_sock_type.lock().unwrap();
-            (s, upstream_guard.remote, upstream_guard.local, t)
+            let s = up_guard.sock.try_clone()?;
+            let t = up_guard.sock_type;
+            (s, up_guard.remote, up_guard.local, t)
         };
 
         Ok((
@@ -347,12 +332,12 @@ impl SocketManager {
     )> {
         let fresh = resolve_first(&self.listen_target)?;
 
-        let mut listen_guard = self.listen.lock().unwrap();
+        let mut cl_guard = self.client_listen.lock().unwrap();
         let (fam_flip, changed) = {
-            let prev_addr = listen_guard.addr;
+            let prev_addr = cl_guard.listen.addr;
             let changed = prev_addr.ip() != fresh.ip();
             let fam_flip = if changed {
-                listen_guard.addr = fresh;
+                cl_guard.listen.addr = fresh;
                 family_changed(prev_addr, fresh)
             } else {
                 false
@@ -370,27 +355,20 @@ impl SocketManager {
                 self.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
             )?;
 
-            // Update the internal socket state
-            let mut client_guard = self.client_addr_connected.lock().unwrap();
-            let mut client_sock_guard = self.client_sock.lock().unwrap();
-            *listen_guard = local_canonical;
-            *client_guard = ClientState {
-                flow: None,
-                peer: None,
-                connected: false,
-            };
-            *client_sock_guard = new_sock.try_clone()?;
-            (new_sock, None, None, false, *listen_guard, listen_guard.id)
+            cl_guard.listen = local_canonical;
+            cl_guard.flow = None;
+            cl_guard.peer = None;
+            cl_guard.connected = false;
+            cl_guard.sock = new_sock.try_clone()?;
+            (new_sock, None, None, false, cl_guard.listen, cl_guard.listen.id)
         } else {
-            let client_guard = self.client_addr_connected.lock().unwrap();
-            let client_sock_guard = self.client_sock.lock().unwrap();
             (
-                client_sock_guard.try_clone()?,
-                client_guard.flow,
-                client_guard.peer,
-                client_guard.connected,
-                *listen_guard,
-                listen_guard.id,
+                cl_guard.sock.try_clone()?,
+                cl_guard.flow,
+                cl_guard.peer,
+                cl_guard.connected,
+                cl_guard.listen,
+                cl_guard.listen.id,
             )
         };
 
@@ -430,16 +408,14 @@ impl SocketManager {
             let res = self.reresolve_listen(context)?;
             (res.0, res.1, res.2, res.3, res.4, res.5, res.6)
         } else {
-            let listen_guard = self.listen.lock().unwrap();
-            let client_guard = self.client_addr_connected.lock().unwrap();
-            let client_sock_guard = self.client_sock.lock().unwrap();
+            let cl = self.client_listen.lock().unwrap();
             (
-                client_sock_guard.try_clone()?,
-                client_guard.flow,
-                client_guard.peer,
-                client_guard.connected,
-                *listen_guard,
-                listen_guard.id,
+                cl.sock.try_clone()?,
+                cl.flow,
+                cl.peer,
+                cl.connected,
+                cl.listen,
+                cl.listen.id,
                 false,
             )
         };
@@ -455,15 +431,13 @@ impl SocketManager {
             let res = self.reresolve_upstream(context)?;
             (res.0, res.1, res.2, res.3, true, res.4)
         } else {
-            let upstream_guard = self.upstream_addr_connected.lock().unwrap();
-            let upstream_sock_guard = self.upstream_sock.lock().unwrap();
-            let upstream_type_guard = self.upstream_sock_type.lock().unwrap();
+            let up = self.upstream.lock().unwrap();
             (
-                upstream_sock_guard.try_clone()?,
-                upstream_guard.remote,
-                upstream_guard.local,
-                *upstream_type_guard,
-                upstream_guard.connected,
+                up.sock.try_clone()?,
+                up.remote,
+                up.local,
+                up.sock_type,
+                up.connected,
                 false,
             )
         };
@@ -501,36 +475,29 @@ impl SocketManager {
     pub fn refresh_handles(&self) -> SocketHandles {
         // Snapshot all mutable state while holding the relevant locks so the
         // returned version matches the handles we hand back.
-        let listen_guard = self.listen.lock().unwrap();
-        let client_guard = self.client_addr_connected.lock().unwrap();
-        let client_sock_guard = self.client_sock.lock().unwrap();
-        let upstream_guard = self.upstream_addr_connected.lock().unwrap();
-        let upstream_sock_guard = self.upstream_sock.lock().unwrap();
-        let upstream_sock_type_guard = self.upstream_sock_type.lock().unwrap();
-        let upstream_sock_type = *upstream_sock_type_guard;
+        let cl = self.client_listen.lock().unwrap();
+        let up = self.upstream.lock().unwrap();
 
         SocketHandles {
-            locked_flow: client_guard.flow,
-            client_peer: client_guard.peer,
-            client_connected: client_guard.connected,
-            client_sock: client_sock_guard.try_clone().expect("clone client socket"),
-            listen: *listen_guard,
+            locked_flow: cl.flow,
+            client_peer: cl.peer,
+            client_connected: cl.connected,
+            client_sock: cl.sock.try_clone().expect("clone client socket"),
+            listen: cl.listen,
             listen_sock_type: self.listen_sock_type,
             listen_icmp_header_source: Self::icmp_header_source(
                 self.listen_proto,
                 self.listen_sock_type,
             ),
-            upstream: upstream_guard.remote,
-            upstream_local: upstream_guard.local,
-            upstream_sock_type,
+            upstream: up.remote,
+            upstream_local: up.local,
+            upstream_sock_type: up.sock_type,
             upstream_icmp_header_source: Self::icmp_header_source(
                 self.upstream_proto,
-                upstream_sock_type,
+                up.sock_type,
             ),
-            upstream_connected: upstream_guard.connected,
-            upstream_sock: upstream_sock_guard
-                .try_clone()
-                .expect("clone upstream socket"),
+            upstream_connected: up.connected,
+            upstream_sock: up.sock.try_clone().expect("clone upstream socket"),
             version: self.get_version(),
         }
     }
