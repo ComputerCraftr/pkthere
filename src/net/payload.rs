@@ -644,6 +644,42 @@ mod tests {
     }
 
     #[test]
+    fn validate_payload_exact_icmp_policy_rejects_other_identifiers() {
+        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
+        let stats = Stats::new();
+        let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
+        buf[4] = 0xAA;
+        buf[5] = 0x55;
+
+        // 1. Rejects non-matching ID
+        let res = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            IcmpIdPolicy::Exact(0x1111),
+            PayloadOrigin::Wire,
+        );
+        assert!(res.is_err(), "exact policy should reject mismatching ID");
+        assert!(
+            res.unwrap_err().to_string().contains("identity mismatch"),
+            "error message should mention identity mismatch"
+        );
+
+        // 2. Accepts matching ID
+        let event = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            IcmpIdPolicy::Exact(0xAA55),
+            PayloadOrigin::Wire,
+        )
+        .expect("exact policy should accept matching identifier");
+        assert_eq!(event.wire().src_ident, 0xAA55);
+    }
+
+    #[test]
     fn validate_payload_rejects_invalid_icmp_shim() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();

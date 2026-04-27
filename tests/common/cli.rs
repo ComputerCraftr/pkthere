@@ -93,7 +93,20 @@ pub fn run_cli_args_expect_running_with_stdout(
     };
 
     if early_exit_code.is_none() {
-        let _ = child.kill();
+        if child.kill().is_err() {
+            #[cfg(unix)]
+            {
+                // If we lack permission to kill (e.g. setuid root process),
+                // try non-interactive sudo kill.
+                let _ = Command::new("sudo")
+                    .arg("-n")
+                    .arg("kill")
+                    .arg("-9")
+                    .arg(child.id().to_string())
+                    .status();
+            }
+        }
+
         let _ = child.wait();
     }
 

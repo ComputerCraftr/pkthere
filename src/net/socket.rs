@@ -1,10 +1,10 @@
 use crate::cli::SupportedProtocol;
-use crate::net::icmp_support::{choose_effective_local_icmp_id, upstream_requires_raw_icmp};
+use crate::net::icmp_support::{choose_upstream_icmp_id, upstream_requires_raw_icmp};
 use crate::net::params::CanonicalAddr;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::time::Duration;
@@ -63,7 +63,7 @@ pub fn make_socket(
         Some(Duration::from_millis(read_timeout_ms))
     })?;
 
-    let actual_local = if sock_type == Type::DGRAM {
+    let actual_local = if proto == SupportedProtocol::UDP && bind_addr.port() == 0 {
         CanonicalAddr::from_socket_addr(sock.local_addr()?.as_socket().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
         })?)
@@ -114,29 +114,36 @@ pub fn make_upstream_socket_for(
     proto: SupportedProtocol,
     requested_port_id: u16,
 ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type)> {
-    let local_port = if proto == SupportedProtocol::ICMP {
-        dest.id
-    } else {
-        0
-    };
-    let bind_addr = match dest {
-        CanonicalAddr {
-            addr: SocketAddr::V6(_),
-            ..
-        } => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_port),
-        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_port),
+    let (domain, proto_id) = match dest.addr {
+        SocketAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
+        _ => (Domain::IPV4, Protocol::ICMPV4),
     };
 
-    let (sock, _actual_local, sock_type) = make_socket(
-        bind_addr,
-        proto,
-        1000,
-        false,
-        proto == SupportedProtocol::ICMP && upstream_requires_raw_icmp(requested_port_id),
-    )?;
+    let is_icmp = proto == SupportedProtocol::ICMP;
+    let force_raw = is_icmp && upstream_requires_raw_icmp(requested_port_id);
+
+    let (sock, sock_type) = if is_icmp {
+        if force_raw {
+            (Socket::new(domain, Type::RAW, Some(proto_id))?, Type::RAW)
+        } else {
+            match Socket::new(domain, Type::DGRAM, Some(proto_id)) {
+                Ok(s) => (s, Type::DGRAM),
+                Err(_) => (Socket::new(domain, Type::RAW, Some(proto_id))?, Type::RAW),
+            }
+        }
+    } else {
+        (
+            Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?,
+            Type::DGRAM,
+        )
+    };
+
+    let read_timeout = Duration::from_millis(1000);
+    sock.set_read_timeout(Some(read_timeout))?;
+    sock.set_write_timeout(Some(read_timeout))?;
 
     let dest_sa = dest.as_sock_addr();
-    sock.connect(&dest_sa)?;
+    sock.connect(&dest_sa.into())?;
 
     let actual_local_sa = sock.local_addr()?.as_socket().ok_or_else(|| {
         io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
@@ -145,14 +152,9 @@ pub fn make_upstream_socket_for(
     // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
     let final_local_port = actual_local_sa.port();
 
-    let effective_local_id = if proto == SupportedProtocol::ICMP {
-        choose_effective_local_icmp_id(
-            requested_port_id,
-            final_local_port,
-            sock_type == Type::RAW,
-            true,
-        )
-        .0
+    let effective_local_id = if is_icmp {
+        choose_upstream_icmp_id(requested_port_id, final_local_port, sock_type == Type::RAW)
+            .0
     } else {
         final_local_port
     };
@@ -278,7 +280,7 @@ pub fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
     fn test_make_upstream_socket_local_id_assigned() {

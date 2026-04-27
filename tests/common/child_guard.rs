@@ -26,6 +26,7 @@ impl DerefMut for ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         // If it's still running (or we can't tell), try to kill and wait.
+        // Drop is best-effort only and never invokes sudo to avoid hangs.
         match self.0.try_wait() {
             Ok(Some(_status)) => {
                 // already exited

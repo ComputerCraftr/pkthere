@@ -1,6 +1,6 @@
 use crate::cli::SupportedProtocol;
 use crate::flow_key::ClientFlowKey;
-use crate::net::icmp_support::{choose_effective_local_icmp_id, listener_requires_raw_icmp};
+use crate::net::icmp_support::listener_requires_raw_icmp;
 use crate::net::params::{CanonicalAddr, IcmpHeaderIdSource};
 use crate::net::socket::{
     disconnect_socket, family_changed, make_socket, make_upstream_socket_for, resolve_first,
@@ -364,7 +364,7 @@ impl SocketManager {
 
         let (ret_sock, cflow, cpeer, cconn, laddr, eff_id) = if fam_flip || changed {
             log_info!("{context}: listen {fresh} (listener swapped)");
-            let (new_sock, mut local_canonical, new_type) = make_socket(
+            let (new_sock, local_canonical, _new_type) = make_socket(
                 fresh,
                 self.listen_proto,
                 1000,
@@ -372,22 +372,9 @@ impl SocketManager {
                 self.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
             )?;
 
-            let effective_listen_id = if self.listen_proto == SupportedProtocol::ICMP {
-                choose_effective_local_icmp_id(
-                    self.listen_request.id,
-                    local_canonical.id,
-                    new_type == Type::RAW,
-                    false,
-                )
-                .0
-            } else {
-                local_canonical.id
-            };
-
             // Update the internal socket state
             let mut client_guard = self.client_addr_connected.lock().unwrap();
             let mut client_sock_guard = self.client_sock.lock().unwrap();
-            local_canonical.id = effective_listen_id;
             *listen_guard = local_canonical;
             *client_guard = ClientState {
                 flow: None,

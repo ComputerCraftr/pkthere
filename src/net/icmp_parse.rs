@@ -90,9 +90,6 @@ pub fn probe_kernel_icmp_echo() -> std::io::Result<()> {
             ));
         };
 
-    let bind_sa = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    sock.bind(&bind_sa.into())?;
-
     sock.set_read_timeout(Some(Duration::from_millis(500)))?;
 
     // ICMP Echo Request
@@ -116,7 +113,8 @@ pub fn probe_kernel_icmp_echo() -> std::io::Result<()> {
     request[3] = checksum_bytes[1];
 
     let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    sock.send_to(&request, &dest.into())?;
+    sock.connect(&dest.into())?;
+    sock.send(&request)?;
 
     let mut recv_buf = [std::mem::MaybeUninit::uninit(); 2048];
     let start = Instant::now();

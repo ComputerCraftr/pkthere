@@ -16,7 +16,7 @@ use cli::{
 };
 use flow_claim::FlowClaimTable;
 use flow_state::FlowRuntimeState;
-use net::icmp_support::{choose_effective_local_icmp_id, listener_requires_raw_icmp};
+use net::icmp_support::listener_requires_raw_icmp;
 use net::params::CanonicalAddr;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
@@ -141,19 +141,6 @@ fn main() -> io::Result<()> {
         worker_count != 1,
         requested_cfg.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
     )?;
-
-    let listen_effective_id = if requested_cfg.listen_proto == SupportedProtocol::ICMP {
-        choose_effective_local_icmp_id(
-            requested_cfg.listen_request.id,
-            actual_listen.id,
-            listen_sock_type == socket2::Type::RAW,
-            false,
-        )
-        .0
-    } else {
-        actual_listen.id
-    };
-    let actual_listen = CanonicalAddr::new(actual_listen.addr, listen_effective_id);
 
     let cfg = Arc::new(realize_config(requested_cfg, actual_listen)?);
 
