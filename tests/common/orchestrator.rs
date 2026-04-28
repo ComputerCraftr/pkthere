@@ -22,6 +22,7 @@ pub use matrix::{
     NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR, SOCKET_MODES, bind_client_or_skip, bind_udp_client,
     default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
     random_unprivileged_port, run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server,
+    spawn_upstream_echo_or_skip,
 };
 pub use raw_icmp::{
     platform_supports_dgram_icmp, require_kernel_echo_reply_supported, require_raw_icmp_supported,

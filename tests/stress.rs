@@ -8,8 +8,7 @@ mod orchestrator;
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
     ForwarderConfig, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, SocketMode,
-    bind_udp_client, default_test_upstream_arg, launch_forwarder, localhost_addr,
-    spawn_udp_echo_server, wait_for_child_exit_success,
+    bind_udp_client, launch_forwarder, spawn_upstream_echo_or_skip, wait_for_child_exit_success,
 };
 
 use std::io;
@@ -20,36 +19,23 @@ use std::time::{Duration, Instant};
 #[ignore]
 fn stress_test_ipv4() {
     let _ = IpFamily::V6;
-    let _ = SocketMode::Unconnected;
     for &proto in SUPPORTED_PROTOCOLS {
-        if !proto.eq_ignore_ascii_case("icmp") {
-            stress_test_ipv4_case(proto);
-        } else {
-            #[cfg(supports_kernel_icmp_echo)]
-            {
-                orchestrator::require_kernel_echo_reply_supported()
-                    .expect("ICMP stress case enabled but runtime ICMP support is missing");
-                stress_test_ipv4_case(proto);
-            }
-        }
+        stress_test_ipv4_case(proto);
     }
 }
 
 fn stress_test_ipv4_case(proto: &str) {
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback not available");
 
-    let up_addr = if !proto.eq_ignore_ascii_case("icmp") {
-        spawn_udp_echo_server(IpFamily::V4)
-            .expect("IPv4 echo server could not bind")
-            .0
-    } else {
-        localhost_addr(IpFamily::V4, 0)
+    let Some((there_arg, _up_addr, _up_thread)) = spawn_upstream_echo_or_skip(IpFamily::V4, proto)
+    else {
+        return;
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: SocketMode::Connected,
         here: IpFamily::V4.listen_arg().to_string(),
-        there: default_test_upstream_arg(proto, up_addr),
+        there: there_arg,
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,

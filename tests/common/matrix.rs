@@ -88,3 +88,24 @@ pub fn spawn_echo_or_skip(family: IpFamily) -> Option<(SocketAddr, thread::JoinH
         Err(e) => panic!("IPv4 echo server could not bind: {e}"),
     }
 }
+
+pub fn spawn_upstream_echo_or_skip(
+    family: IpFamily,
+    proto: &str,
+) -> Option<(String, SocketAddr, Option<thread::JoinHandle<()>>)> {
+    if proto.eq_ignore_ascii_case("icmp") {
+        #[cfg(not(supports_kernel_icmp_echo))]
+        return None;
+
+        #[cfg(supports_kernel_icmp_echo)]
+        {
+            crate::orchestrator::require_kernel_echo_reply_supported()
+                .expect("ICMP test was enabled, but runtime ICMP support is missing");
+            let addr = localhost_addr(family, 0);
+            Some((default_test_icmp_upstream_arg(addr.ip()), addr, None))
+        }
+    } else {
+        spawn_echo_or_skip(family)
+            .map(|(addr, handle)| (format!("{proto}:{addr}"), addr, Some(handle)))
+    }
+}

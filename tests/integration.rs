@@ -8,11 +8,10 @@ use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
     CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS,
     MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES, SUPPORTED_PROTOCOLS,
-    bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg,
-    default_test_upstream_arg, expect_no_echo, json_addr, launch_forwarder, localhost_addr,
-    random_unprivileged_port, run_matrix_cases, send_until_locked, spawn_echo_or_skip,
-    spawn_udp_echo_server, try_launch_forwarder, wait_for_child_exit_success,
-    wait_for_locked_client_from, wait_for_stats_matching,
+    bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg, expect_no_echo,
+    json_addr, launch_forwarder, localhost_addr, random_unprivileged_port, run_matrix_cases,
+    send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
+    wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_matching,
 };
 
 use std::io::ErrorKind;
@@ -55,7 +54,7 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
     });
     client_sock
         .connect(session.listen_addr)
-        .expect("connect to forwarder (sync keepalive)");
+        .expect("connect to ICMP forwarder (sync keepalive)");
 
     client_sock
         .send(b"x")
@@ -63,7 +62,7 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
     let mut buf = [0u8; 2048];
     let n = client_sock
         .recv(&mut buf)
-        .expect("recv initial sync reply from forwarder");
+        .expect("recv initial sync reply from ICMP forwarder");
     assert!(n >= 1, "expected at least 1-byte echoed payload, got {}", n);
     assert_eq!(&buf[..n], b"x", "expected exact echoed payload");
 
@@ -119,7 +118,7 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
     });
     client_sock
         .connect(session.listen_addr)
-        .expect("connect to forwarder (sync timeout)");
+        .expect("connect to ICMP forwarder (sync timeout)");
 
     let payload = b"sync-timeout-check";
     client_sock
@@ -222,7 +221,7 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
     });
     client_sock
         .connect(session.listen_addr)
-        .expect("connect to forwarder");
+        .expect("connect to ICMP forwarder");
     client_sock
         .set_read_timeout(Some(Duration::from_millis(250)))
         .expect("set read timeout");
@@ -388,14 +387,16 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
     let Some(client_sock) = bind_client_or_skip(case.family) else {
         return;
     };
-    let Some((up_addr, _up_thread)) = spawn_echo_or_skip(case.family) else {
+    let Some((there_arg, _up_addr, _up_thread)) =
+        spawn_upstream_echo_or_skip(case.family, case.proto)
+    else {
         return;
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: case.family.listen_arg().to_string(),
-        there: default_test_upstream_arg(case.proto, up_addr),
+        there: there_arg,
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: Some(max_payload),
@@ -404,16 +405,17 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         icmp_sync_pps: None,
     });
 
-    client_sock
-        .connect(session.listen_addr)
-        .expect("connect to forwarder (max payload)");
+    client_sock.connect(session.listen_addr).expect(&format!(
+        "connect to {} forwarder (max payload)",
+        case.proto
+    ));
 
     let ok = vec![255u8; max_payload];
     client_sock.send(&ok).expect("send max payload");
     let mut buf = vec![0u8; recv_buf_len];
     let _ = client_sock
         .recv(&mut buf)
-        .expect("recv from forwarder (max payload)");
+        .expect(&format!("recv from {} forwarder (max payload)", case.proto));
 
     // Drain any delayed packets before testing the drop, especially for empty payloads
     client_sock
@@ -486,14 +488,16 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         return;
     };
     let client_local = client_sock.local_addr().expect("client local addr");
-    let Some((up_addr, _up_thread)) = spawn_echo_or_skip(case.family) else {
+    let Some((there_arg, up_addr, _up_thread)) =
+        spawn_upstream_echo_or_skip(case.family, case.proto)
+    else {
         return;
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: case.family.listen_arg().to_string(),
-        there: default_test_upstream_arg(case.proto, up_addr),
+        there: there_arg,
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -502,18 +506,20 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         icmp_sync_pps: None,
     });
 
-    client_sock
-        .connect(session.listen_addr)
-        .expect("connect to forwarder (single client)");
+    client_sock.connect(session.listen_addr).expect(&format!(
+        "connect to {} forwarder (single client)",
+        case.proto
+    ));
 
     for _ in 0..COUNT {
         client_sock
             .send(payload)
-            .expect("send to forwarder (single client)");
+            .expect(&format!("send to {} forwarder (single client)", case.proto));
         let mut buf = [0u8; 2048];
-        let n = client_sock
-            .recv(&mut buf)
-            .expect("recv from forwarder (single client)");
+        let n = client_sock.recv(&mut buf).expect(&format!(
+            "recv from {} forwarder (single client)",
+            case.proto
+        ));
         assert_eq!(&buf[..n], payload, "echo payload mismatch");
     }
 
@@ -603,19 +609,17 @@ fn relock_after_timeout_drop_ipv4() {
 fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     let client_a = bind_udp_client(IpFamily::V4).expect("client_a IPv4 loopback not available");
     let client_b = bind_udp_client(IpFamily::V4).expect("client_b IPv4 loopback not available");
-    let up_addr = spawn_udp_echo_server(IpFamily::V4)
-        .expect("IPv4 echo server could not bind")
-        .0;
+    let Some((there_arg, _up_addr, _up_thread)) =
+        spawn_upstream_echo_or_skip(case.family, case.proto)
+    else {
+        return;
+    };
     let here_port = random_unprivileged_port(IpFamily::V4).expect("ephemeral listen port");
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: format!("UDP:{}", localhost_addr(IpFamily::V4, here_port)),
-        there: if case.proto.eq_ignore_ascii_case("icmp") {
-            default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip())
-        } else {
-            format!("{}:{up_addr}", case.proto)
-        },
+        there: there_arg,
         timeout_action: "drop",
         timeout_secs: None,
         max_payload: None,
@@ -680,7 +684,10 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
             Err(e) => panic!("recv echo B: {e}"),
         }
     }
-    let n = got.expect("did not receive echo from forwarder after re-lock");
+    let n = got.expect(&format!(
+        "did not receive echo from {} forwarder after re-lock",
+        case.proto
+    ));
     assert_eq!(&buf[..n], payload_b);
 
     let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS).expect(&format!(
@@ -787,14 +794,17 @@ fn unconnected_udp_listener_rejects_payloads_from_wrong_port() {
 fn unconnected_udp_listener_rejects_payloads_from_wrong_port_case(case: MatrixCase<'_>) {
     let client_a = bind_udp_client(case.family).expect("client_a loopback not available");
     let client_b = bind_udp_client(case.family).expect("client_b loopback not available");
-    let (up_addr, _up_thread) =
-        spawn_echo_or_skip(case.family).expect("echo server could not bind");
+    let Some((there_arg, _up_addr, _up_thread)) =
+        spawn_upstream_echo_or_skip(case.family, case.proto)
+    else {
+        return;
+    };
     let here_port = random_unprivileged_port(case.family).expect("ephemeral listen port");
 
     let mut session = launch_forwarder(ForwarderConfig {
         mode: case.mode,
         here: format!("UDP:{}", localhost_addr(case.family, here_port)),
-        there: default_test_upstream_arg(case.proto, up_addr),
+        there: there_arg,
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
