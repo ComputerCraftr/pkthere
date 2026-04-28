@@ -118,6 +118,7 @@ pub struct DebugBehavior {
 pub struct DebugLogs {
     pub drops: bool,
     pub handles: bool,
+    pub packets: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -249,7 +250,7 @@ pub fn parse_args() -> RequestedConfig {
              \t--group NAME             Drop privileges to this group (Unix only)\n\
              \t--debug-no-connect       Keep sockets unconnected for debug/relock behavior\n\
              \t--debug-fast-stats       Shorten stats cadence for tests/debugging\n\
-             \t--debug-log WHAT         Enable debug log category WHAT = drops|handles (repeatable)\n\
+             \t--debug-log WHAT         Enable debug log category WHAT = drops|handles|packets (repeatable)\n\
              \t-h, --help               Show this help and exit"
         );
         process::exit(code)
@@ -457,8 +458,11 @@ pub fn parse_args() -> RequestedConfig {
                     match flag {
                         "drops" => debug_logs.drops = true,
                         "handles" => debug_logs.handles = true,
+                        "packets" => debug_logs.packets = true,
                         _ => {
-                            log_error!("--debug-log expects drops or handles (got '{flag}')");
+                            log_error!(
+                                "--debug-log expects drops, handles, or packets (got '{flag}')"
+                            );
                             print_usage_and_exit(2)
                         }
                     }
@@ -566,7 +570,7 @@ mod tests {
         TimeoutAction, WorkerFlowMode, realize_config,
     };
     use crate::net::params::CanonicalAddr;
-    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
     fn requested_icmp_listener(id: u16) -> RequestedConfig {
         RequestedConfig {
@@ -607,7 +611,7 @@ mod tests {
 
     #[test]
     fn realize_config_rejects_port_conflict() {
-        let mut cfg = test_requested_config();
+        let mut cfg = requested_icmp_listener(0);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
         cfg.upstream_request = CanonicalAddr::new(addr, 8888);
         let listen = CanonicalAddr::new(addr, 8888);

@@ -127,15 +127,31 @@ fn pack_dedup_stamp(generation: u64, seq: u16) -> u64 {
     (generation << 16) | u64::from(seq)
 }
 
-pub(crate) fn reset_session(shared: &SharedSyncIcmpState, cache: &mut SyncIcmpCache) {
+pub(crate) fn reset_session(
+    cfg: &RuntimeConfig,
+    shared: &SharedSyncIcmpState,
+    cache: &mut SyncIcmpCache,
+) {
     let next_generation = shared
         .generation
         .0
         .fetch_add(1, AtomOrdering::Relaxed)
         .wrapping_add(1);
-    shared.latest.valid.store(false, AtomOrdering::Relaxed);
+
+    log_debug!(
+        cfg.debug_logs.packets,
+        "[reset_session] generation advanced to {}",
+        next_generation
+    );
+
     shared.latest.seq.store(0, AtomOrdering::Relaxed);
     shared.reply_icmp_seq.0.store(0, AtomOrdering::Relaxed);
+
+    // Clear deduplication slots to prevent cross-session or transition duplicates.
+    for slot in &shared.dedup_slots {
+        slot.0.store(0, AtomOrdering::Relaxed);
+    }
+
     cache.generation = next_generation;
     cache.latest_valid = false;
     cache.latest_sent_seq = 0;
@@ -168,12 +184,62 @@ pub(crate) fn classify_u2c(
     if !wire.src_is_icmp {
         return Ok(U2cDecision::ForwardPayload);
     }
-    if !sync_icmp_enabled(cfg) {
-        return if matches!(event, PayloadEvent::SyncKeepalive(_)) {
-            Err(io::Error::new(
+
+    // Always perform deduplication for ICMP to handle potential OS-level double-delivery
+    // of loopback packets (observed on macOS with ICMP DGRAM sockets).
+    // Use the SHARED generation for deduplication to ensure consistency across
+    // multiple worker threads even during session resets.
+    let shared_gen = shared.generation.0.load(AtomOrdering::Relaxed);
+    let stamp = pack_dedup_stamp(shared_gen, wire.src_seq);
+    let slot_idx = (wire.src_seq as usize) & (DEDUP_SLOT_COUNT - 1);
+    let slot = &shared.dedup_slots[slot_idx].0;
+    let mut prev = slot.load(AtomOrdering::Relaxed);
+
+    log_debug!(
+        cfg.debug_logs.packets,
+        "[classify_u2c] seq={} stamp={:016x} slot_idx={} prev={:016x} shared_gen={}",
+        wire.src_seq,
+        stamp,
+        slot_idx,
+        prev,
+        shared_gen
+    );
+
+    loop {
+        if prev == stamp {
+            log_debug!(cfg.debug_logs.packets, "[classify_u2c] DUPLICATE DETECTED");
+
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "ICMP keepalive arrived while sync mode is disabled",
-            ))
+                "ICMP sync mode: duplicate reply sequence",
+            ));
+        }
+        match slot.compare_exchange_weak(prev, stamp, AtomOrdering::Relaxed, AtomOrdering::Relaxed)
+        {
+            Ok(_) => break,
+            Err(current) => prev = current,
+        }
+    }
+
+    let is_keepalive = matches!(event, PayloadEvent::SyncKeepalive(_));
+
+    if !sync_icmp_enabled(cfg) {
+        return if is_keepalive {
+            if origin == PayloadOrigin::Wire {
+                if cfg.listen_proto == SupportedProtocol::ICMP {
+                    Ok(U2cDecision::ForwardKeepaliveReply)
+                } else {
+                    Ok(U2cDecision::ConsumeKeepalive)
+                }
+            } else {
+                // This is a synthetic/internal keepalive, but sync is off.
+                // This shouldn't really happen if the pacer is off, but if it does,
+                // we should reject it to avoid confusing the state.
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ICMP keepalive arrived while sync mode is disabled",
+                ))
+            }
         } else {
             Ok(U2cDecision::ForwardPayload)
         };
@@ -199,24 +265,7 @@ pub(crate) fn classify_u2c(
         return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
 
-    let stamp = pack_dedup_stamp(cache.generation, wire.src_seq);
-    let slot = &shared.dedup_slots[(wire.src_seq as usize) & (DEDUP_SLOT_COUNT - 1)].0;
-    let mut prev = slot.load(AtomOrdering::Relaxed);
-    loop {
-        if prev == stamp {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ICMP sync mode: duplicate reply sequence",
-            ));
-        }
-        match slot.compare_exchange_weak(prev, stamp, AtomOrdering::Relaxed, AtomOrdering::Relaxed)
-        {
-            Ok(_) => break,
-            Err(current) => prev = current,
-        }
-    }
-
-    if matches!(event, PayloadEvent::SyncKeepalive(_)) && origin == PayloadOrigin::Wire {
+    if is_keepalive && origin == PayloadOrigin::Wire {
         if cfg.listen_proto == SupportedProtocol::ICMP {
             Ok(U2cDecision::ForwardKeepaliveReply)
         } else {
@@ -281,7 +330,9 @@ pub(crate) fn prepare_send(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DebugBehavior, DebugLogs, ListenMode, ReresolveMode, TimeoutAction};
+    use crate::cli::{
+        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, TimeoutAction, WorkerFlowMode,
+    };
     use crate::net::params::CanonicalAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
@@ -299,7 +350,7 @@ mod tests {
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
             workers: 1,
-            worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,
+            worker_flow_mode: WorkerFlowMode::SharedFlow,
             upstream: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2222)),
                 2222,
@@ -575,18 +626,32 @@ mod tests {
     }
 
     #[test]
-    fn classify_u2c_rejects_keepalive_when_sync_is_disabled() {
+    fn classify_u2c_consumes_wire_keepalive_when_sync_is_disabled() {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.icmp_sync_pps = 0;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let event = PayloadEvent::SyncKeepalive(test_wire(&[], 5, SupportedProtocol::UDP));
+        let event1 = PayloadEvent::SyncKeepalive(test_wire(&[], 1, SupportedProtocol::UDP));
+        // Wire keepalives should be silently consumed even if sync is off (for robustness/dedup)
+        assert_eq!(
+            classify_u2c(&cfg, &event1, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
+            U2cDecision::ConsumeKeepalive
+        );
+
+        // But internal/synthetic keepalives should still fail if sync is off (sanity check)
+        let event2 = PayloadEvent::SyncKeepalive(test_wire(&[], 2, SupportedProtocol::UDP));
         assert!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache)
-                .unwrap_err()
-                .to_string()
-                .contains("sync mode is disabled")
+            classify_u2c(
+                &cfg,
+                &event2,
+                PayloadOrigin::SyntheticSyncKeepalive,
+                &shared,
+                &mut cache
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("sync mode is disabled")
         );
     }
 
@@ -634,7 +699,7 @@ mod tests {
         cache.latest_valid = true;
         let event = PayloadEvent::UserData(test_wire(b"first", 12, SupportedProtocol::UDP));
         assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
-        reset_session(&shared, &mut cache);
+        reset_session(&cfg, &shared, &mut cache);
         shared.latest.seq.store(12, AtomOrdering::Relaxed);
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
         cache.latest_sent_seq = 12;

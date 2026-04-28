@@ -91,6 +91,7 @@ fn send_local_keepalive_reply(
         flow_state,
         0,
         false,
+        false,
         &send_res,
         handles.client_connected,
         &route.dest_sa,
@@ -202,13 +203,14 @@ pub(crate) fn buffer_sync_event(
 
 #[inline]
 pub(crate) fn sync_session_on_lock_transition(
+    cfg: &RuntimeConfig,
     was_locked: &mut bool,
     locked: bool,
     sync_state: &SharedSyncIcmpState,
     sync_cache: &mut SyncIcmpCache,
 ) {
     if *was_locked && !locked {
-        reset_session(sync_state, sync_cache);
+        reset_session(cfg, sync_state, sync_cache);
     }
     *was_locked = locked;
 }
@@ -237,10 +239,6 @@ mod tests {
             client_peer: None,
             client_connected: false,
             client_sock: udp_socket_clone(),
-            listen: CanonicalAddr::new(
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
-                3333,
-            ),
             listen_sock_type: Type::DGRAM, // UDP sockets are always DGRAM
             upstream: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4444)),
@@ -297,11 +295,7 @@ mod tests {
 
     #[test]
     fn local_keepalive_reply_route_uses_realized_listen_id_for_dgram_listener() {
-        let mut handles = test_handles();
-        handles.listen = CanonicalAddr::new(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
-            3333,
-        );
+        let handles = test_handles();
         let dest = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
             9999,

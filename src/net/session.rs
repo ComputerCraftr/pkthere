@@ -23,19 +23,29 @@ pub(crate) fn handle_send_result(
     stats: &dyn StatsSink,
     flow_state: &FlowRuntimeState,
     payload_len: usize,
+    is_user_data: bool,
     counts_as_session_activity: bool,
     send_res: &io::Result<bool>,
     sock_connected: bool,
     dest_sa: &SockAddr,
     disconnect_ctx: Option<(&mut SocketHandles, &SocketManager)>,
 ) {
+    log_debug!(
+        cfg.debug_logs.packets,
+        "[handle_send_result] worker {} c2u={} is_user_data={} payload_len={}",
+        worker_id,
+        c2u,
+        is_user_data,
+        payload_len
+    );
+
     if counts_as_session_activity {
         flow_state.record_activity(t_start, t_recv);
     }
 
     match send_res {
         Ok(res) => {
-            if cfg.stats_interval_mins != 0 {
+            if cfg.stats_interval_mins != 0 && is_user_data {
                 let t_send = Instant::now();
                 stats.send_add(c2u, payload_len as u64, t_recv, t_send);
             }

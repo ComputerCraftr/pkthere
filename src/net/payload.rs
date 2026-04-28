@@ -103,10 +103,17 @@ impl<'a> WirePayload<'a> {
 #[inline]
 fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<'a>> {
     if payload.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing ICMP tunnel shim header",
-        ));
+        // Empty ICMP payload is used for PPS cadence in sync mode.
+        // It's not a user packet or a keepalive; it's a "pps tick".
+        // We represent this as a special keepalive variant.
+        return Ok(PayloadEvent::SyncKeepalive(WirePayload {
+            src_is_icmp: true,
+            src_ident: 0,
+            src_seq: 0,
+            dst_proto: SupportedProtocol::ICMP,
+            payload: &[],
+            pub_len: 0,
+        }));
     }
 
     let shim = payload[0];
@@ -121,6 +128,9 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
     let is_data = (shim & ICMP_SHIM_IS_DATA) != 0;
     let has_user_payload = (shim & ICMP_SHIM_HAS_PAYLOAD) != 0;
 
+    // Normal tunnel packets MUST have a valid shim.
+    // Zero-length user data has IS_DATA set but HAS_PAYLOAD unset.
+    // Sync keepalives have both bits unset (legacy/sync convention).
     match (is_data, has_user_payload, user_payload.is_empty()) {
         (true, true, false) => Ok(PayloadEvent::UserData(WirePayload {
             src_is_icmp: true,
@@ -397,7 +407,10 @@ fn test_icmp_echo_header(ident: u16, seq: u16) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DebugBehavior, DebugLogs, ListenMode, RuntimeConfig, SupportedProtocol};
+    use crate::cli::{
+        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
+        TimeoutAction, WorkerFlowMode,
+    };
     use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -415,7 +428,7 @@ mod tests {
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
             workers: 1,
-            worker_flow_mode: crate::cli::WorkerFlowMode::SharedFlow,
+            worker_flow_mode: WorkerFlowMode::SharedFlow,
             upstream: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321)),
                 4321,
@@ -423,12 +436,12 @@ mod tests {
             upstream_proto,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,
-            on_timeout: crate::cli::TimeoutAction::Drop,
+            on_timeout: TimeoutAction::Drop,
             stats_interval_mins: 0,
             max_payload: 1500,
             icmp_sync_pps: 10,
             reresolve_secs: 0,
-            reresolve_mode: crate::cli::ReresolveMode::Upstream,
+            reresolve_mode: ReresolveMode::Upstream,
             #[cfg(unix)]
             run_as_user: None,
             #[cfg(unix)]
@@ -679,10 +692,26 @@ mod tests {
     }
 
     #[test]
+    fn validate_payload_accepts_empty_icmp_as_sync_keepalive() {
+        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
+        let stats = Stats::new();
+        let empty_icmp = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09];
+        let event = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &empty_icmp,
+            IcmpIdPolicy::Exact(0x04D2),
+            PayloadOrigin::Wire,
+        )
+        .expect("empty ICMP should be accepted as sync keepalive");
+        assert!(!event.is_user_data());
+    }
+
+    #[test]
     fn validate_payload_rejects_invalid_icmp_shim() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let bad_empty = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09];
         let bad_reserved = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | 0x01), &[]);
         // Keepalive (0x00) but has_payload (0x40) set
         let bad_keepalive_with_flag = encode_icmp_payload(Some(ICMP_SHIM_HAS_PAYLOAD), &[]);
@@ -695,7 +724,6 @@ mod tests {
         let bad_data_with_unexpected_payload = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), b"x");
 
         for bad in [
-            bad_empty.to_vec(),
             bad_reserved,
             bad_keepalive_with_flag,
             bad_keepalive_with_payload,

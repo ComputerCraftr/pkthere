@@ -1,4 +1,4 @@
-use crate::cli::{RuntimeConfig, TimeoutAction};
+use crate::cli::{RuntimeConfig, TimeoutAction, WorkerFlowMode};
 use crate::flow_claim::FlowClaimTable;
 use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
@@ -53,33 +53,38 @@ pub fn run_watchdog_thread(
         thread::sleep(period);
         let now_s = Instant::now().saturating_duration_since(t_start).as_secs();
 
-        for (worker_pair_id, (sock_mgr, flow_state)) in
-            sock_mgrs.iter().zip(flow_states.iter()).enumerate()
-        {
+        for (idx, flow_state) in flow_states.iter().enumerate() {
             if !flow_state.is_locked() {
+                if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
+                    break;
+                }
                 continue;
             }
+
             let last_s = flow_state.last_seen_s();
             if last_s == 0 || now_s.saturating_sub(last_s) < cfg.timeout_secs {
+                if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
+                    break;
+                }
                 continue;
             }
 
             match cfg.on_timeout {
                 TimeoutAction::Drop => {
-                    let locked_flow = sock_mgr.get_client_dest().0;
+                    let locked_flow = sock_mgrs[idx].get_client_dest().0;
                     log_warn!(
                         "Idle timeout reached ({}s): dropping locked client on worker pair {}",
                         cfg.timeout_secs,
-                        worker_pair_id
+                        idx
                     );
 
                     // In SharedFlow mode, we must clear ALL managers because they share a single flow_state.
                     // In SingleFlow mode, we only clear the specific manager.
                     let managers_to_clear: Vec<_> =
-                        if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SharedFlow {
+                        if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
                             sock_mgrs.iter().collect()
                         } else {
-                            vec![sock_mgr]
+                            vec![&sock_mgrs[idx]]
                         };
 
                     for mgr in managers_to_clear {
@@ -102,12 +107,7 @@ pub fn run_watchdog_thread(
 
                     flow_state.reset();
                     if let (Some(flow_claims), Some(flow)) = (flow_claims, locked_flow) {
-                        flow_claims.release(flow, worker_pair_id);
-                    }
-
-                    // If we were in SharedFlow mode, we've handled all workers by clearing all managers.
-                    if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SharedFlow {
-                        break;
+                        flow_claims.release(flow, idx);
                     }
                 }
                 _ => {
@@ -118,6 +118,11 @@ pub fn run_watchdog_thread(
                     exit_code_set.store(1 << 31, AtomOrdering::Relaxed);
                     return;
                 }
+            }
+
+            // If we were in SharedFlow mode, we've handled all workers by clearing all managers.
+            if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
+                break;
             }
         }
     }
@@ -143,8 +148,18 @@ pub fn run_upstream_to_client_thread(
         match handles.upstream_sock.recv(as_uninit_mut(&mut buf.data)) {
             Ok(len) => {
                 let t_recv = Instant::now();
+
+                log_debug!(
+                    cfg.debug_logs.packets,
+                    "[worker {}] received {} bytes from upstream socket {:?}",
+                    worker_id,
+                    len,
+                    handles.upstream
+                );
+
                 cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
                 sync_session_on_lock_transition(
+                    cfg,
                     &mut was_locked,
                     flow_state.is_locked(),
                     sync_state,
@@ -205,6 +220,7 @@ pub fn run_upstream_to_client_thread(
                         stats,
                         flow_state,
                         wire.len(),
+                        decision.counts_as_payload(),
                         counts_as_session_activity(&event, decision.counts_as_payload()),
                         &send_res,
                         handles.client_connected,
@@ -249,7 +265,13 @@ pub fn run_client_to_upstream_thread(
     let mut cache = CachedClientState::new(C2U, worker_id, cfg, &handles, cfg.debug_logs.handles);
     loop {
         let locked_now = flow_state.is_locked();
-        sync_session_on_lock_transition(&mut was_locked, locked_now, sync_state, &mut sync_cache);
+        sync_session_on_lock_transition(
+            cfg,
+            &mut was_locked,
+            locked_now,
+            sync_state,
+            &mut sync_cache,
+        );
         cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
         if handles.client_connected {
             if sync_icmp_mode {
@@ -273,7 +295,7 @@ pub fn run_client_to_upstream_thread(
                             &[],
                             handles.client_peer.map_or_else(
                                 || IcmpIdPolicy::Any,
-                                |peer| IcmpIdPolicy::Exact(peer.id),
+                                |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
                             ),
                             PayloadOrigin::SyntheticSyncKeepalive,
                         )
@@ -309,6 +331,7 @@ pub fn run_client_to_upstream_thread(
                         stats,
                         flow_state,
                         wire.len(),
+                        event.is_user_data(),
                         counts_as_session_activity(&event, true),
                         &send_res,
                         handles.upstream_connected,
@@ -382,6 +405,13 @@ pub fn run_client_to_upstream_thread(
                 Ok(len) => {
                     let t_recv = Instant::now();
 
+                    log_debug!(
+                        cfg.debug_logs.packets,
+                        "[worker {}] received {} bytes from client socket",
+                        worker_id,
+                        len
+                    );
+
                     if flow_state.is_locked() {
                         let event = result_or_log_continue!(
                             validate_payload(
@@ -422,6 +452,7 @@ pub fn run_client_to_upstream_thread(
                                     stats,
                                     flow_state,
                                     wire.len(),
+                                    event.is_user_data(),
                                     counts_as_session_activity(&event, true),
                                     &send_res,
                                     handles.upstream_connected,
@@ -471,7 +502,7 @@ pub fn run_client_to_upstream_thread(
                             &[],
                             handles.client_peer.map_or_else(
                                 || IcmpIdPolicy::Any,
-                                |peer| IcmpIdPolicy::Exact(peer.id),
+                                |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
                             ),
                             PayloadOrigin::SyntheticSyncKeepalive,
                         )
@@ -507,6 +538,7 @@ pub fn run_client_to_upstream_thread(
                         stats,
                         flow_state,
                         wire.len(),
+                        event.is_user_data(),
                         counts_as_session_activity(&event, true),
                         &send_res,
                         handles.upstream_connected,
@@ -621,7 +653,7 @@ pub fn run_client_to_upstream_thread(
                         );
                         let flow = ClientFlowKey::from_wire(src, cfg.listen_proto, &event);
 
-                        if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SingleFlow
+                        if cfg.worker_flow_mode == WorkerFlowMode::SingleFlow
                             && flow_claims.is_some_and(|flow_claims| {
                                 !flow_claims.try_claim(flow, worker_pair_id)
                             })
@@ -629,7 +661,7 @@ pub fn run_client_to_upstream_thread(
                             continue;
                         }
 
-                        reset_session(sync_state, &mut sync_cache);
+                        reset_session(cfg, sync_state, &mut sync_cache);
                         flow_state.set_locked(true);
                         was_locked = true;
                         let peer_canonical = if let Some(ident) = flow.icmp_ident() {
@@ -666,7 +698,7 @@ pub fn run_client_to_upstream_thread(
                             handles.version
                         );
 
-                        if cfg.worker_flow_mode == crate::cli::WorkerFlowMode::SharedFlow {
+                        if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
                             for mgr in all_sock_mgrs {
                                 if !std::ptr::eq(mgr.as_ref(), sock_mgr) {
                                     let _ = mgr.set_client_sock_connected(
@@ -713,6 +745,7 @@ pub fn run_client_to_upstream_thread(
                                     stats,
                                     flow_state,
                                     wire.len(),
+                                    event.is_user_data(),
                                     counts_as_session_activity(&event, true),
                                     &send_res,
                                     handles.upstream_connected,
@@ -779,6 +812,7 @@ pub fn run_client_to_upstream_thread(
                                     stats,
                                     flow_state,
                                     wire.len(),
+                                    event.is_user_data(),
                                     counts_as_session_activity(&event, true),
                                     &send_res,
                                     handles.upstream_connected,

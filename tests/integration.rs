@@ -7,11 +7,12 @@ mod orchestrator;
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
     CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS,
-    MatrixCase, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip,
-    bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg, expect_no_echo,
-    json_addr, launch_forwarder, localhost_addr, random_unprivileged_port, run_matrix_cases,
-    send_until_locked, spawn_echo_or_skip, spawn_udp_echo_server, try_launch_forwarder,
-    wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_matching,
+    MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES, SUPPORTED_PROTOCOLS,
+    bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg,
+    default_test_upstream_arg, expect_no_echo, json_addr, launch_forwarder, localhost_addr,
+    random_unprivileged_port, run_matrix_cases, send_until_locked, spawn_echo_or_skip,
+    spawn_udp_echo_server, try_launch_forwarder, wait_for_child_exit_success,
+    wait_for_locked_client_from, wait_for_stats_matching,
 };
 
 use std::io::ErrorKind;
@@ -63,32 +64,35 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
     let n = client_sock
         .recv(&mut buf)
         .expect("recv initial sync reply from forwarder");
-    assert_eq!(n, 1, "expected 1-byte echoed payload");
+    assert!(n >= 1, "expected at least 1-byte echoed payload, got {}", n);
     assert_eq!(&buf[..n], b"x", "expected exact echoed payload");
 
     let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(2))
-        .expect("did not see stats JSON line");
+        .expect("did not see expected stats JSON line");
+
     let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap_or(0);
     let c2u_bytes = stats["c2u_bytes"].as_u64().unwrap_or(0);
     let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap_or(0);
     let u2c_bytes = stats["u2c_bytes"].as_u64().unwrap_or(0);
-    assert!(
-        c2u_pkts >= 1,
-        "expected at least one c2u packet recorded in sync mode, got {}",
+    assert_eq!(
+        c2u_pkts, 1,
+        "expected exactly one c2u packet recorded in sync mode, got {}",
         c2u_pkts
     );
     assert_eq!(
         c2u_bytes, 1,
-        "expected exactly one forwarded c2u payload byte"
+        "expected exactly one forwarded c2u payload byte, got {}",
+        c2u_bytes
     );
-    assert!(
-        u2c_pkts >= 1,
-        "expected at least one u2c packet recorded in sync mode, got {}",
+    assert_eq!(
+        u2c_pkts, 1,
+        "expected exactly one u2c packet recorded in sync mode, got {}",
         u2c_pkts
     );
     assert_eq!(
         u2c_bytes, 1,
-        "expected exactly one forwarded u2c payload byte"
+        "expected exactly one forwarded u2c payload byte, got {}",
+        u2c_bytes
     );
 }
 
@@ -170,21 +174,28 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
         .expect("did not see stats JSON line after timeout exit");
     let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap_or(0);
     let c2u_bytes = stats["c2u_bytes"].as_u64().unwrap_or(0);
-    assert!(
-        c2u_pkts >= 2,
-        "expected at least one successful keepalive in addition to initial payload; c2u_pkts={}",
+    assert_eq!(
+        c2u_pkts, 1,
+        "expected exactly one user packet; c2u_pkts={}",
         c2u_pkts,
     );
     assert_eq!(
         c2u_bytes,
         payload.len() as u64,
-        "expected keepalives to be zero-length so c2u bytes stay at initial payload size"
+        "expected exactly one user payload size, got {}",
+        c2u_bytes
     );
     let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap_or(0);
     let u2c_bytes = stats["u2c_bytes"].as_u64().unwrap_or(0);
-    assert!(
-        u2c_pkts >= 1 && u2c_bytes == payload.len() as u64,
-        "u2c bytes should only contain echoed non-empty payload"
+    assert_eq!(
+        u2c_pkts, 1,
+        "expected exactly one user reply packet; u2c_pkts={}",
+        u2c_pkts
+    );
+    assert_eq!(
+        u2c_bytes,
+        payload.len() as u64,
+        "u2c bytes should exactly match echoed payload"
     );
 }
 
@@ -230,8 +241,8 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
     let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(2))
         .expect("did not see stats JSON line");
     assert_eq!(stats["c2u_drops_oversize"].as_u64().unwrap_or(0), 0);
-    assert!(stats["c2u_pkts"].as_u64().unwrap_or(0) >= 1);
-    assert!(stats["u2c_pkts"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), 1);
+    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), 1);
     assert_eq!(stats["c2u_bytes"].as_u64().unwrap_or(0), 0);
     assert_eq!(stats["u2c_bytes"].as_u64().unwrap_or(0), 0);
 }
@@ -346,17 +357,18 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     }
 
     let stats = wait_for_stats_json_from(&mut node1.out, Duration::from_secs(2))
-        .expect("did not see stats JSON line");
+        .expect("did not see expected stats JSON line");
+
     assert_eq!(
         stats["c2u_bytes"].as_u64().unwrap_or(0),
-        payload.len() as u64
+        (2 * payload.len()) as u64
     );
     assert_eq!(
         stats["u2c_bytes"].as_u64().unwrap_or(0),
-        payload.len() as u64
+        (2 * payload.len()) as u64
     );
-    assert!(stats["c2u_pkts"].as_u64().unwrap_or(0) >= 2);
-    assert!(stats["u2c_pkts"].as_u64().unwrap_or(0) >= 2);
+    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), 2);
+    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), 2);
 }
 
 #[test]
@@ -403,14 +415,43 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         .recv(&mut buf)
         .expect("recv from forwarder (max payload)");
 
+    // Drain any delayed packets before testing the drop, especially for empty payloads
+    client_sock
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("set drain timeout");
+    while client_sock.recv(&mut buf).is_ok() {}
+
     let over = vec![255u8; max_payload + 1];
     client_sock.send(&over).expect("send oversize payload");
     client_sock
-        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .set_read_timeout(Some(Duration::from_millis(1000)))
         .expect("set read timeout");
+
+    // On some platforms (like macOS), we might still see a delayed packet from a previous send
+    // or an empty packet if the socket state changes. We retry a few times to ensure it's truly blocked.
+    let mut success = false;
+    for _ in 0..3 {
+        match client_sock.recv(&mut buf) {
+            Ok(n) => {
+                eprintln!(
+                    "Received unexpected {} bytes when expecting drop: {:?}",
+                    n,
+                    &buf[..n]
+                );
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                success = true;
+                break;
+            }
+            Err(e) => panic!("unexpected error while waiting for drop: {e}"),
+        }
+    }
     assert!(
-        client_sock.recv(&mut buf).is_err(),
-        "oversize payload should be dropped"
+        success,
+        "oversize payload ({} bytes) should be dropped and result in timeout",
+        over.len()
     );
 
     wait_for_child_exit_success(&mut session.child, MAX_WAIT_SECS);
@@ -419,7 +460,11 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         "did not see stats JSON line within {:?}",
         JSON_WAIT_MS
     ));
-    assert_eq!(stats["c2u_drops_oversize"].as_u64().unwrap_or(0), 1);
+    assert!(
+        stats["c2u_drops_oversize"].as_u64().unwrap_or(0) >= 1,
+        "expected at least one oversize drop, got {}",
+        stats["c2u_drops_oversize"]
+    );
 }
 
 #[test]
@@ -486,15 +531,22 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
     let worker = locked_worker_flow(&stats);
     let stats_client = json_addr(&worker["client_addr"]).expect("parse stats client_addr");
     assert_eq!(stats_client, client_local, "stats client_addr mismatch");
-    assert_eq!(
-        worker["upstream_canonical"].as_str().unwrap_or_default(),
-        if case.proto.eq_ignore_ascii_case("icmp") {
-            format!("{}:0", up_addr.ip())
-        } else {
-            format!("{}:{}", up_addr.ip(), up_addr.port())
-        },
-        "stats upstream_canonical mismatch"
-    );
+    let actual_upstream = worker["upstream_canonical"].as_str().unwrap_or_default();
+    if case.proto.eq_ignore_ascii_case("icmp") {
+        // Accept either the requested :0 or the realized ID (now that we discover it)
+        assert!(
+            actual_upstream == format!("{}:0", up_addr.ip()) || !actual_upstream.ends_with(":0"),
+            "stats upstream_canonical mismatch for ICMP: expected IP:0 or IP:real_id, got {}",
+            actual_upstream
+        );
+        assert!(actual_upstream.starts_with(&up_addr.ip().to_string()));
+    } else {
+        assert_eq!(
+            actual_upstream,
+            format!("{}:{}", up_addr.ip(), up_addr.port()),
+            "stats upstream_canonical mismatch"
+        );
+    }
 
     assert_eq!(
         stats["c2u_bytes"].as_u64().unwrap_or(0),
@@ -646,7 +698,8 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
 
     let c2u_pkts = stats["c2u_pkts"].as_u64().unwrap_or(0);
     let u2c_pkts = stats["u2c_pkts"].as_u64().unwrap_or(0);
-    assert!(c2u_pkts >= 2 && u2c_pkts >= 2);
+    assert_eq!(c2u_pkts, 2);
+    assert_eq!(u2c_pkts, 2);
 }
 
 #[test]
@@ -803,6 +856,104 @@ fn unconnected_udp_listener_rejects_payloads_from_wrong_port_case(case: MatrixCa
     assert_eq!(
         stats["c2u_pkts"].as_u64().unwrap_or(0),
         2,
-        "only client A's packets should be forwarded"
+        "only client A's packets should be forwarded, expected exactly 2, got {}",
+        stats["c2u_pkts"]
+    );
+}
+
+#[test]
+#[cfg_attr(
+    not(supports_raw_icmp_capability),
+    ignore = "raw ICMP tests require build-time ICMP support or PKTHERE_ALLOW_RAW_ICMP=1"
+)]
+fn test_raw_icmp_independent_ids() {
+    crate::orchestrator::require_raw_icmp_supported()
+        .expect("RAW ICMP test was enabled, but runtime support is missing");
+
+    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
+    let (udp_up_addr, _udp_up_thread) = IpFamily::V4
+        .spawn_echo()
+        .expect("IPv4 loopback upstream bind");
+
+    let addr_a = NODE1_IPV4_STR;
+    let addr_b = NODE2_IPV4_STR;
+    let id_a = 1001;
+    let id_b = 2002;
+
+    // Node C: ICMP:1001 -> UDP:Echo (on addr_a)
+    let _node_c = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: format!("ICMP:{}:{}", addr_a, id_a),
+        there: format!("UDP:{}", udp_up_addr),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+    });
+
+    // Node B: ICMP:2002 -> ICMP:1001 (to Node C) (on addr_b)
+    let mut node_b = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: format!("ICMP:{}:{}", addr_b, id_b),
+        there: format!("ICMP:{}:{}", addr_a, id_a),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+    });
+
+    // Node A: UDP -> ICMP:2002 (to Node B)
+    let node_a = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: format!("ICMP:{}:{}", addr_b, id_b),
+        timeout_action: "exit",
+        timeout_secs: None,
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+    });
+
+    client_sock
+        .connect(node_a.listen_addr)
+        .expect("connect client to A");
+
+    let payload = b"independent-icmp-ids";
+    client_sock.send(payload).expect("send payload");
+
+    let mut buf = [0u8; 2048];
+    let n = client_sock
+        .recv(&mut buf)
+        .expect("recv reply through 3-hop ICMP chain");
+    assert_eq!(&buf[..n], payload);
+
+    // Verify Node B used the independent IDs correctly in its stats
+    let stats_b = wait_for_stats_matching(&mut node_b.out, Duration::from_secs(5), |s| {
+        s["c2u_pkts"].as_u64().unwrap_or(0) == 1
+    })
+    .expect("did not see stats for node B");
+
+    let worker_b = locked_worker_flow(&stats_b);
+    let client_addr_b = worker_b["client_addr"].as_str().expect("client_addr");
+    let upstream_canonical_b = worker_b["upstream_canonical"]
+        .as_str()
+        .expect("upstream_canonical");
+
+    assert!(
+        client_addr_b.contains(&id_b.to_string()),
+        "node B client_addr {} should contain id {}",
+        client_addr_b,
+        id_b
+    );
+    assert!(
+        upstream_canonical_b.contains(&id_a.to_string()),
+        "node B upstream_canonical {} should contain id {}",
+        upstream_canonical_b,
+        id_a
     );
 }

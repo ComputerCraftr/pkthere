@@ -17,7 +17,6 @@ pub struct SocketHandles {
     pub client_peer: Option<CanonicalAddr>,
     pub client_connected: bool,
     pub client_sock: Socket,
-    pub listen: CanonicalAddr,
     pub listen_sock_type: Type,
     pub upstream: CanonicalAddr,
     pub upstream_local: CanonicalAddr,
@@ -102,7 +101,7 @@ impl SocketManager {
             listen_proto,
             upstream_target,
             upstream_request: upstream,
-            upstream_local_reuses_remote_id: true,
+            upstream_local_reuses_remote_id: false,
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
@@ -325,7 +324,6 @@ impl SocketManager {
         Option<ClientFlowKey>,
         Option<CanonicalAddr>,
         bool,
-        CanonicalAddr,
         bool,
         Type,
     )> {
@@ -344,7 +342,7 @@ impl SocketManager {
             (fam_flip, changed)
         };
 
-        let (ret_sock, cflow, cpeer, cconn, laddr, ltype) = if fam_flip || changed {
+        let (ret_sock, cflow, cpeer, cconn, ltype) = if fam_flip || changed {
             log_info!("{context}: listen {fresh} (listener swapped)");
             let (new_sock, local_canonical, new_type) = make_socket(
                 fresh,
@@ -360,27 +358,18 @@ impl SocketManager {
             cl_guard.connected = false;
             cl_guard.sock = new_sock.try_clone()?;
             cl_guard.sock_type = new_type;
-            (new_sock, None, None, false, cl_guard.listen, new_type)
+            (new_sock, None, None, false, new_type)
         } else {
             (
                 cl_guard.sock.try_clone()?,
                 cl_guard.flow,
                 cl_guard.peer,
                 cl_guard.connected,
-                cl_guard.listen,
                 cl_guard.sock_type,
             )
         };
 
-        Ok((
-            ret_sock,
-            cflow,
-            cpeer,
-            cconn,
-            laddr,
-            fam_flip || changed,
-            ltype,
-        ))
+        Ok((ret_sock, cflow, cpeer, cconn, fam_flip || changed, ltype))
     }
 
     /// Re-resolve both ends and publish any changes. When `allow_listen_rebind`
@@ -401,12 +390,11 @@ impl SocketManager {
             client_flow,
             client_peer,
             client_connected,
-            listen_canonical,
             listen_changed,
             listen_sock_type,
         ) = if allow_listen_rebind {
             let res = self.reresolve_listen(context)?;
-            (res.0, res.1, res.2, res.3, res.4, res.5, res.6)
+            (res.0, res.1, res.2, res.3, res.4, res.5)
         } else {
             let cl = self.client_listen.lock().unwrap();
             (
@@ -414,7 +402,6 @@ impl SocketManager {
                 cl.flow,
                 cl.peer,
                 cl.connected,
-                cl.listen,
                 false,
                 cl.sock_type,
             )
@@ -450,7 +437,6 @@ impl SocketManager {
             client_peer,
             client_connected,
             client_sock,
-            listen: listen_canonical,
             listen_sock_type,
             upstream: upstream_remote,
             upstream_local,
@@ -475,7 +461,6 @@ impl SocketManager {
             client_peer: cl.peer,
             client_connected: cl.connected,
             client_sock: cl.sock.try_clone().expect("clone client socket"),
-            listen: cl.listen,
             listen_sock_type: cl.sock_type,
             upstream: up.remote,
             upstream_local: up.local,

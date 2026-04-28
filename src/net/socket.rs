@@ -63,7 +63,7 @@ pub fn make_socket(
         Some(Duration::from_millis(read_timeout_ms))
     })?;
 
-    let actual_local = if proto == SupportedProtocol::UDP && bind_addr.port() == 0 {
+    let actual_local = if bind_addr.port() == 0 {
         CanonicalAddr::from_socket_addr(sock.local_addr()?.as_socket().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
         })?)

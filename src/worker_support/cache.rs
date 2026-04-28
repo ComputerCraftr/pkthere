@@ -201,12 +201,6 @@ mod tests {
         }
     }
 
-    fn wildcard_icmp_config() -> RuntimeConfig {
-        let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        cfg.listen_mode = ListenMode::Dynamic;
-        cfg
-    }
-
     fn udp_socket_clone() -> Socket {
         Socket::from(
             UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
@@ -220,10 +214,6 @@ mod tests {
             client_peer: None,
             client_connected: false,
             client_sock: udp_socket_clone(),
-            listen: CanonicalAddr::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
-                8888,
-            ),
             listen_sock_type: Type::DGRAM,
             upstream: CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
