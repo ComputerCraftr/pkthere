@@ -177,12 +177,6 @@ pub(crate) fn validate_payload<'a>(
     } else {
         (cfg.upstream_proto, cfg.listen_proto)
     };
-    eprintln!(
-        "validate_payload args:
-c2u: {}, cfg: {:?}, origin: {:?}
-dst_proto: {:?}",
-        c2u, cfg, origin, dst_proto
-    );
 
     if origin == PayloadOrigin::SyntheticSyncKeepalive {
         if c2u && dst_proto == SupportedProtocol::ICMP && cfg.icmp_sync_pps > 0 {
