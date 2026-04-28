@@ -28,6 +28,7 @@ pub fn make_socket(
         _ => (Domain::IPV4, Protocol::ICMPV4),
     };
 
+    // Create socket
     let (sock, sock_type) = match proto {
         SupportedProtocol::ICMP => {
             // Linux kernels expose SOCK_DGRAM ping sockets when ping_group_range
@@ -52,16 +53,16 @@ pub fn make_socket(
     sock.set_recv_buffer_size(1 << 20)?;
     sock.set_send_buffer_size(1 << 20)?;
 
-    // Bind
-    let bind_sa = SockAddr::from(bind_addr);
-    sock.bind(&bind_sa)?;
-
     // Read timeout
     sock.set_read_timeout(if read_timeout_ms == 0 {
         None
     } else {
         Some(Duration::from_millis(read_timeout_ms))
     })?;
+
+    // Bind
+    let bind_sa = SockAddr::from(bind_addr);
+    sock.bind(&bind_sa)?;
 
     let actual_local = if bind_addr.port() == 0 {
         CanonicalAddr::from_socket_addr(sock.local_addr()?.as_socket().ok_or_else(|| {
@@ -123,6 +124,7 @@ pub fn make_upstream_socket_for(
     let is_icmp = proto == SupportedProtocol::ICMP;
     let force_raw = is_icmp && upstream_requires_raw_icmp(dest.id);
 
+    // Create socket
     let (sock, sock_type) = if is_icmp {
         if force_raw {
             (Socket::new(domain, Type::RAW, Some(proto_id))?, Type::RAW)
@@ -139,10 +141,16 @@ pub fn make_upstream_socket_for(
         )
     };
 
+    // Best-effort bigger buffers
+    sock.set_recv_buffer_size(1 << 20)?;
+    sock.set_send_buffer_size(1 << 20)?;
+
+    // Read timeout
     let read_timeout = Duration::from_millis(1000);
     sock.set_read_timeout(Some(read_timeout))?;
     sock.set_write_timeout(Some(read_timeout))?;
 
+    // Connect
     let dest_sa = dest.as_sock_addr();
     sock.connect(&dest_sa.into())?;
 
