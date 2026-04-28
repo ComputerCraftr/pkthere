@@ -298,12 +298,18 @@ mod tests {
         // Use a loopback UDP address as destination to avoid privilege issues
         // while still testing the port/ID assignment logic.
         // We use port 9 (Discard protocol) or just something that exists.
-        let dest = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9), 9);
-
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-        let proto = SupportedProtocol::ICMP;
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-        let proto = SupportedProtocol::UDP;
+        let (dest, proto) = (
+            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)),
+            SupportedProtocol::UDP,
+        );
+
+        // Use id 0 for ICMP to trigger the assignment logic.
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        let (dest, proto) = (
+            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+            SupportedProtocol::ICMP,
+        );
 
         let (sock, local, _remote, sock_type) = make_upstream_socket_for(dest, proto, 0, false)
             .expect("make_upstream_socket_for failed");
