@@ -145,6 +145,7 @@ pub fn run_upstream_to_client_thread(
     let mut sync_cache = sync_state.cache();
     let mut cache = CachedClientState::new(C2U, worker_id, cfg, &handles, cfg.debug_logs.handles);
     loop {
+        cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
         let locked_now = flow_state.is_locked();
         sync_session_on_lock_transition(
             cfg,
@@ -153,7 +154,6 @@ pub fn run_upstream_to_client_thread(
             sync_state,
             &mut sync_cache,
         );
-        cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
 
         match handles.upstream_sock.recv(as_uninit_mut(&mut buf.data)) {
             Ok(len) => {
@@ -168,15 +168,16 @@ pub fn run_upstream_to_client_thread(
                 );
 
                 cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
+                let locked_now = flow_state.is_locked();
                 sync_session_on_lock_transition(
                     cfg,
                     &mut was_locked,
-                    flow_state.is_locked(),
+                    locked_now,
                     sync_state,
                     &mut sync_cache,
                 );
 
-                if flow_state.is_locked() {
+                if locked_now {
                     let event = result_or_log_continue!(
                         validate_payload(
                             C2U,
@@ -274,6 +275,7 @@ pub fn run_client_to_upstream_thread(
     let mut sync_cache = sync_state.cache();
     let mut cache = CachedClientState::new(C2U, worker_id, cfg, &handles, cfg.debug_logs.handles);
     loop {
+        cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
         let locked_now = flow_state.is_locked();
         sync_session_on_lock_transition(
             cfg,
@@ -282,7 +284,6 @@ pub fn run_client_to_upstream_thread(
             sync_state,
             &mut sync_cache,
         );
-        cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
         if handles.client_connected {
             if sync_icmp_mode {
                 if !locked_now {

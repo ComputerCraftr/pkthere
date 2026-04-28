@@ -4,6 +4,8 @@ use crate::net::params::CanonicalAddr;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use std::io;
+#[cfg(windows)]
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
