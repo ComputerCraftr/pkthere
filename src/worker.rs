@@ -145,6 +145,16 @@ pub fn run_upstream_to_client_thread(
     let mut sync_cache = sync_state.cache();
     let mut cache = CachedClientState::new(C2U, worker_id, cfg, &handles, cfg.debug_logs.handles);
     loop {
+        let locked_now = flow_state.is_locked();
+        sync_session_on_lock_transition(
+            cfg,
+            &mut was_locked,
+            locked_now,
+            sync_state,
+            &mut sync_cache,
+        );
+        cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
+
         match handles.upstream_sock.recv(as_uninit_mut(&mut buf.data)) {
             Ok(len) => {
                 let t_recv = Instant::now();
@@ -341,19 +351,19 @@ pub fn run_client_to_upstream_thread(
                     continue;
                 }
 
-                let readable =
-                    match wait_socket_until_readable(&handles.client_sock, pacer.poll_wait()) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            log_error_dir!(worker_id, C2U, "poll/read wait error: {}", e);
-                            stats.drop_err(C2U);
-                            thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                    };
-                if !readable {
-                    continue;
-                }
+                match wait_socket_until_readable(&handles.client_sock, pacer.poll_wait()) {
+                    Ok(v) if !v => {
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log_error_dir!(worker_id, C2U, "poll/read wait error: {}", e);
+                        stats.drop_err(C2U);
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                };
+
                 match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
                     Ok(len) => {
                         latest_sync_payload = match validate_payload(

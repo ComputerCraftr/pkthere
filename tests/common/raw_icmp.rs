@@ -4,6 +4,7 @@ use crate::app_bin::find_app_bin;
 use std::process::Command;
 
 use std::io;
+use std::sync::OnceLock;
 
 #[path = "../../src/net/icmp_parse.rs"]
 mod icmp_parse;
@@ -50,8 +51,14 @@ pub fn require_raw_icmp_supported() -> io::Result<()> {
     ))
 }
 
+static KERNEL_ECHO_SUPPORT: OnceLock<io::Result<()>> = OnceLock::new();
+
 pub fn require_kernel_echo_reply_supported() -> io::Result<()> {
-    icmp_parse::probe_kernel_icmp_echo()
+    KERNEL_ECHO_SUPPORT
+        .get_or_init(|| icmp_parse::probe_kernel_icmp_echo())
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
 pub fn platform_supports_dgram_icmp() -> bool {

@@ -6,4 +6,10 @@ pub const TIMEOUT_SECS: Duration = Duration::from_secs(2);
 pub const MAX_WAIT_SECS: Duration = Duration::from_secs(4);
 pub const JSON_WAIT_MS: Duration = Duration::from_millis(50);
 
+/// Standard timeout for client socket read/write operations in tests.
+pub const CLIENT_WAIT_MS: Duration = Duration::from_millis(2000);
+
+/// Small timeout for draining sockets when we expect them to be empty.
+pub const DRAIN_WAIT_MS: Duration = Duration::from_millis(200);
+
 pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP", "ICMP"];

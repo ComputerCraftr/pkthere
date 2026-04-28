@@ -167,7 +167,11 @@ pub fn make_upstream_socket_for(
 
     let local = CanonicalAddr::new(actual_local_sa, local_id);
     let dest = if is_icmp {
-        CanonicalAddr::new(dest.addr, remote_id)
+        let new_dest = CanonicalAddr::new(dest.addr, remote_id);
+        if new_dest.id != 0 && new_dest.id != dest.id {
+            sock.connect(&new_dest.as_sock_addr().into())?;
+        }
+        new_dest
     } else {
         dest
     };

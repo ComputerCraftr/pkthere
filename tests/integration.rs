@@ -6,11 +6,11 @@ mod core;
 mod orchestrator;
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    CLIENT_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS,
-    MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES, SUPPORTED_PROTOCOLS,
-    bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg, expect_no_echo,
-    json_addr, launch_forwarder, localhost_addr, random_unprivileged_port, run_matrix_cases,
-    send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
+    CLIENT_WAIT_MS, DRAIN_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS,
+    MAX_WAIT_SECS, MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES,
+    SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg,
+    expect_no_echo, json_addr, launch_forwarder, localhost_addr, random_unprivileged_port,
+    run_matrix_cases, send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
     wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_matching,
 };
 
@@ -126,7 +126,7 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
         .expect("send initial payload to establish lock");
 
     client_sock
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
         .expect("set read timeout for sync flow");
 
     let mut saw_echo = false;
@@ -223,7 +223,7 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
         .connect(session.listen_addr)
         .expect("connect to ICMP forwarder");
     client_sock
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
         .expect("set read timeout");
 
     client_sock
@@ -347,7 +347,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     );
 
     client_sock
-        .set_read_timeout(Some(Duration::from_millis(300)))
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
         .expect("set read timeout");
     match client_sock.recv(&mut buf) {
         Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
@@ -419,14 +419,14 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
 
     // Drain any delayed packets before testing the drop, especially for empty payloads
     client_sock
-        .set_read_timeout(Some(Duration::from_millis(100)))
+        .set_read_timeout(Some(DRAIN_WAIT_MS))
         .expect("set drain timeout");
     while client_sock.recv(&mut buf).is_ok() {}
 
     let over = vec![255u8; max_payload + 1];
     client_sock.send(&over).expect("send oversize payload");
     client_sock
-        .set_read_timeout(Some(Duration::from_millis(1000)))
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
         .expect("set read timeout");
 
     // On some platforms (like macOS), we might still see a delayed packet from a previous send

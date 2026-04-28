@@ -1,9 +1,9 @@
 //! UDP test-network helpers shared across integration-style test targets.
 
+use crate::orchestrator::CLIENT_WAIT_MS;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::thread;
-use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpFamily {
@@ -20,8 +20,8 @@ pub const NODE3_IPV4_STR: &str = "127.0.0.3";
 
 fn bind_udp_client_impl(addr: SocketAddr) -> io::Result<UdpSocket> {
     let sock = UdpSocket::bind(addr)?;
-    sock.set_read_timeout(Some(Duration::from_millis(1000)))?;
-    sock.set_write_timeout(Some(Duration::from_millis(1000)))?;
+    sock.set_read_timeout(Some(CLIENT_WAIT_MS))?;
+    sock.set_write_timeout(Some(CLIENT_WAIT_MS))?;
     Ok(sock)
 }
 
@@ -67,8 +67,8 @@ fn spawn_udp_echo_server_impl(
     addr: SocketAddr,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<()>)> {
     let sock = UdpSocket::bind(addr)?;
-    sock.set_read_timeout(Some(Duration::from_millis(1000)))?;
-    sock.set_write_timeout(Some(Duration::from_millis(1000)))?;
+    sock.set_read_timeout(Some(CLIENT_WAIT_MS))?;
+    sock.set_write_timeout(Some(CLIENT_WAIT_MS))?;
     let local = sock.local_addr()?;
     let handle = thread::spawn(move || {
         let mut buf = [0u8; 65535];

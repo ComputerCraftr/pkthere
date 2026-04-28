@@ -1,12 +1,10 @@
 use crate::core::{strip_log_prefix, wait_for_stats_json_from};
-use crate::orchestrator::JSON_WAIT_MS;
+use crate::orchestrator::{CLIENT_WAIT_MS, JSON_WAIT_MS};
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
-
-pub const CLIENT_WAIT_MS: Duration = Duration::from_millis(250);
 
 pub fn wait_for_stats_matching<R: Read>(
     reader: &mut R,
