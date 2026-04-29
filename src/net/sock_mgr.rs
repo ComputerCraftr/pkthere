@@ -69,7 +69,7 @@ pub struct SocketManager {
     listen_proto: SupportedProtocol,         // never changes
     upstream_target: String,                 // unresolved --there host:port
     upstream_request: CanonicalAddr,
-    upstream_local_reuses_remote_id: bool,
+    upstream_local_id: u16,
     upstream: Mutex<UpstreamState>,    // cold-path updates only
     upstream_proto: SupportedProtocol, // never changes
     version: AtomicU64,                // increments on any change
@@ -83,11 +83,12 @@ impl SocketManager {
         listen_target: String,
         listen_proto: SupportedProtocol,
         upstream: CanonicalAddr,
+        upstream_local_id: u16,
         upstream_target: String,
         upstream_proto: SupportedProtocol,
     ) -> io::Result<Self> {
         let (sock, upstream_local, upstream_remote, upstream_sock_type) =
-            make_upstream_socket_for(upstream, upstream_proto, 0, true)?;
+            make_upstream_socket_for(upstream, upstream_proto, upstream_local_id, upstream_local_id == 0)?;
         Ok(Self {
             client_listen: Mutex::new(ClientListenState {
                 listen,
@@ -101,7 +102,7 @@ impl SocketManager {
             listen_proto,
             upstream_target,
             upstream_request: upstream,
-            upstream_local_reuses_remote_id: false,
+            upstream_local_id,
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
@@ -277,8 +278,8 @@ impl SocketManager {
             let (new_sock, local, remote, new_type) = make_upstream_socket_for(
                 fresh,
                 self.upstream_proto,
-                0,
-                self.upstream_local_reuses_remote_id,
+                self.upstream_local_id,
+                self.upstream_local_id == 0,
             )?;
             up_guard.local = local;
             up_guard.remote = remote;
@@ -291,8 +292,8 @@ impl SocketManager {
             let (new_sock, local, remote, new_type) = make_upstream_socket_for(
                 fresh,
                 self.upstream_proto,
-                0,
-                self.upstream_local_reuses_remote_id,
+                self.upstream_local_id,
+                self.upstream_local_id == 0,
             )?;
             up_guard.local = local;
             up_guard.remote = remote;
@@ -496,6 +497,7 @@ mod tests {
             actual_listen.addr.to_string(),
             SupportedProtocol::UDP,
             CanonicalAddr::from_socket_addr(upstream_addr),
+            0,
             upstream_addr.to_string(),
             SupportedProtocol::UDP,
         )

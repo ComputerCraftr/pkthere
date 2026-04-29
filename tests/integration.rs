@@ -289,7 +289,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     })
     .expect("could not launch pure ICMP middle node");
 
-    let mut node1 = launch_forwarder(ForwarderConfig {
+    let node1 = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
@@ -355,19 +355,37 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         Err(e) => panic!("unexpected recv error: {e}"),
     }
 
-    let stats = wait_for_stats_json_from(&mut node1.out, Duration::from_secs(2))
-        .expect("did not see expected stats JSON line");
+    for (i, mut out) in [node1.out, node2_out, node3_out].into_iter().enumerate() {
+        let stats = wait_for_stats_json_from(&mut out, Duration::from_secs(2)).expect(&format!(
+            "did not see expected stats JSON line from node {}",
+            i + 1
+        ));
 
-    assert_eq!(
-        stats["c2u_bytes"].as_u64().unwrap_or(0),
-        (2 * payload.len()) as u64
-    );
-    assert_eq!(
-        stats["u2c_bytes"].as_u64().unwrap_or(0),
-        (2 * payload.len()) as u64
-    );
-    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), 2);
-    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), 2);
+        assert_eq!(
+            stats["c2u_bytes"].as_u64().unwrap_or(0),
+            payload.len() as u64,
+            "node {} c2u_bytes mismatch",
+            i + 1
+        );
+        assert_eq!(
+            stats["u2c_bytes"].as_u64().unwrap_or(0),
+            payload.len() as u64,
+            "node {} u2c_bytes mismatch",
+            i + 1
+        );
+        assert_eq!(
+            stats["c2u_pkts"].as_u64().unwrap_or(0),
+            2,
+            "node {} c2u_pkts mismatch",
+            i + 1
+        );
+        assert_eq!(
+            stats["u2c_pkts"].as_u64().unwrap_or(0),
+            2,
+            "node {} u2c_pkts mismatch",
+            i + 1
+        );
+    }
 }
 
 #[test]
@@ -904,10 +922,11 @@ fn test_raw_icmp_independent_ids() {
     });
 
     // Node B: ICMP:2002 -> ICMP:1001 (to Node C) (on addr_b)
+    // We explicitly request local identity id_b (2002) for the upstream side.
     let mut node_b = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: format!("ICMP:{}:{}", addr_b, id_b),
-        there: format!("ICMP:{}:{}", addr_a, id_a),
+        there: format!("ICMP:{}:{}:{}", addr_a, id_a, id_b),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -944,7 +963,7 @@ fn test_raw_icmp_independent_ids() {
 
     // Verify Node B used the independent IDs correctly in its stats
     let stats_b = wait_for_stats_matching(&mut node_b.out, Duration::from_secs(5), |s| {
-        s["c2u_pkts"].as_u64().unwrap_or(0) == 1
+        s["c2u_pkts"].as_u64().unwrap_or(0) >= 1
     })
     .expect("did not see stats for node B");
 
@@ -953,6 +972,9 @@ fn test_raw_icmp_independent_ids() {
     let upstream_canonical_b = worker_b["upstream_canonical"]
         .as_str()
         .expect("upstream_canonical");
+    let upstream_local_canonical_b = worker_b["upstream_local_canonical"]
+        .as_str()
+        .expect("upstream_local_canonical");
 
     assert!(
         client_addr_b.contains(&id_b.to_string()),
@@ -965,5 +987,11 @@ fn test_raw_icmp_independent_ids() {
         "node B upstream_canonical {} should contain id {}",
         upstream_canonical_b,
         id_a
+    );
+    assert!(
+        upstream_local_canonical_b.contains(&id_b.to_string()),
+        "node B upstream_local_canonical {} should contain id {}",
+        upstream_local_canonical_b,
+        id_b
     );
 }

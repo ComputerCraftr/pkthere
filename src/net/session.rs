@@ -119,6 +119,7 @@ mod tests {
             dst_proto: SupportedProtocol::UDP,
             payload: &[],
             pub_len: 0,
+            src_id_from_shim: None,
         });
         let keepalive = PayloadEvent::SyncKeepalive(WirePayload {
             src_is_icmp: true,
@@ -127,6 +128,7 @@ mod tests {
             dst_proto: SupportedProtocol::ICMP,
             payload: &[],
             pub_len: 0,
+            src_id_from_shim: None,
         });
 
         assert!(counts_as_session_activity(&zero, true));

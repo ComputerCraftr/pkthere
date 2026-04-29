@@ -1,8 +1,9 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::net::checksum::{checksum16, checksum16_parts};
-use crate::net::icmp_parse::parse_icmp_echo_header;
+use crate::net::icmp_parse::{be16_16, parse_icmp_echo_header};
 use crate::net::payload_support::{
-    DEST_ADDR_REQUIRED, ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_IS_DATA,
+    DEST_ADDR_REQUIRED, ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_HAS_SOURCE_ID,
+    ICMP_SHIM_IS_DATA,
 };
 use crate::stats::StatsSink;
 use socket2::{SockAddr, Socket, Type};
@@ -66,6 +67,7 @@ impl<'a> PayloadEvent<'a> {
         dst_proto: SupportedProtocol,
         payload: &'a [u8],
         pub_len: usize,
+        src_id_from_shim: Option<u16>,
     ) -> Self {
         let wire = WirePayload {
             src_is_icmp: true,
@@ -74,6 +76,7 @@ impl<'a> PayloadEvent<'a> {
             dst_proto,
             payload,
             pub_len,
+            src_id_from_shim,
         };
         if is_user_data {
             Self::UserData(wire)
@@ -91,6 +94,7 @@ pub(crate) struct WirePayload<'a> {
     pub(crate) dst_proto: SupportedProtocol,
     pub(crate) payload: &'a [u8],
     pub(crate) pub_len: usize,
+    pub(crate) src_id_from_shim: Option<u16>,
 }
 
 impl<'a> WirePayload<'a> {
@@ -113,6 +117,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
             dst_proto: SupportedProtocol::ICMP,
             payload: &[],
             pub_len: 0,
+            src_id_from_shim: None,
         }));
     }
 
@@ -124,7 +129,21 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
         ));
     }
 
-    let user_payload = &payload[1..];
+    let has_source_id = (shim & ICMP_SHIM_HAS_SOURCE_ID) != 0;
+    if has_source_id && payload.len() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ICMP tunnel shim has source ID flag but payload is too short",
+        ));
+    }
+
+    let (src_id_from_shim, user_payload) = if has_source_id {
+        let id = be16_16(payload[1], payload[2]);
+        (Some(id), &payload[3..])
+    } else {
+        (None, &payload[1..])
+    };
+
     let is_data = (shim & ICMP_SHIM_IS_DATA) != 0;
     let has_user_payload = (shim & ICMP_SHIM_HAS_PAYLOAD) != 0;
 
@@ -139,6 +158,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
             dst_proto: SupportedProtocol::UDP,
             payload: user_payload,
             pub_len: user_payload.len(),
+            src_id_from_shim,
         })),
         (true, false, true) => Ok(PayloadEvent::UserData(WirePayload {
             src_is_icmp: true,
@@ -147,6 +167,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
             dst_proto: SupportedProtocol::UDP,
             payload: &[],
             pub_len: 0,
+            src_id_from_shim,
         })),
         (false, false, true) => Ok(PayloadEvent::SyncKeepalive(WirePayload {
             src_is_icmp: true,
@@ -155,6 +176,7 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
             dst_proto: SupportedProtocol::ICMP,
             payload: &[],
             pub_len: 0,
+            src_id_from_shim,
         })),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -171,6 +193,7 @@ pub(crate) fn validate_payload<'a>(
     buf: &'a [u8],
     icmp_id_policy: IcmpIdPolicy,
     origin: PayloadOrigin,
+    is_locked: bool,
 ) -> io::Result<PayloadEvent<'a>> {
     let (src_proto, dst_proto) = if c2u {
         (cfg.listen_proto, cfg.upstream_proto)
@@ -187,6 +210,7 @@ pub(crate) fn validate_payload<'a>(
                 dst_proto,
                 payload: &[],
                 pub_len: 0,
+                src_id_from_shim: None,
             }));
         } else {
             stats.drop_oversize(c2u);
@@ -197,13 +221,14 @@ pub(crate) fn validate_payload<'a>(
         }
     }
 
-    let (src_is_icmp, icmp_success, payload, src_ident, src_seq, src_is_req) = match src_proto {
-        SupportedProtocol::ICMP => {
-            let res = parse_icmp_echo_header(buf);
-            (true, res.0, &res.1[res.2..res.3], res.4, res.5, res.6)
-        }
-        _ => (false, true, buf, 0u16, 0u16, c2u),
-    };
+    let (src_is_icmp, icmp_success, payload, src_ident_header, src_seq, src_is_req) =
+        match src_proto {
+            SupportedProtocol::ICMP => {
+                let res = parse_icmp_echo_header(buf);
+                (true, res.0, &res.1[res.2..res.3], res.4, res.5, res.6)
+            }
+            _ => (false, true, buf, 0u16, 0u16, c2u),
+        };
 
     if !icmp_success {
         stats.drop_err(c2u);
@@ -213,12 +238,12 @@ pub(crate) fn validate_payload<'a>(
         ));
     }
 
-    if c2u != src_is_req || (src_is_icmp && !icmp_id_policy.accepts(src_ident)) {
+    if c2u != src_is_req || (src_is_icmp && !icmp_id_policy.accepts(src_ident_header)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "ICMP Echo direction or identity mismatch: got (req={}, id={}), expected (req={}, policy={:?})",
-                src_is_req, src_ident, c2u, icmp_id_policy
+                src_is_req, src_ident_header, c2u, icmp_id_policy
             ),
         ));
     }
@@ -226,22 +251,46 @@ pub(crate) fn validate_payload<'a>(
     let decoded_event = if src_is_icmp {
         let event = decode_icmp_tunnel_payload(payload)?;
         let base = event.wire();
+
+        if base.src_id_from_shim.is_some() {
+            if is_locked {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ICMP tunnel handshake attempted on already locked session",
+                ));
+            }
+            if !src_is_req {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ICMP tunnel handshake attempted on Echo Reply",
+                ));
+            }
+            if !event.is_user_data() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ICMP tunnel handshake attempted on Keepalive packet",
+                ));
+            }
+        }
+
         PayloadEvent::from_wire_parts(
             event.is_user_data(),
-            src_ident,
+            base.src_id_from_shim.unwrap_or(src_ident_header),
             src_seq,
             dst_proto,
             base.payload,
             base.pub_len,
+            base.src_id_from_shim,
         )
     } else {
         PayloadEvent::UserData(WirePayload {
             src_is_icmp,
-            src_ident,
+            src_ident: src_ident_header,
             src_seq,
             dst_proto,
             payload,
             pub_len: payload.len(),
+            src_id_from_shim: None,
         })
     };
     let len = decoded_event.wire().len();
@@ -264,14 +313,35 @@ pub(crate) fn send_payload(
     icmp_header_id: u16,
     c2u: bool,
     icmp_seq: Option<u16>,
+    source_id_for_shim: Option<u16>,
 ) -> io::Result<bool> {
     let wire = event.wire();
-    let shim = match event {
-        PayloadEvent::UserData(wire) => {
-            [ICMP_SHIM_IS_DATA | (((wire.len() != 0) as u8) * ICMP_SHIM_HAS_PAYLOAD)]
-        }
-        PayloadEvent::SyncKeepalive(_) => [0u8],
+    let mut shim_storage = [0u8; 3];
+    let shim_len = if let Some(src_id) = source_id_for_shim {
+        let base = match event {
+            PayloadEvent::UserData(wire) => {
+                ICMP_SHIM_IS_DATA
+                    | (((wire.len() != 0) as u8) * ICMP_SHIM_HAS_PAYLOAD)
+                    | ICMP_SHIM_HAS_SOURCE_ID
+            }
+            PayloadEvent::SyncKeepalive(_) => ICMP_SHIM_HAS_SOURCE_ID,
+        };
+        let idb = src_id.to_be_bytes();
+        shim_storage[0] = base;
+        shim_storage[1] = idb[0];
+        shim_storage[2] = idb[1];
+        3
+    } else {
+        let base = match event {
+            PayloadEvent::UserData(wire) => {
+                ICMP_SHIM_IS_DATA | (((wire.len() != 0) as u8) * ICMP_SHIM_HAS_PAYLOAD)
+            }
+            PayloadEvent::SyncKeepalive(_) => 0u8,
+        };
+        shim_storage[0] = base;
+        1
     };
+
     let send_res = match wire.dst_proto {
         SupportedProtocol::ICMP => send_icmp_echo(
             sock,
@@ -281,7 +351,7 @@ pub(crate) fn send_payload(
             icmp_header_id,
             icmp_seq.expect("missing ICMP sequence for ICMP destination"),
             !c2u,
-            Some(&shim),
+            Some(&shim_storage[..shim_len]),
             wire.payload,
         ),
         _ => {
@@ -311,7 +381,7 @@ pub(crate) fn send_payload(
                     icmp_header_id,
                     icmp_seq.expect("missing ICMP sequence for ICMP destination"),
                     !c2u,
-                    Some(&shim),
+                    Some(&shim_storage[..shim_len]),
                     wire.payload,
                 ),
                 _ => sock.send_to(wire.payload, dest_sa),
@@ -433,6 +503,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321)),
                 4321,
             ),
+            upstream_local_id: 0,
             upstream_proto,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,
@@ -549,6 +620,7 @@ mod tests {
             &[],
             IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
+            false,
         )
         .expect("wire zero-length UDP must be treated as user data");
         assert!(matches!(wire, PayloadEvent::UserData(_)));
@@ -561,6 +633,7 @@ mod tests {
             &[],
             IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::SyntheticSyncKeepalive,
+            false,
         )
         .expect("synthetic sync keepalive should be accepted");
         assert!(matches!(synthetic, PayloadEvent::SyncKeepalive(_)));
@@ -581,6 +654,7 @@ mod tests {
             &buf,
             IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
+            false,
         )
         .expect("wire ICMP keepalive header should decode");
         assert!(matches!(event, PayloadEvent::SyncKeepalive(_)));
@@ -610,6 +684,7 @@ mod tests {
             &buf,
             IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
+            false,
         )
         .expect("ICMP shim should decode zero-length user data");
         assert!(matches!(event, PayloadEvent::UserData(_)));
@@ -629,6 +704,7 @@ mod tests {
             &buf,
             IcmpIdPolicy::Exact(cfg.listen.id),
             PayloadOrigin::Wire,
+            false,
         )
         .expect("ICMP shim should decode non-empty user data");
         assert!(matches!(event, PayloadEvent::UserData(_)));
@@ -650,6 +726,7 @@ mod tests {
             &buf,
             IcmpIdPolicy::Any,
             PayloadOrigin::Wire,
+            false,
         )
         .expect("wildcard ICMP policy should accept arbitrary identifier");
         assert_eq!(event.wire().src_ident, 0xAA55);
@@ -671,7 +748,9 @@ mod tests {
             &buf,
             IcmpIdPolicy::Exact(0x1111),
             PayloadOrigin::Wire,
-        );
+            false,
+            )
+;
         assert!(res.is_err(), "exact policy should reject mismatching ID");
         assert!(
             res.unwrap_err().to_string().contains("identity mismatch"),
@@ -686,6 +765,7 @@ mod tests {
             &buf,
             IcmpIdPolicy::Exact(0xAA55),
             PayloadOrigin::Wire,
+            false,
         )
         .expect("exact policy should accept matching identifier");
         assert_eq!(event.wire().src_ident, 0xAA55);
@@ -703,6 +783,7 @@ mod tests {
             &empty_icmp,
             IcmpIdPolicy::Exact(0x04D2),
             PayloadOrigin::Wire,
+            false,
         )
         .expect("empty ICMP should be accepted as sync keepalive");
         assert!(!event.is_user_data());
@@ -738,7 +819,9 @@ mod tests {
                     &bad,
                     IcmpIdPolicy::Exact(cfg.listen.id),
                     PayloadOrigin::Wire,
-                )
+                    false,
+                    )
+
                 .is_err(),
                 "shim {:02X} should be rejected",
                 bad.get(8).cloned().unwrap_or(0xFF)
@@ -760,7 +843,8 @@ mod tests {
                 &stats,
                 &[],
                 IcmpIdPolicy::Exact(cfg.listen.id),
-                PayloadOrigin::Wire
+                PayloadOrigin::Wire,
+                false,
             )
             .is_ok()
         );
@@ -771,7 +855,8 @@ mod tests {
                 &stats,
                 &[0],
                 IcmpIdPolicy::Exact(cfg.listen.id),
-                PayloadOrigin::Wire
+                PayloadOrigin::Wire,
+                false,
             )
             .is_err()
         );
@@ -790,7 +875,8 @@ mod tests {
                 &stats,
                 &ok_icmp,
                 IcmpIdPolicy::Exact(cfg_icmp.listen.id),
-                PayloadOrigin::Wire
+                PayloadOrigin::Wire,
+                false,
             )
             .is_ok()
         );
@@ -801,7 +887,8 @@ mod tests {
                 &stats,
                 &over_icmp,
                 IcmpIdPolicy::Exact(cfg_icmp.listen.id),
-                PayloadOrigin::Wire
+                PayloadOrigin::Wire,
+                false,
             )
             .is_err()
         );
@@ -823,6 +910,7 @@ mod tests {
                 &ok,
                 IcmpIdPolicy::Exact(cfg.listen.id),
                 PayloadOrigin::Wire,
+                false,
             )
             .is_ok()
         );
@@ -834,8 +922,87 @@ mod tests {
                 &over,
                 IcmpIdPolicy::Exact(cfg.listen.id),
                 PayloadOrigin::Wire,
+                false,
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn validate_payload_strict_handshake_rejections() {
+        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
+        let stats = Stats::new();
+
+        // 1. Valid handshake (Unlocked, Echo Request, UserData)
+        let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_SOURCE_ID), &[]);
+        let id_bytes = 0x2002u16.to_be_bytes();
+        buf.insert(9, id_bytes[0]);
+        buf.insert(10, id_bytes[1]);
+        let res = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            IcmpIdPolicy::Exact(0x04D2),
+            PayloadOrigin::Wire,
+            false,
+        );
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap().wire().src_ident, 0x2002);
+
+        // 2. Reject Locked session
+        let res = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            IcmpIdPolicy::Exact(0x04D2),
+            PayloadOrigin::Wire,
+            true,
+        );
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("already locked session"));
+
+        // 3. Reject Echo Reply
+        buf[0] = 0; // Type 0 = Echo Reply
+        // Need c2u=true but buffer type=0 (Reply) to trigger !src_is_req
+        let res = validate_payload(
+            true, // Expected Request (type 8), but got Reply (type 0)
+            &cfg,
+            &stats,
+            &buf,
+            IcmpIdPolicy::Exact(0x04D2),
+            PayloadOrigin::Wire,
+            false,
+        );
+        assert!(res.is_err(), "should reject Source ID on Echo Reply");
+        let err_msg = res.unwrap_err().to_string();
+        // validate_payload currently prioritize Echo type mismatch error over shim handshake checks if c2u=true
+        assert!(err_msg.contains("identity mismatch") || err_msg.contains("on Echo Reply"));
+
+        // 4. Reject Keepalive
+        // Handshake bit 0x20 is set, but IS_DATA (0x80) is NOT set.
+        let buf_ka = encode_icmp_payload(Some(ICMP_SHIM_HAS_SOURCE_ID), &[]);
+        let mut buf_ka_full = [0u8; 11];
+        buf_ka_full[..8].copy_from_slice(&[8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
+        buf_ka_full[8] = ICMP_SHIM_HAS_SOURCE_ID;
+        let id_bytes = 0x2002u16.to_be_bytes();
+        buf_ka_full[9] = id_bytes[0];
+        buf_ka_full[10] = id_bytes[1];
+
+        let res = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf_ka_full,
+            IcmpIdPolicy::Exact(0x04D2),
+            PayloadOrigin::Wire,
+            false,
+        );
+        assert!(res.is_err(), "should reject Source ID on Keepalive");
+        assert!(res.unwrap_err().to_string().contains("on Keepalive packet"));
     }
 }

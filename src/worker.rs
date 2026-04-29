@@ -186,6 +186,7 @@ pub fn run_upstream_to_client_thread(
                             &buf.data[..len],
                             IcmpIdPolicy::Exact(handles.upstream_local.id),
                             PayloadOrigin::Wire,
+                            true, // Already locked
                         ),
                         log_debug_dir,
                         cfg.debug_logs.drops,
@@ -218,6 +219,7 @@ pub fn run_upstream_to_client_thread(
                             cache.route.icmp_header_id,
                             C2U,
                             prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                            None, // Replies never propose a Source ID
                         )
                     } else {
                         Ok(true)
@@ -309,13 +311,14 @@ pub fn run_client_to_upstream_thread(
                                 |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
                             ),
                             PayloadOrigin::SyntheticSyncKeepalive,
+                            locked_now,
                         )
                         .unwrap_or_else(|e| {
                             log_debug_dir!(
                                 cfg.debug_logs.drops,
                                 worker_id,
                                 C2U,
-                                "validate_payload error: {}",
+                                "synthetic keepalive error: {}",
                                 e
                             );
                             unreachable!("synthetic sync keepalive validation must not fail")
@@ -331,7 +334,12 @@ pub fn run_client_to_upstream_thread(
                         &event,
                         cache.route.icmp_header_id,
                         C2U,
-                        prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                        prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                        if !sync_cache.latest_valid {
+                            Some(handles.upstream_local.id)
+                        } else {
+                            None
+                        },
                     );
                     handle_send_result(
                         C2U,
@@ -374,6 +382,7 @@ pub fn run_client_to_upstream_thread(
                             &buf.data[..len],
                             cache.recv_icmp_policy,
                             PayloadOrigin::Wire,
+                            locked_now,
                         ) {
                             Ok(event) => buffer_sync_event(
                                 worker_id,
@@ -432,6 +441,7 @@ pub fn run_client_to_upstream_thread(
                                 &buf.data[..len],
                                 cache.recv_icmp_policy,
                                 PayloadOrigin::Wire,
+                                true, // Already locked
                             ),
                             log_debug_dir,
                             cfg.debug_logs.drops,
@@ -439,6 +449,7 @@ pub fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
+
                         match event {
                             PayloadEvent::UserData(ref wire) => {
                                 if wire.src_is_icmp {
@@ -453,7 +464,13 @@ pub fn run_client_to_upstream_thread(
                                     cache.route.icmp_header_id,
                                     C2U,
                                     prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                    if !sync_cache.latest_valid {
+                                        Some(handles.upstream_local.id)
+                                    } else {
+                                        None
+                                    },
                                 );
+
                                 handle_send_result(
                                     C2U,
                                     worker_id,
@@ -516,13 +533,14 @@ pub fn run_client_to_upstream_thread(
                                 |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
                             ),
                             PayloadOrigin::SyntheticSyncKeepalive,
+                            locked_now,
                         )
                         .unwrap_or_else(|e| {
                             log_debug_dir!(
                                 cfg.debug_logs.drops,
                                 worker_id,
                                 C2U,
-                                "validate_payload error: {}",
+                                "synthetic keepalive error: {}",
                                 e
                             );
                             unreachable!("synthetic sync keepalive validation must not fail")
@@ -538,7 +556,12 @@ pub fn run_client_to_upstream_thread(
                         &event,
                         cache.route.icmp_header_id,
                         C2U,
-                        prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                        prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                        if !sync_cache.latest_valid {
+                            Some(handles.upstream_local.id)
+                        } else {
+                            None
+                        },
                     );
                     handle_send_result(
                         C2U,
@@ -591,6 +614,7 @@ pub fn run_client_to_upstream_thread(
                             &buf.data[..len],
                             cache.recv_icmp_policy,
                             PayloadOrigin::Wire,
+                            true, // Already locked
                         ) {
                             Ok(event) => event,
                             Err(e) => {
@@ -655,6 +679,7 @@ pub fn run_client_to_upstream_thread(
                                 &buf.data[..len],
                                 cache.recv_icmp_policy,
                                 PayloadOrigin::Wire,
+                                flow_state.is_locked(),
                             ),
                             log_debug_dir,
                             cfg.debug_logs.drops,
@@ -746,6 +771,11 @@ pub fn run_client_to_upstream_thread(
                                     cache.route.icmp_header_id,
                                     C2U,
                                     prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                    if !sync_cache.latest_valid {
+                                        Some(handles.upstream_local.id)
+                                    } else {
+                                        None
+                                    },
                                 );
                                 handle_send_result(
                                     C2U,
@@ -787,6 +817,7 @@ pub fn run_client_to_upstream_thread(
                                 &buf.data[..len],
                                 cache.recv_icmp_policy,
                                 PayloadOrigin::Wire,
+                                flow_state.is_locked(),
                             ),
                             log_debug_dir,
                             cfg.debug_logs.drops,
@@ -813,6 +844,11 @@ pub fn run_client_to_upstream_thread(
                                     cache.route.icmp_header_id,
                                     C2U,
                                     prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                    if !sync_cache.latest_valid {
+                                        Some(handles.upstream_local.id)
+                                    } else {
+                                        None
+                                    },
                                 );
                                 handle_send_result(
                                     C2U,

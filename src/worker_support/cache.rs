@@ -183,6 +183,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
                 9999,
             ),
+            upstream_local_id: 0,
             upstream_proto: up,
             upstream_str: String::from("127.0.0.1:9999"),
             timeout_secs: 10,

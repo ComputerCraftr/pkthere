@@ -42,6 +42,7 @@ impl BufferedSyncPayload {
             dst_proto: self.dst_proto,
             payload: &self.payload,
             pub_len: self.payload.len(),
+            src_id_from_shim: None,
         })
     }
 }
@@ -55,6 +56,7 @@ fn empty_icmp_reply_event(seq: u16) -> PayloadEvent<'static> {
         dst_proto: SupportedProtocol::ICMP,
         payload: &[],
         pub_len: 0,
+        src_id_from_shim: None,
     })
 }
 
@@ -80,6 +82,7 @@ fn send_local_keepalive_reply(
         route.icmp_header_id,
         false,
         Some(wire.src_seq),
+        None, // Local keepalive replies never propose a Source ID
     );
     handle_send_result(
         false,
@@ -264,6 +267,7 @@ mod tests {
             dst_proto: SupportedProtocol::ICMP,
             payload: b"payload",
             pub_len: 7,
+            src_id_from_shim: None,
         });
 
         let buffered = BufferedSyncPayload::from_wire(event.wire());

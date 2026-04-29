@@ -60,11 +60,11 @@ pub(crate) struct SharedSyncIcmpState {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SyncIcmpCache {
-    generation: u64,
-    latest_sent_seq: u16,
-    latest_valid: bool,
-    reply_icmp_seq: u16,
-    catchup_window: usize,
+    pub(crate) generation: u64,
+    pub(crate) latest_sent_seq: u16,
+    pub(crate) latest_valid: bool,
+    pub(crate) reply_icmp_seq: u16,
+    pub(crate) catchup_window: usize,
 }
 
 impl SharedSyncIcmpState {
@@ -355,6 +355,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2222)),
                 2222,
             ),
+            upstream_local_id: 0,
             upstream_proto: SupportedProtocol::ICMP,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,
@@ -381,6 +382,7 @@ mod tests {
             dst_proto,
             payload,
             pub_len: payload.len(),
+            src_id_from_shim: None,
         }
     }
 

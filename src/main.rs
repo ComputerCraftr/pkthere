@@ -151,6 +151,7 @@ fn main() -> io::Result<()> {
         cfg.listen_str.clone(),
         cfg.listen_proto,
         cfg.upstream,
+        cfg.upstream_local_id,
         cfg.upstream_str.clone(),
         cfg.upstream_proto,
     )?));
@@ -170,6 +171,7 @@ fn main() -> io::Result<()> {
             cfg.listen_str.clone(),
             cfg.listen_proto,
             cfg.upstream,
+            cfg.upstream_local_id,
             cfg.upstream_str.clone(),
             cfg.upstream_proto,
         )?));

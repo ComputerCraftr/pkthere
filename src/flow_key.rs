@@ -53,13 +53,13 @@ impl ClientFlowKey {
     pub fn display_addr(self) -> SocketAddr {
         match self {
             Self::Udp(addr) => addr,
-            Self::IcmpV4 { ip, .. } => SocketAddr::new(IpAddr::V4(ip), 0),
+            Self::IcmpV4 { ip, ident } => SocketAddr::new(IpAddr::V4(ip), ident),
             Self::IcmpV6 {
                 ip,
+                ident,
                 flowinfo,
                 scope_id,
-                ..
-            } => SocketAddr::V6(SocketAddrV6::new(ip, 0, flowinfo, scope_id)),
+            } => SocketAddr::V6(SocketAddrV6::new(ip, ident, flowinfo, scope_id)),
         }
     }
 }
@@ -126,7 +126,7 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(
             a.display_addr(),
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 1, 2))
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 10, 1, 2))
         );
     }
 }

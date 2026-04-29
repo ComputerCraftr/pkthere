@@ -130,6 +130,7 @@ pub struct RequestedConfig {
     pub workers: usize,                // listener/upstream worker pairs
     pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
     pub upstream_request: CanonicalAddr, // CLI remote UDP port or ICMP peer/listener id
+    pub upstream_local_id: u16,        // CLI requested local ID for ICMP upstreams
     pub upstream_proto: SupportedProtocol, // UDP | ICMP
     pub upstream_str: String,          // FQDN:port or IP:port
     pub timeout_secs: u64,             // idle timeout for single client
@@ -156,6 +157,7 @@ pub struct RuntimeConfig {
     pub workers: usize,        // listener/upstream worker pairs
     pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
     pub upstream: CanonicalAddr, // remote UDP port or ICMP peer/listener id
+    pub upstream_local_id: u16,        // CLI requested local source ID
     pub upstream_proto: SupportedProtocol, // UDP | ICMP
     pub upstream_str: String,  // FQDN:port or IP:port
     pub timeout_secs: u64,     // idle timeout for single client
@@ -202,6 +204,7 @@ pub fn realize_config(
         workers: requested.workers,
         worker_flow_mode: requested.worker_flow_mode,
         upstream: requested.upstream_request,
+        upstream_local_id: requested.upstream_local_id,
         upstream_proto: requested.upstream_proto,
         upstream_str: requested.upstream_str,
         timeout_secs: requested.timeout_secs,
@@ -290,10 +293,21 @@ pub fn parse_args() -> RequestedConfig {
     }
 
     // Address helpers.
-    fn parse_here(s: &str) -> (String, CanonicalAddr, SupportedProtocol) {
+    fn parse_here(s: &str) -> (String, CanonicalAddr, SupportedProtocol, ListenMode) {
         let (proto, addr_str) = split_proto(s, "--here");
+
+        let (_host_port, id_part) = match addr_str.rsplit_once(':') {
+            Some((h, p)) => (h, p),
+            _ => (addr_str, "0"),
+        };
+        let mode = if id_part == "0" {
+            ListenMode::Dynamic
+        } else {
+            ListenMode::Fixed
+        };
+
         match resolve_first(addr_str) {
-            Ok(sa) => (sa.to_string(), CanonicalAddr::from_socket_addr(sa), proto),
+            Ok(sa) => (sa.to_string(), CanonicalAddr::from_socket_addr(sa), proto, mode),
             Err(e) => {
                 log_error!(
                     "--here: failed to parse and resolve host:port or ip:port (got '{s}'): {e}"
@@ -302,10 +316,40 @@ pub fn parse_args() -> RequestedConfig {
             }
         }
     }
-    fn validate_there(s: &str) -> (String, CanonicalAddr, SupportedProtocol) {
+    fn validate_there(s: &str) -> (String, CanonicalAddr, u16, SupportedProtocol) {
         let (proto, addr_str) = split_proto(s, "--there");
-        match resolve_first(addr_str) {
-            Ok(sa) => (sa.to_string(), CanonicalAddr::from_socket_addr(sa), proto),
+
+        // Support ICMP:host:remote_id:local_id
+        let (final_addr_str, local_id) = if proto == SupportedProtocol::ICMP {
+            // Heuristic to separate the IP/host part from the numeric ICMP IDs.
+            // IPv6 addresses like [::1]:1234 are split into many parts.
+            let mut found_local_id = 0;
+            let mut final_addr = addr_str;
+
+            if let Some((rest, last)) = addr_str.rsplit_once(':') {
+                if let Ok(id) = last.parse::<u16>() {
+                    // One numeric part found. Is there another one before it?
+                    if let Some((_base, mid)) = rest.rsplit_once(':') {
+                        if let Ok(_remote_id) = mid.parse::<u16>() {
+                            // Yes, matches <ip>:<remote_id>:<local_id>
+                            found_local_id = id;
+                            final_addr = rest;
+                        }
+                    }
+                }
+            }
+            (final_addr, found_local_id)
+        } else {
+            (addr_str, 0)
+        };
+
+        match resolve_first(final_addr_str) {
+            Ok(sa) => (
+                sa.to_string(),
+                CanonicalAddr::from_socket_addr(sa),
+                local_id,
+                proto,
+            ),
             Err(e) => {
                 log_error!(
                     "--there: failed to parse and resolve host:port or ip:port (got '{s}'): {e}"
@@ -327,8 +371,9 @@ pub fn parse_args() -> RequestedConfig {
     }
 
     // Required
-    let mut listen_opt: Option<(String, CanonicalAddr, SupportedProtocol)> = None;
-    let mut upstream_opt: Option<(String, CanonicalAddr, SupportedProtocol)> = None;
+    let mut listen_opt: Option<(String, CanonicalAddr, SupportedProtocol, ListenMode)> = None;
+    let mut upstream_opt: Option<(String, CanonicalAddr, u16, SupportedProtocol)> = None;
+
 
     // Optional (track presence to reject duplicates cleanly)
     let mut timeout_secs: Option<u64> = None;
@@ -476,14 +521,14 @@ pub fn parse_args() -> RequestedConfig {
         }
     }
 
-    let (listen_str, listen_request, listen_proto) = match listen_opt {
+    let (listen_str, listen_request, listen_proto, listen_mode_parsed) = match listen_opt {
         Some(t) => t,
         None => {
             log_error!("missing required flag: --here <protocol:listen_ip:port>");
             print_usage_and_exit(2)
         }
     };
-    let (upstream_str, upstream_request, upstream_proto) = match upstream_opt {
+    let (upstream_str, upstream_request, upstream_local_id, upstream_proto) = match upstream_opt {
         Some(t) => t,
         None => {
             log_error!("missing required flag: --there <protocol:upstream_host_or_ip:port>");
@@ -506,7 +551,7 @@ pub fn parse_args() -> RequestedConfig {
     let worker_flow_mode = worker_flow_mode.unwrap_or(WorkerFlowMode::SharedFlow);
     let reresolve_secs = reresolve_secs.unwrap_or(0);
     let reresolve_mode = reresolve_mode.unwrap_or(ReresolveMode::Upstream);
-    let listen_mode = if listen_request.id == 0 {
+    let _ = if listen_request.id == 0 {
         ListenMode::Dynamic
     } else {
         ListenMode::Fixed
@@ -540,11 +585,12 @@ pub fn parse_args() -> RequestedConfig {
     RequestedConfig {
         listen_request,
         listen_proto,
-        listen_mode,
+        listen_mode: listen_mode_parsed,
         listen_str,
         workers,
         worker_flow_mode,
         upstream_request,
+        upstream_local_id,
         upstream_proto,
         upstream_str,
         timeout_secs,
@@ -591,6 +637,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
                 9,
             ),
+            upstream_local_id: 0,
             upstream_proto: SupportedProtocol::UDP,
             upstream_str: String::from("127.0.0.1:9"),
             timeout_secs: 10,
