@@ -18,7 +18,7 @@ pub(crate) struct CachedClientState {
     pub(crate) dest_sock_type: Type,
     pub(crate) route: CachedSendRoute,
     pub(crate) recv_icmp_policy: IcmpIdPolicy,
-    pub(crate) keepalive_reply_route: Option<CachedSendRoute>,
+    pub(crate) session_control_reply_route: Option<CachedSendRoute>,
     log_handles: bool,
 }
 
@@ -55,7 +55,7 @@ impl CachedClientState {
     }
 
     #[inline]
-    pub(crate) fn build_local_keepalive_reply_route(
+    pub(crate) fn build_local_session_control_reply_route(
         _handles: &SocketHandles,
         dest: CanonicalAddr,
     ) -> CachedSendRoute {
@@ -67,7 +67,7 @@ impl CachedClientState {
     }
 
     #[inline]
-    fn maybe_build_keepalive_reply_route(handles: &SocketHandles) -> Option<CachedSendRoute> {
+    fn maybe_build_session_control_reply_route(handles: &SocketHandles) -> Option<CachedSendRoute> {
         let dest = handles.client_peer.map(|peer| {
             CanonicalAddr::new(
                 peer.addr,
@@ -77,7 +77,7 @@ impl CachedClientState {
                     .unwrap_or(peer.id),
             )
         })?;
-        Some(Self::build_local_keepalive_reply_route(handles, dest))
+        Some(Self::build_local_session_control_reply_route(handles, dest))
     }
 
     pub(crate) fn new(
@@ -94,7 +94,7 @@ impl CachedClientState {
                 dest_sock_type: handles.upstream_sock_type,
                 route: Self::build_send_route(c2u, handles, handles.upstream),
                 recv_icmp_policy: Self::resolve_client_recv_icmp_policy(cfg, handles),
-                keepalive_reply_route: Self::maybe_build_keepalive_reply_route(handles),
+                session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
         } else {
@@ -107,7 +107,7 @@ impl CachedClientState {
                 dest_sock_type: handles.listen_sock_type,
                 route: Self::build_send_route(c2u, handles, remote),
                 recv_icmp_policy: Self::resolve_client_recv_icmp_policy(cfg, handles),
-                keepalive_reply_route: Self::maybe_build_keepalive_reply_route(handles),
+                session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
         }
@@ -126,7 +126,7 @@ impl CachedClientState {
             );
         }
         self.recv_icmp_policy = Self::resolve_client_recv_icmp_policy(cfg, handles);
-        self.keepalive_reply_route = Self::maybe_build_keepalive_reply_route(handles);
+        self.session_control_reply_route = Self::maybe_build_session_control_reply_route(handles);
     }
 
     #[inline]
@@ -273,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_keepalive_reply_route_is_built_from_locked_client_peer() {
+    fn cached_session_control_reply_route_is_built_from_locked_client_peer() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
         let mut handles = test_handles();
         handles.client_peer = Some(CanonicalAddr::new(
@@ -286,7 +286,9 @@ mod tests {
         ))));
 
         let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
-        let reply_route = cache.keepalive_reply_route.expect("reply route exists");
+        let reply_route = cache
+            .session_control_reply_route
+            .expect("reply route exists");
         assert_eq!(reply_route.dest.id, 5555);
     }
 

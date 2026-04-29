@@ -1,37 +1,70 @@
+use std::fmt;
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering as AtomOrdering};
+
 #[doc(hidden)]
 pub const fn log_dir_label(c2u: bool) -> &'static str {
     if c2u { "c2u" } else { "u2c" }
 }
 
+static STDOUT_BROKEN: AtomicBool = AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn emit_stdout(args: fmt::Arguments<'_>) {
+    if STDOUT_BROKEN.load(AtomOrdering::Relaxed) {
+        return;
+    }
+
+    let mut stdout = io::stdout().lock();
+    if let Err(e) = writeln!(stdout, "{args}")
+        && e.kind() == io::ErrorKind::BrokenPipe
+    {
+        STDOUT_BROKEN.store(true, AtomOrdering::Relaxed);
+    }
+}
+
+#[doc(hidden)]
+pub fn emit_stderr(args: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr().lock(), "{args}");
+}
+
 #[macro_export]
 macro_rules! __log_emit_plain {
     (stdout, $level:literal, $($arg:tt)*) => {
-        ::std::println!("[{}] {}", $level, ::std::format_args!($($arg)*));
+        $crate::logging::emit_stdout(::std::format_args!(
+            "[{}] {}",
+            $level,
+            ::std::format_args!($($arg)*)
+        ));
     };
     (stderr, $level:literal, $($arg:tt)*) => {
-        ::std::eprintln!("[{}] {}", $level, ::std::format_args!($($arg)*));
+        $crate::logging::emit_stderr(::std::format_args!(
+            "[{}] {}",
+            $level,
+            ::std::format_args!($($arg)*)
+        ));
     };
 }
 
 #[macro_export]
 macro_rules! __log_emit_dir {
     (stdout, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {
-        ::std::println!(
+        $crate::logging::emit_stdout(::std::format_args!(
             "[{}][worker {}][{}] {}",
             $level,
             $worker,
             $crate::logging::log_dir_label($c2u),
             ::std::format_args!($($arg)*)
-        );
+        ));
     };
     (stderr, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {
-        ::std::eprintln!(
+        $crate::logging::emit_stderr(::std::format_args!(
             "[{}][worker {}][{}] {}",
             $level,
             $worker,
             $crate::logging::log_dir_label($c2u),
             ::std::format_args!($($arg)*)
-        );
+        ));
     };
 }
 

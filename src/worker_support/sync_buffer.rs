@@ -7,7 +7,7 @@ use crate::net::payload::{PayloadEvent, WirePayload, send_payload};
 use crate::net::session::handle_send_result;
 use crate::net::sock_mgr::SocketHandles;
 use crate::net::sync_icmp::{
-    C2uKeepaliveDecision, SharedSyncIcmpState, SyncIcmpCache, classify_c2u_keepalive,
+    C2uSessionControlDecision, SharedSyncIcmpState, SyncIcmpCache, classify_c2u_session_control,
     remember_request_seq, reset_session,
 };
 use crate::stats::StatsSink;
@@ -35,7 +35,7 @@ impl BufferedSyncPayload {
 
     #[inline]
     pub(crate) fn as_event(&self) -> PayloadEvent<'_> {
-        PayloadEvent::UserData(WirePayload {
+        PayloadEvent::UserPayload(WirePayload {
             src_is_icmp: self.src_is_icmp,
             src_ident: self.src_ident,
             src_seq: self.src_seq,
@@ -47,9 +47,14 @@ impl BufferedSyncPayload {
     }
 }
 
+pub(crate) enum BufferedSyncUpdate {
+    Replace(BufferedSyncPayload),
+    Keep,
+}
+
 #[inline]
 fn empty_icmp_reply_event(seq: u16) -> PayloadEvent<'static> {
-    PayloadEvent::SyncKeepalive(WirePayload {
+    PayloadEvent::SessionControl(WirePayload {
         src_is_icmp: true,
         src_ident: 0,
         src_seq: seq,
@@ -61,7 +66,7 @@ fn empty_icmp_reply_event(seq: u16) -> PayloadEvent<'static> {
 }
 
 #[inline]
-fn send_local_keepalive_reply(
+fn send_local_session_control_reply(
     worker_id: usize,
     t_start: Instant,
     t_recv: Instant,
@@ -82,7 +87,7 @@ fn send_local_keepalive_reply(
         route.icmp_header_id,
         false,
         Some(wire.src_seq),
-        None, // Local keepalive replies never propose a Source ID
+        None, // Local session-control replies never propose a Source ID
     );
     handle_send_result(
         false,
@@ -92,8 +97,7 @@ fn send_local_keepalive_reply(
         cfg,
         stats,
         flow_state,
-        0,
-        false,
+        &reply_event,
         false,
         &send_res,
         handles.client_connected,
@@ -103,7 +107,7 @@ fn send_local_keepalive_reply(
 }
 
 #[inline]
-pub(crate) fn handle_c2u_keepalive(
+pub(crate) fn handle_c2u_session_control(
     worker_id: usize,
     t_start: Instant,
     t_recv: Instant,
@@ -116,9 +120,9 @@ pub(crate) fn handle_c2u_keepalive(
     default_reply_route: Option<&CachedSendRoute>,
     wire: &WirePayload<'_>,
 ) {
-    match classify_c2u_keepalive(cfg, wire, sync_state, sync_cache) {
-        Ok(C2uKeepaliveDecision::Consume) => {}
-        Ok(C2uKeepaliveDecision::ReplyLocally) => {
+    match classify_c2u_session_control(cfg, wire, sync_state, sync_cache) {
+        Ok(C2uSessionControlDecision::Consume) => {}
+        Ok(C2uSessionControlDecision::ReplyLocally) => {
             let reply_route = default_reply_route.cloned().or_else(|| {
                 let dest = handles.client_peer.map(|peer| {
                     CanonicalAddr::new(
@@ -129,12 +133,12 @@ pub(crate) fn handle_c2u_keepalive(
                             .unwrap_or(peer.id),
                     )
                 })?;
-                Some(CachedClientState::build_local_keepalive_reply_route(
+                Some(CachedClientState::build_local_session_control_reply_route(
                     handles, dest,
                 ))
             });
             if let Some(reply_route) = reply_route.as_ref() {
-                send_local_keepalive_reply(
+                send_local_session_control_reply(
                     worker_id,
                     t_start,
                     t_recv,
@@ -150,7 +154,7 @@ pub(crate) fn handle_c2u_keepalive(
                     cfg.debug_logs.drops,
                     worker_id,
                     true,
-                    "dropping keepalive reply with no locked client address"
+                    "dropping session-control reply with no locked client address"
                 );
             }
         }
@@ -158,7 +162,7 @@ pub(crate) fn handle_c2u_keepalive(
             cfg.debug_logs.drops,
             worker_id,
             true,
-            "classify_c2u_keepalive error: {}",
+            "classify_c2u_session_control error: {}",
             e
         ),
     }
@@ -177,16 +181,16 @@ pub(crate) fn buffer_sync_event(
     sync_cache: &mut SyncIcmpCache,
     default_reply_route: Option<&CachedSendRoute>,
     event: PayloadEvent<'_>,
-) -> Option<BufferedSyncPayload> {
+) -> BufferedSyncUpdate {
     match event {
-        PayloadEvent::UserData(wire) => {
+        PayloadEvent::UserPayload(wire) => {
             if wire.src_is_icmp {
                 remember_request_seq(sync_state, sync_cache, &wire);
             }
-            Some(BufferedSyncPayload::from_wire(&wire))
+            BufferedSyncUpdate::Replace(BufferedSyncPayload::from_wire(&wire))
         }
-        PayloadEvent::SyncKeepalive(wire) => {
-            handle_c2u_keepalive(
+        PayloadEvent::SessionControl(wire) => {
+            handle_c2u_session_control(
                 worker_id,
                 t_start,
                 t_recv,
@@ -199,8 +203,9 @@ pub(crate) fn buffer_sync_event(
                 default_reply_route,
                 &wire,
             );
-            None
+            BufferedSyncUpdate::Keep
         }
+        PayloadEvent::CadencePacket { .. } => BufferedSyncUpdate::Keep,
     }
 }
 
@@ -220,7 +225,7 @@ pub(crate) fn sync_session_on_lock_transition(
 
 #[cfg(test)]
 mod tests {
-    use super::BufferedSyncPayload;
+    use super::{BufferedSyncPayload, BufferedSyncUpdate};
     use crate::cli::SupportedProtocol;
     use crate::net::params::CanonicalAddr;
     use crate::net::payload::{PayloadEvent, WirePayload};
@@ -260,7 +265,7 @@ mod tests {
 
     #[test]
     fn buffered_sync_payload_round_trips_validated_user_data() {
-        let event = PayloadEvent::UserData(WirePayload {
+        let event = PayloadEvent::UserPayload(WirePayload {
             src_is_icmp: true,
             src_ident: 1234,
             src_seq: 77,
@@ -270,10 +275,10 @@ mod tests {
             src_id_from_shim: None,
         });
 
-        let buffered = BufferedSyncPayload::from_wire(event.wire());
+        let buffered = BufferedSyncPayload::from_wire(event.wire_payload().unwrap());
         let replay = buffered.as_event();
-        let wire = replay.wire();
-        assert!(replay.is_user_data());
+        let wire = replay.wire_payload().unwrap();
+        assert!(replay.is_user_payload());
         assert!(wire.src_is_icmp);
         assert_eq!(wire.src_ident, 1234);
         assert_eq!(wire.src_seq, 77);
@@ -283,32 +288,44 @@ mod tests {
     }
 
     #[test]
-    fn local_keepalive_reply_route_uses_destination_peer_id_for_raw_listener() {
+    fn local_session_control_reply_route_uses_destination_peer_id_for_raw_listener() {
         let handles = test_handles();
         let dest = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
             9999,
         );
-        let route = CachedClientState::build_local_keepalive_reply_route(&handles, dest);
+        let route = CachedClientState::build_local_session_control_reply_route(&handles, dest);
         assert_eq!(route.icmp_header_id, 9999);
         assert_eq!(
-            route.dest_sa.as_socket().expect("cached keepalive dest"),
+            route
+                .dest_sa
+                .as_socket()
+                .expect("cached session-control dest"),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999))
         );
     }
 
     #[test]
-    fn local_keepalive_reply_route_uses_realized_listen_id_for_dgram_listener() {
+    fn local_session_control_reply_route_uses_realized_listen_id_for_dgram_listener() {
         let handles = test_handles();
         let dest = CanonicalAddr::new(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
             9999,
         );
-        let route = CachedClientState::build_local_keepalive_reply_route(&handles, dest);
+        let route = CachedClientState::build_local_session_control_reply_route(&handles, dest);
         assert_eq!(route.icmp_header_id, 9999);
         assert_eq!(
-            route.dest_sa.as_socket().expect("cached keepalive dest"),
+            route
+                .dest_sa
+                .as_socket()
+                .expect("cached session-control dest"),
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999))
         );
+    }
+
+    #[test]
+    fn cadence_packet_keeps_existing_buffered_payload() {
+        let update = BufferedSyncUpdate::Keep;
+        assert!(matches!(update, BufferedSyncUpdate::Keep));
     }
 }

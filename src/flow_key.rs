@@ -29,11 +29,11 @@ impl ClientFlowKey {
             SupportedProtocol::ICMP => match src {
                 SocketAddr::V4(addr) => Self::IcmpV4 {
                     ip: *addr.ip(),
-                    ident: event.wire().src_ident,
+                    ident: event.src_ident(),
                 },
                 SocketAddr::V6(addr) => Self::IcmpV6 {
                     ip: *addr.ip(),
-                    ident: event.wire().src_ident,
+                    ident: event.src_ident(),
                     flowinfo: addr.flowinfo(),
                     scope_id: addr.scope_id(),
                 },

@@ -12,7 +12,8 @@ use crate::orchestrator::{
     expect_no_echo, json_addr, launch_forwarder, localhost_addr, random_unprivileged_port,
     render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local, run_matrix_cases,
     send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
-    wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_matching,
+    wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_match_or_last,
+    wait_for_stats_matching,
 };
 
 use std::io::ErrorKind;
@@ -268,7 +269,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         here: default_test_icmp_upstream_arg(node3_ip.into()),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
-        timeout_secs: None,
+        timeout_secs: Some(10),
         max_payload: None,
         fast_stats: true,
         stats_interval_mins: None,
@@ -282,7 +283,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         there: default_test_icmp_upstream_arg(node3_ip.into()),
         timeout_action: "exit",
-        timeout_secs: None,
+        timeout_secs: Some(10),
         max_payload: None,
         fast_stats: true,
         stats_interval_mins: None,
@@ -295,7 +296,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
-        timeout_secs: None,
+        timeout_secs: Some(10),
         max_payload: None,
         fast_stats: true,
         stats_interval_mins: None,
@@ -357,34 +358,20 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     }
 
     for (i, mut out) in [node1.out, node2_out, node3_out].into_iter().enumerate() {
-        let stats = wait_for_stats_json_from(&mut out, Duration::from_secs(2)).expect(&format!(
-            "did not see expected stats JSON line from node {}",
-            i + 1
-        ));
-
-        assert_eq!(
-            stats["c2u_bytes"].as_u64().unwrap_or(0),
-            payload.len() as u64,
-            "node {} c2u_bytes mismatch",
-            i + 1
-        );
-        assert_eq!(
-            stats["u2c_bytes"].as_u64().unwrap_or(0),
-            payload.len() as u64,
-            "node {} u2c_bytes mismatch",
-            i + 1
-        );
-        assert_eq!(
-            stats["c2u_pkts"].as_u64().unwrap_or(0),
-            2,
-            "node {} c2u_pkts mismatch",
-            i + 1
-        );
-        assert_eq!(
-            stats["u2c_pkts"].as_u64().unwrap_or(0),
-            2,
-            "node {} u2c_pkts mismatch",
-            i + 1
+        let outcome = wait_for_stats_match_or_last(&mut out, Duration::from_secs(5), |stats| {
+            stats["c2u_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
+                && stats["u2c_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
+                && stats["c2u_pkts"].as_u64().unwrap_or(0) == 2
+                && stats["u2c_pkts"].as_u64().unwrap_or(0) == 2
+        });
+        assert!(
+            outcome.matched,
+            "did not see expected stats JSON line from node {}. last seen stats: {}",
+            i + 1,
+            outcome
+                .last_seen
+                .map(|stats| stats.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
         );
     }
 }

@@ -6,21 +6,44 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub struct StatsWaitOutcome {
+    pub matched: bool,
+    pub last_seen: Option<serde_json::Value>,
+}
+
 pub fn wait_for_stats_matching<R: Read>(
     reader: &mut R,
     max_wait: Duration,
-    mut predicate: impl FnMut(&serde_json::Value) -> bool,
+    predicate: impl FnMut(&serde_json::Value) -> bool,
 ) -> Option<serde_json::Value> {
+    let outcome = wait_for_stats_match_or_last(reader, max_wait, predicate);
+    outcome.last_seen.filter(|_| outcome.matched)
+}
+
+pub fn wait_for_stats_match_or_last<R: Read>(
+    reader: &mut R,
+    max_wait: Duration,
+    mut predicate: impl FnMut(&serde_json::Value) -> bool,
+) -> StatsWaitOutcome {
     let give_up = Instant::now() + max_wait;
+    let mut last_seen = None;
     while Instant::now() < give_up {
         if let Some(candidate) = wait_for_stats_json_from(reader, JSON_WAIT_MS) {
-            if predicate(&candidate) {
-                return Some(candidate);
+            let matched = predicate(&candidate);
+            last_seen = Some(candidate);
+            if matched {
+                return StatsWaitOutcome {
+                    matched: true,
+                    last_seen,
+                };
             }
         }
         thread::sleep(Duration::from_millis(50));
     }
-    None
+    StatsWaitOutcome {
+        matched: false,
+        last_seen,
+    }
 }
 
 pub fn send_until_locked<R: Read>(

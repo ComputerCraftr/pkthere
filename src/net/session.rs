@@ -10,8 +10,11 @@ use std::io;
 use std::time::Instant;
 
 #[inline]
-pub(crate) fn counts_as_session_activity(event: &PayloadEvent<'_>, will_forward: bool) -> bool {
-    will_forward && event.is_user_data()
+pub(crate) fn counts_as_session_activity(
+    event: &PayloadEvent<'_>,
+    accepted_peer_activity: bool,
+) -> bool {
+    accepted_peer_activity && !event.is_cadence_packet()
 }
 
 pub(crate) fn handle_send_result(
@@ -22,8 +25,7 @@ pub(crate) fn handle_send_result(
     cfg: &RuntimeConfig,
     stats: &dyn StatsSink,
     flow_state: &FlowRuntimeState,
-    payload_len: usize,
-    is_user_data: bool,
+    event: &PayloadEvent<'_>,
     counts_as_session_activity: bool,
     send_res: &io::Result<bool>,
     sock_connected: bool,
@@ -32,11 +34,11 @@ pub(crate) fn handle_send_result(
 ) {
     log_debug!(
         cfg.debug_logs.packets,
-        "[handle_send_result] worker {} c2u={} is_user_data={} payload_len={}",
+        "[handle_send_result] worker {} c2u={} is_user_payload={} payload_len={}",
         worker_id,
         c2u,
-        is_user_data,
-        payload_len
+        event.is_user_payload(),
+        event.payload_len()
     );
 
     if counts_as_session_activity {
@@ -45,9 +47,9 @@ pub(crate) fn handle_send_result(
 
     match send_res {
         Ok(res) => {
-            if cfg.stats_interval_mins != 0 && is_user_data {
+            if cfg.stats_interval_mins != 0 && event.is_user_payload() {
                 let t_send = Instant::now();
-                stats.send_add(c2u, payload_len as u64, t_recv, t_send);
+                stats.send_add(c2u, event.payload_len() as u64, t_recv, t_send);
             }
 
             if !*res {
@@ -112,7 +114,7 @@ mod tests {
 
     #[test]
     fn forwarded_user_data_counts_as_activity_even_when_zero_length() {
-        let zero = PayloadEvent::UserData(WirePayload {
+        let zero = PayloadEvent::UserPayload(WirePayload {
             src_is_icmp: false,
             src_ident: 0,
             src_seq: 0,
@@ -121,7 +123,7 @@ mod tests {
             pub_len: 0,
             src_id_from_shim: None,
         });
-        let keepalive = PayloadEvent::SyncKeepalive(WirePayload {
+        let session_control = PayloadEvent::SessionControl(WirePayload {
             src_is_icmp: true,
             src_ident: 0,
             src_seq: 1,
@@ -130,9 +132,15 @@ mod tests {
             pub_len: 0,
             src_id_from_shim: None,
         });
+        let cadence = PayloadEvent::CadencePacket {
+            src_is_icmp: true,
+            src_ident: 0,
+            src_seq: 2,
+        };
 
         assert!(counts_as_session_activity(&zero, true));
         assert!(!counts_as_session_activity(&zero, false));
-        assert!(!counts_as_session_activity(&keepalive, true));
+        assert!(counts_as_session_activity(&session_control, true));
+        assert!(!counts_as_session_activity(&cadence, true));
     }
 }

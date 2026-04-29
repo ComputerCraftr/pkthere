@@ -15,8 +15,8 @@ use crate::net::sync_icmp::{
 };
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
-    AlignedBuf, BufferedSyncPayload, CachedClientState, GlobalSyncPacer, as_uninit_mut,
-    buffer_sync_event, handle_c2u_keepalive, sync_session_on_lock_transition,
+    AlignedBuf, BufferedSyncPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer,
+    as_uninit_mut, buffer_sync_event, handle_c2u_session_control, sync_session_on_lock_transition,
     wait_socket_until_readable,
 };
 
@@ -209,7 +209,6 @@ pub fn run_upstream_to_client_thread(
                         C2U,
                         "classify_u2c error: {}"
                     );
-                    let wire = event.wire();
                     let send_res = if decision.should_send() {
                         send_payload(
                             &handles.client_sock,
@@ -219,7 +218,7 @@ pub fn run_upstream_to_client_thread(
                             &event,
                             cache.route.icmp_header_id,
                             C2U,
-                            prepare_send(C2U, wire, true, sync_state, &mut sync_cache),
+                            prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
                             None, // Replies never propose a Source ID
                         )
                     } else {
@@ -233,9 +232,8 @@ pub fn run_upstream_to_client_thread(
                         cfg,
                         stats,
                         flow_state,
-                        wire.len(),
-                        decision.counts_as_payload(),
-                        counts_as_session_activity(&event, decision.counts_as_payload()),
+                        &event,
+                        counts_as_session_activity(&event, decision.counts_as_session_activity()),
                         &send_res,
                         handles.client_connected,
                         &cache.route.dest_sa,
@@ -311,7 +309,7 @@ pub fn run_client_to_upstream_thread(
                                 || IcmpIdPolicy::Any,
                                 |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
                             ),
-                            PayloadOrigin::SyntheticSyncKeepalive,
+                            PayloadOrigin::SyntheticCadencePacket,
                             locked_now,
                         )
                         .unwrap_or_else(|e| {
@@ -319,14 +317,13 @@ pub fn run_client_to_upstream_thread(
                                 cfg.debug_logs.drops,
                                 worker_id,
                                 C2U,
-                                "synthetic keepalive error: {}",
+                                "synthetic cadence packet error: {}",
                                 e
                             );
-                            unreachable!("synthetic sync keepalive validation must not fail")
+                            unreachable!("synthetic cadence packet validation must not fail")
                         });
                         synthetic_event
                     };
-                    let wire = event.wire();
                     let source_id_for_shim = source_id_shim_for_c2u(
                         &event,
                         sync_cache.latest_valid,
@@ -340,7 +337,7 @@ pub fn run_client_to_upstream_thread(
                         &event,
                         cache.route.icmp_header_id,
                         C2U,
-                        prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                        prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
                         source_id_for_shim,
                     );
                     handle_send_result(
@@ -351,8 +348,7 @@ pub fn run_client_to_upstream_thread(
                         cfg,
                         stats,
                         flow_state,
-                        wire.len(),
-                        event.is_user_data(),
+                        &event,
                         counts_as_session_activity(&event, true),
                         &send_res,
                         handles.upstream_connected,
@@ -377,7 +373,7 @@ pub fn run_client_to_upstream_thread(
 
                 match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
                     Ok(len) => {
-                        latest_sync_payload = match validate_payload(
+                        match validate_payload(
                             C2U,
                             cfg,
                             stats,
@@ -386,7 +382,7 @@ pub fn run_client_to_upstream_thread(
                             PayloadOrigin::Wire,
                             locked_now,
                         ) {
-                            Ok(event) => buffer_sync_event(
+                            Ok(event) => match buffer_sync_event(
                                 worker_id,
                                 t_start,
                                 Instant::now(),
@@ -396,9 +392,14 @@ pub fn run_client_to_upstream_thread(
                                 &mut handles,
                                 sync_state,
                                 &mut sync_cache,
-                                cache.keepalive_reply_route.as_ref(),
+                                cache.session_control_reply_route.as_ref(),
                                 event,
-                            ),
+                            ) {
+                                BufferedSyncUpdate::Replace(payload) => {
+                                    latest_sync_payload = Some(payload);
+                                }
+                                BufferedSyncUpdate::Keep => {}
+                            },
                             Err(e) => {
                                 log_debug_dir!(
                                     cfg.debug_logs.drops,
@@ -407,9 +408,8 @@ pub fn run_client_to_upstream_thread(
                                     "validate_payload error: {}",
                                     e
                                 );
-                                None
                             }
-                        };
+                        }
                     }
                     Err(ref e)
                         if e.kind() == io::ErrorKind::WouldBlock
@@ -453,7 +453,7 @@ pub fn run_client_to_upstream_thread(
                         );
 
                         match event {
-                            PayloadEvent::UserData(ref wire) => {
+                            PayloadEvent::UserPayload(ref wire) => {
                                 if wire.src_is_icmp {
                                     remember_request_seq(sync_state, &mut sync_cache, &wire);
                                 }
@@ -470,7 +470,7 @@ pub fn run_client_to_upstream_thread(
                                     &event,
                                     cache.route.icmp_header_id,
                                     C2U,
-                                    prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                    prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
                                     source_id_for_shim,
                                 );
 
@@ -482,8 +482,7 @@ pub fn run_client_to_upstream_thread(
                                     cfg,
                                     stats,
                                     flow_state,
-                                    wire.len(),
-                                    event.is_user_data(),
+                                    &event,
                                     counts_as_session_activity(&event, true),
                                     &send_res,
                                     handles.upstream_connected,
@@ -491,7 +490,7 @@ pub fn run_client_to_upstream_thread(
                                     None,
                                 );
                             }
-                            PayloadEvent::SyncKeepalive(wire) => handle_c2u_keepalive(
+                            PayloadEvent::SessionControl(wire) => handle_c2u_session_control(
                                 worker_id,
                                 t_start,
                                 t_recv,
@@ -501,8 +500,14 @@ pub fn run_client_to_upstream_thread(
                                 &mut handles,
                                 sync_state,
                                 &mut sync_cache,
-                                cache.keepalive_reply_route.as_ref(),
+                                cache.session_control_reply_route.as_ref(),
                                 &wire,
+                            ),
+                            PayloadEvent::CadencePacket { .. } => log_debug_dir!(
+                                cfg.debug_logs.drops,
+                                worker_id,
+                                C2U,
+                                "dropping wire cadence packet from locked client session"
                             ),
                         }
                     }
@@ -535,7 +540,7 @@ pub fn run_client_to_upstream_thread(
                                 || IcmpIdPolicy::Any,
                                 |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
                             ),
-                            PayloadOrigin::SyntheticSyncKeepalive,
+                            PayloadOrigin::SyntheticCadencePacket,
                             locked_now,
                         )
                         .unwrap_or_else(|e| {
@@ -543,14 +548,13 @@ pub fn run_client_to_upstream_thread(
                                 cfg.debug_logs.drops,
                                 worker_id,
                                 C2U,
-                                "synthetic keepalive error: {}",
+                                "synthetic cadence packet error: {}",
                                 e
                             );
-                            unreachable!("synthetic sync keepalive validation must not fail")
+                            unreachable!("synthetic cadence packet validation must not fail")
                         });
                         synthetic_event
                     };
-                    let wire = event.wire();
                     let source_id_for_shim = source_id_shim_for_c2u(
                         &event,
                         sync_cache.latest_valid,
@@ -564,7 +568,7 @@ pub fn run_client_to_upstream_thread(
                         &event,
                         cache.route.icmp_header_id,
                         C2U,
-                        prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                        prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
                         source_id_for_shim,
                     );
                     handle_send_result(
@@ -575,8 +579,7 @@ pub fn run_client_to_upstream_thread(
                         cfg,
                         stats,
                         flow_state,
-                        wire.len(),
-                        event.is_user_data(),
+                        &event,
                         counts_as_session_activity(&event, true),
                         &send_res,
                         handles.upstream_connected,
@@ -634,7 +637,7 @@ pub fn run_client_to_upstream_thread(
                         };
                         let flow_key = ClientFlowKey::from_wire(src, cfg.listen_proto, &event);
                         if Some(flow_key) == handles.locked_flow {
-                            latest_sync_payload = buffer_sync_event(
+                            match buffer_sync_event(
                                 worker_id,
                                 t_start,
                                 Instant::now(),
@@ -644,9 +647,14 @@ pub fn run_client_to_upstream_thread(
                                 &mut handles,
                                 sync_state,
                                 &mut sync_cache,
-                                cache.keepalive_reply_route.as_ref(),
+                                cache.session_control_reply_route.as_ref(),
                                 event,
-                            );
+                            ) {
+                                BufferedSyncUpdate::Replace(payload) => {
+                                    latest_sync_payload = Some(payload);
+                                }
+                                BufferedSyncUpdate::Keep => {}
+                            }
                         }
                     }
                     Err(ref e)
@@ -762,7 +770,7 @@ pub fn run_client_to_upstream_thread(
                         }
 
                         match event {
-                            PayloadEvent::UserData(ref wire) => {
+                            PayloadEvent::UserPayload(ref wire) => {
                                 if wire.src_is_icmp {
                                     remember_request_seq(sync_state, &mut sync_cache, &wire);
                                 }
@@ -779,7 +787,7 @@ pub fn run_client_to_upstream_thread(
                                     &event,
                                     cache.route.icmp_header_id,
                                     C2U,
-                                    prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                    prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
                                     source_id_for_shim,
                                 );
                                 handle_send_result(
@@ -790,8 +798,7 @@ pub fn run_client_to_upstream_thread(
                                     cfg,
                                     stats,
                                     flow_state,
-                                    wire.len(),
-                                    event.is_user_data(),
+                                    &event,
                                     counts_as_session_activity(&event, true),
                                     &send_res,
                                     handles.upstream_connected,
@@ -799,7 +806,7 @@ pub fn run_client_to_upstream_thread(
                                     None,
                                 );
                             }
-                            PayloadEvent::SyncKeepalive(wire) => handle_c2u_keepalive(
+                            PayloadEvent::SessionControl(wire) => handle_c2u_session_control(
                                 worker_id,
                                 t_start,
                                 t_recv,
@@ -809,8 +816,14 @@ pub fn run_client_to_upstream_thread(
                                 &mut handles,
                                 sync_state,
                                 &mut sync_cache,
-                                cache.keepalive_reply_route.as_ref(),
+                                cache.session_control_reply_route.as_ref(),
                                 &wire,
+                            ),
+                            PayloadEvent::CadencePacket { .. } => log_debug_dir!(
+                                cfg.debug_logs.drops,
+                                worker_id,
+                                C2U,
+                                "dropping wire cadence packet during initial lock"
                             ),
                         }
                     } else {
@@ -836,7 +849,7 @@ pub fn run_client_to_upstream_thread(
                             continue;
                         }
                         match event {
-                            PayloadEvent::UserData(ref wire) => {
+                            PayloadEvent::UserPayload(ref wire) => {
                                 if wire.src_is_icmp {
                                     remember_request_seq(sync_state, &mut sync_cache, &wire);
                                 }
@@ -853,7 +866,7 @@ pub fn run_client_to_upstream_thread(
                                     &event,
                                     cache.route.icmp_header_id,
                                     C2U,
-                                    prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
+                                    prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
                                     source_id_for_shim,
                                 );
                                 handle_send_result(
@@ -864,8 +877,7 @@ pub fn run_client_to_upstream_thread(
                                     cfg,
                                     stats,
                                     flow_state,
-                                    wire.len(),
-                                    event.is_user_data(),
+                                    &event,
                                     counts_as_session_activity(&event, true),
                                     &send_res,
                                     handles.upstream_connected,
@@ -873,7 +885,7 @@ pub fn run_client_to_upstream_thread(
                                     None,
                                 );
                             }
-                            PayloadEvent::SyncKeepalive(wire) => handle_c2u_keepalive(
+                            PayloadEvent::SessionControl(wire) => handle_c2u_session_control(
                                 worker_id,
                                 t_start,
                                 t_recv,
@@ -883,8 +895,14 @@ pub fn run_client_to_upstream_thread(
                                 &mut handles,
                                 sync_state,
                                 &mut sync_cache,
-                                cache.keepalive_reply_route.as_ref(),
+                                cache.session_control_reply_route.as_ref(),
                                 &wire,
+                            ),
+                            PayloadEvent::CadencePacket { .. } => log_debug_dir!(
+                                cfg.debug_logs.drops,
+                                worker_id,
+                                C2U,
+                                "dropping wire cadence packet from active client flow"
                             ),
                         }
                     }

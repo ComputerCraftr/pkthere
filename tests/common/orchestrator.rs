@@ -28,8 +28,8 @@ pub use raw_icmp::{
     platform_supports_dgram_icmp, require_kernel_echo_reply_supported, require_raw_icmp_supported,
 };
 pub use runtime_asserts::{
-    expect_no_echo, json_addr, send_until_locked, wait_for_locked_client_from,
-    wait_for_stats_matching,
+    StatsWaitOutcome, expect_no_echo, json_addr, send_until_locked, wait_for_locked_client_from,
+    wait_for_stats_match_or_last, wait_for_stats_matching,
 };
 pub use timing::{
     CLIENT_WAIT_MS, DRAIN_WAIT_MS, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, TIMEOUT_SECS,
