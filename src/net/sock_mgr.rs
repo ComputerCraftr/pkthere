@@ -87,8 +87,12 @@ impl SocketManager {
         upstream_target: String,
         upstream_proto: SupportedProtocol,
     ) -> io::Result<Self> {
-        let (sock, upstream_local, upstream_remote, upstream_sock_type) =
-            make_upstream_socket_for(upstream, upstream_proto, upstream_local_id, upstream_local_id == 0)?;
+        let (sock, upstream_local, upstream_remote, upstream_sock_type) = make_upstream_socket_for(
+            upstream,
+            upstream_proto,
+            upstream_local_id,
+            upstream_local_id == 0,
+        )?;
         Ok(Self {
             client_listen: Mutex::new(ClientListenState {
                 listen,

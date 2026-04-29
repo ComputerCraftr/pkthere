@@ -1,7 +1,8 @@
 pub use crate::core::{
     IpFamily, NODE1_IPV4, NODE1_IPV4_STR, NODE2_IPV4, NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR,
     bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
-    random_unprivileged_port, spawn_udp_echo_server,
+    random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
+    spawn_udp_echo_server,
 };
 use crate::orchestrator::forwarder::SocketMode;
 

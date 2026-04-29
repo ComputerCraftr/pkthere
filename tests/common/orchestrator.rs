@@ -21,8 +21,8 @@ pub use matrix::{
     IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, NODE1_IPV4, NODE1_IPV4_STR, NODE2_IPV4,
     NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR, SOCKET_MODES, bind_client_or_skip, bind_udp_client,
     default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
-    random_unprivileged_port, run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server,
-    spawn_upstream_echo_or_skip,
+    random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
+    run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server, spawn_upstream_echo_or_skip,
 };
 pub use raw_icmp::{
     platform_supports_dgram_icmp, require_kernel_echo_reply_supported, require_raw_icmp_supported,

@@ -10,7 +10,8 @@ use crate::orchestrator::{
     MAX_WAIT_SECS, MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES,
     SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg,
     expect_no_echo, json_addr, launch_forwarder, localhost_addr, random_unprivileged_port,
-    run_matrix_cases, send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
+    render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local, run_matrix_cases,
+    send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
     wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_matching,
 };
 
@@ -559,15 +560,20 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
     if case.proto.eq_ignore_ascii_case("icmp") {
         // Accept either the requested :0 or the realized ID (now that we discover it)
         assert!(
-            actual_upstream == format!("{}:0", up_addr.ip()) || !actual_upstream.ends_with(":0"),
+            actual_upstream == render_canonical_ip_id(up_addr.ip(), 0)
+                || !actual_upstream.ends_with(":0"),
             "stats upstream_canonical mismatch for ICMP: expected IP:0 or IP:real_id, got {}",
             actual_upstream
         );
-        assert!(actual_upstream.starts_with(&up_addr.ip().to_string()));
+        let expected_prefix = match up_addr.ip() {
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        };
+        assert!(actual_upstream.starts_with(&expected_prefix));
     } else {
         assert_eq!(
             actual_upstream,
-            format!("{}:{}", up_addr.ip(), up_addr.port()),
+            render_canonical_ip_id(up_addr.ip(), up_addr.port()),
             "stats upstream_canonical mismatch"
         );
     }
@@ -911,7 +917,7 @@ fn test_raw_icmp_independent_ids() {
     // Node C: ICMP:1001 -> UDP:Echo (on addr_a)
     let _node_c = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: format!("ICMP:{}:{}", addr_a, id_a),
+        here: render_icmp_arg(addr_a.parse().expect("node a ip"), id_a),
         there: format!("UDP:{}", udp_up_addr),
         timeout_action: "exit",
         timeout_secs: None,
@@ -925,8 +931,8 @@ fn test_raw_icmp_independent_ids() {
     // We explicitly request local identity id_b (2002) for the upstream side.
     let mut node_b = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: format!("ICMP:{}:{}", addr_b, id_b),
-        there: format!("ICMP:{}:{}:{}", addr_a, id_a, id_b),
+        here: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
+        there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -939,7 +945,7 @@ fn test_raw_icmp_independent_ids() {
     let node_a = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: IpFamily::V4.listen_arg().to_string(),
-        there: format!("ICMP:{}:{}", addr_b, id_b),
+        there: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,

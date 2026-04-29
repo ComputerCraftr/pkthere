@@ -157,7 +157,7 @@ pub struct RuntimeConfig {
     pub workers: usize,        // listener/upstream worker pairs
     pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
     pub upstream: CanonicalAddr, // remote UDP port or ICMP peer/listener id
-    pub upstream_local_id: u16,        // CLI requested local source ID
+    pub upstream_local_id: u16, // CLI requested local source ID
     pub upstream_proto: SupportedProtocol, // UDP | ICMP
     pub upstream_str: String,  // FQDN:port or IP:port
     pub timeout_secs: u64,     // idle timeout for single client
@@ -223,6 +223,94 @@ pub fn realize_config(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedIcmpCliTarget {
+    resolve_arg: String,
+    local_id: u16,
+}
+
+#[inline]
+fn parse_cli_num<T>(s: &str, flag: &str, what: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+    <T as std::str::FromStr>::Err: std::fmt::Display,
+{
+    s.parse::<T>()
+        .map_err(|e| format!("{flag}: invalid {what} '{s}': {e}"))
+}
+
+#[inline]
+fn parse_proto_and_rest<'a>(
+    s: &'a str,
+    flag: &str,
+) -> Result<(SupportedProtocol, &'a str), String> {
+    s.split_once(':')
+        .and_then(|(proto_str, rest)| SupportedProtocol::from_str(proto_str).map(|p| (p, rest)))
+        .ok_or_else(|| {
+            format!(
+                "{flag} must be UDP:<ip>:<port> or ICMP:<ip>:<id> (UDP :0 = ephemeral local bind on --here; ICMP :0 = wildcard listener on --here or dynamic local source id on --there) (got '{s}')"
+            )
+        })
+}
+
+fn parse_icmp_cli_target(
+    addr_str: &str,
+    flag: &str,
+    allow_local_id: bool,
+) -> Result<ParsedIcmpCliTarget, String> {
+    let expected = if allow_local_id {
+        "ICMP:<host>:<remote_id> or ICMP:[<ipv6>]:<remote_id>[:<local_id>]"
+    } else {
+        "ICMP:<host>:<id> or ICMP:[<ipv6>]:<id>"
+    };
+
+    let parse_ids = |host: &str, ids: &[&str]| -> Result<ParsedIcmpCliTarget, String> {
+        if host.is_empty() {
+            return Err(format!("{flag} must use {expected}"));
+        }
+        if ids.len() != 1 && !(allow_local_id && ids.len() == 2) {
+            return Err(format!("{flag} must use {expected}"));
+        }
+
+        let remote_id = parse_cli_num::<u16>(ids[0], flag, "ICMP id")?;
+        let local_id = if ids.len() == 2 {
+            parse_cli_num::<u16>(ids[1], flag, "ICMP local id")?
+        } else {
+            0
+        };
+
+        Ok(ParsedIcmpCliTarget {
+            resolve_arg: format!("{host}:{remote_id}"),
+            local_id,
+        })
+    };
+
+    if let Some(rest) = addr_str.strip_prefix('[') {
+        let close = rest.find(']').ok_or_else(|| {
+            format!("{flag} invalid ICMP IPv6 address: missing closing ']' (got '{addr_str}')")
+        })?;
+        let host = &addr_str[..=close + 1];
+        let suffix = &addr_str[close + 2..];
+        let ids = suffix
+            .strip_prefix(':')
+            .ok_or_else(|| format!("{flag} must use {expected}"))?;
+        let parts: Vec<&str> = ids.split(':').collect();
+        return parse_ids(host, &parts);
+    }
+
+    let parts: Vec<&str> = addr_str.split(':').collect();
+    if parts.len() > 3 || (parts.len() > 2 && !allow_local_id) {
+        return Err(format!(
+            "{flag} ICMP IPv6 addresses must use brackets: ICMP:[<ipv6>]:<id>"
+        ));
+    }
+    if parts.len() < 2 {
+        return Err(format!("{flag} must use {expected}"));
+    }
+
+    parse_ids(parts[0], &parts[1..])
+}
+
 pub fn parse_args() -> RequestedConfig {
     // One place for usage. Program name is filled dynamically.
     fn print_usage_and_exit(code: i32) -> ! {
@@ -268,18 +356,6 @@ pub fn parse_args() -> RequestedConfig {
         *slot = Some(val);
     }
 
-    // Split "UDP:host:port" / "ICMP:host:id" into (proto, "host:port")
-    fn split_proto<'a>(s: &'a str, flag: &str) -> (SupportedProtocol, &'a str) {
-        s.split_once(':')
-            .and_then(|(proto_str, rest)| SupportedProtocol::from_str(proto_str).map(|p| (p, rest)))
-            .unwrap_or_else(|| {
-                log_error!(
-                    "{flag} must be UDP:<ip>:<port> or ICMP:<ip>:<id> (UDP :0 = ephemeral local bind on --here; ICMP :0 = wildcard listener on --here or dynamic local source id on --there) (got '{s}')"
-                );
-                print_usage_and_exit(2)
-            })
-    }
-
     // Generic number parser with good errors.
     fn parse_num<T>(s: &str, flag: &str) -> T
     where
@@ -294,20 +370,43 @@ pub fn parse_args() -> RequestedConfig {
 
     // Address helpers.
     fn parse_here(s: &str) -> (String, CanonicalAddr, SupportedProtocol, ListenMode) {
-        let (proto, addr_str) = split_proto(s, "--here");
+        let (proto, addr_str) = parse_proto_and_rest(s, "--here").unwrap_or_else(|msg| {
+            log_error!("{msg}");
+            print_usage_and_exit(2)
+        });
 
-        let (_host_port, id_part) = match addr_str.rsplit_once(':') {
-            Some((h, p)) => (h, p),
-            _ => (addr_str, "0"),
-        };
-        let mode = if id_part == "0" {
-            ListenMode::Dynamic
-        } else {
-            ListenMode::Fixed
+        let (resolve_arg, mode) = match proto {
+            SupportedProtocol::UDP => {
+                let id_part = addr_str.rsplit_once(':').map_or("0", |(_, p)| p);
+                let mode = if id_part == "0" {
+                    ListenMode::Dynamic
+                } else {
+                    ListenMode::Fixed
+                };
+                (addr_str.to_string(), mode)
+            }
+            SupportedProtocol::ICMP => {
+                let parsed =
+                    parse_icmp_cli_target(addr_str, "--here", false).unwrap_or_else(|msg| {
+                        log_error!("{msg}");
+                        print_usage_and_exit(2)
+                    });
+                let mode = if parsed.resolve_arg.ends_with(":0") {
+                    ListenMode::Dynamic
+                } else {
+                    ListenMode::Fixed
+                };
+                (parsed.resolve_arg, mode)
+            }
         };
 
-        match resolve_first(addr_str) {
-            Ok(sa) => (sa.to_string(), CanonicalAddr::from_socket_addr(sa), proto, mode),
+        match resolve_first(&resolve_arg) {
+            Ok(sa) => (
+                sa.to_string(),
+                CanonicalAddr::from_socket_addr(sa),
+                proto,
+                mode,
+            ),
             Err(e) => {
                 log_error!(
                     "--here: failed to parse and resolve host:port or ip:port (got '{s}'): {e}"
@@ -317,33 +416,24 @@ pub fn parse_args() -> RequestedConfig {
         }
     }
     fn validate_there(s: &str) -> (String, CanonicalAddr, u16, SupportedProtocol) {
-        let (proto, addr_str) = split_proto(s, "--there");
+        let (proto, addr_str) = parse_proto_and_rest(s, "--there").unwrap_or_else(|msg| {
+            log_error!("{msg}");
+            print_usage_and_exit(2)
+        });
 
-        // Support ICMP:host:remote_id:local_id
-        let (final_addr_str, local_id) = if proto == SupportedProtocol::ICMP {
-            // Heuristic to separate the IP/host part from the numeric ICMP IDs.
-            // IPv6 addresses like [::1]:1234 are split into many parts.
-            let mut found_local_id = 0;
-            let mut final_addr = addr_str;
-
-            if let Some((rest, last)) = addr_str.rsplit_once(':') {
-                if let Ok(id) = last.parse::<u16>() {
-                    // One numeric part found. Is there another one before it?
-                    if let Some((_base, mid)) = rest.rsplit_once(':') {
-                        if let Ok(_remote_id) = mid.parse::<u16>() {
-                            // Yes, matches <ip>:<remote_id>:<local_id>
-                            found_local_id = id;
-                            final_addr = rest;
-                        }
-                    }
-                }
+        let (resolve_arg, local_id) = match proto {
+            SupportedProtocol::UDP => (addr_str.to_string(), 0),
+            SupportedProtocol::ICMP => {
+                let parsed =
+                    parse_icmp_cli_target(addr_str, "--there", true).unwrap_or_else(|msg| {
+                        log_error!("{msg}");
+                        print_usage_and_exit(2)
+                    });
+                (parsed.resolve_arg, parsed.local_id)
             }
-            (final_addr, found_local_id)
-        } else {
-            (addr_str, 0)
         };
 
-        match resolve_first(final_addr_str) {
+        match resolve_first(&resolve_arg) {
             Ok(sa) => (
                 sa.to_string(),
                 CanonicalAddr::from_socket_addr(sa),
@@ -373,7 +463,6 @@ pub fn parse_args() -> RequestedConfig {
     // Required
     let mut listen_opt: Option<(String, CanonicalAddr, SupportedProtocol, ListenMode)> = None;
     let mut upstream_opt: Option<(String, CanonicalAddr, u16, SupportedProtocol)> = None;
-
 
     // Optional (track presence to reject duplicates cleanly)
     let mut timeout_secs: Option<u64> = None;
@@ -612,8 +701,8 @@ pub fn parse_args() -> RequestedConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DebugBehavior, DebugLogs, ListenMode, RequestedConfig, ReresolveMode, SupportedProtocol,
-        TimeoutAction, WorkerFlowMode, realize_config,
+        DebugBehavior, DebugLogs, ListenMode, ParsedIcmpCliTarget, RequestedConfig, ReresolveMode,
+        SupportedProtocol, TimeoutAction, WorkerFlowMode, parse_icmp_cli_target, realize_config,
     };
     use crate::net::params::CanonicalAddr;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -709,5 +798,33 @@ mod tests {
         let runtime = realize_config(requested, listen).expect("wildcard listener must realize");
         assert_eq!(runtime.listen.id, 7777);
         assert_eq!(runtime.listen_mode, ListenMode::Dynamic);
+    }
+
+    #[test]
+    fn parse_icmp_cli_target_accepts_bracketed_ipv6_remote_and_local_ids() {
+        assert_eq!(
+            parse_icmp_cli_target("[::1]:2002:1001", "--there", true).unwrap(),
+            ParsedIcmpCliTarget {
+                resolve_arg: String::from("[::1]:2002"),
+                local_id: 1001,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_icmp_cli_target_accepts_bracketed_ipv6_single_id() {
+        assert_eq!(
+            parse_icmp_cli_target("[::1]:1234", "--there", true).unwrap(),
+            ParsedIcmpCliTarget {
+                resolve_arg: String::from("[::1]:1234"),
+                local_id: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_icmp_cli_target_rejects_bare_ipv6_without_brackets() {
+        let err = parse_icmp_cli_target("::1:1234", "--there", true).unwrap_err();
+        assert!(err.contains("must use brackets"), "unexpected error: {err}");
     }
 }

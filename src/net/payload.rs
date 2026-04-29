@@ -304,6 +304,26 @@ pub(crate) fn validate_payload<'a>(
     Ok(decoded_event)
 }
 
+#[inline]
+pub(crate) fn source_id_shim_for_c2u(
+    event: &PayloadEvent<'_>,
+    had_prior_icmp_send: bool,
+    upstream_local_id: u16,
+) -> Option<u16> {
+    let wire = event.wire();
+    if had_prior_icmp_send || !event.is_user_data() || wire.dst_proto != SupportedProtocol::ICMP {
+        return None;
+    }
+
+    let source_id = if wire.src_is_icmp {
+        wire.src_ident
+    } else {
+        upstream_local_id
+    };
+
+    (source_id != 0).then_some(source_id)
+}
+
 pub(crate) fn send_payload(
     sock: &Socket,
     sock_connected: bool,
@@ -324,7 +344,12 @@ pub(crate) fn send_payload(
                     | (((wire.len() != 0) as u8) * ICMP_SHIM_HAS_PAYLOAD)
                     | ICMP_SHIM_HAS_SOURCE_ID
             }
-            PayloadEvent::SyncKeepalive(_) => ICMP_SHIM_HAS_SOURCE_ID,
+            PayloadEvent::SyncKeepalive(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot encode source ID shim on ICMP keepalive",
+                ));
+            }
         };
         let idb = src_id.to_be_bytes();
         shim_storage[0] = base;
@@ -749,8 +774,7 @@ mod tests {
             IcmpIdPolicy::Exact(0x1111),
             PayloadOrigin::Wire,
             false,
-            )
-;
+        );
         assert!(res.is_err(), "exact policy should reject mismatching ID");
         assert!(
             res.unwrap_err().to_string().contains("identity mismatch"),
@@ -820,8 +844,7 @@ mod tests {
                     IcmpIdPolicy::Exact(cfg.listen.id),
                     PayloadOrigin::Wire,
                     false,
-                    )
-
+                )
                 .is_err(),
                 "shim {:02X} should be rejected",
                 bad.get(8).cloned().unwrap_or(0xFF)
@@ -961,10 +984,11 @@ mod tests {
             true,
         );
         assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .to_string()
-            .contains("already locked session"));
+        assert!(
+            res.unwrap_err()
+                .to_string()
+                .contains("already locked session")
+        );
 
         // 3. Reject Echo Reply
         buf[0] = 0; // Type 0 = Echo Reply
@@ -985,7 +1009,7 @@ mod tests {
 
         // 4. Reject Keepalive
         // Handshake bit 0x20 is set, but IS_DATA (0x80) is NOT set.
-        let buf_ka = encode_icmp_payload(Some(ICMP_SHIM_HAS_SOURCE_ID), &[]);
+        let _buf_ka = encode_icmp_payload(Some(ICMP_SHIM_HAS_SOURCE_ID), &[]);
         let mut buf_ka_full = [0u8; 11];
         buf_ka_full[..8].copy_from_slice(&[8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
         buf_ka_full[8] = ICMP_SHIM_HAS_SOURCE_ID;
@@ -1004,5 +1028,51 @@ mod tests {
         );
         assert!(res.is_err(), "should reject Source ID on Keepalive");
         assert!(res.unwrap_err().to_string().contains("on Keepalive packet"));
+    }
+
+    #[test]
+    fn source_id_shim_for_c2u_uses_upstream_local_id_for_udp_sources() {
+        let event = PayloadEvent::UserData(WirePayload {
+            src_is_icmp: false,
+            src_ident: 0,
+            src_seq: 0,
+            dst_proto: SupportedProtocol::ICMP,
+            payload: b"abc",
+            pub_len: 3,
+            src_id_from_shim: None,
+        });
+
+        assert_eq!(source_id_shim_for_c2u(&event, false, 4321), Some(4321));
+        assert_eq!(source_id_shim_for_c2u(&event, true, 4321), None);
+    }
+
+    #[test]
+    fn source_id_shim_for_c2u_propagates_logical_icmp_source_id() {
+        let event = PayloadEvent::UserData(WirePayload {
+            src_is_icmp: true,
+            src_ident: 2002,
+            src_seq: 9,
+            dst_proto: SupportedProtocol::ICMP,
+            payload: b"abc",
+            pub_len: 3,
+            src_id_from_shim: Some(2002),
+        });
+
+        assert_eq!(source_id_shim_for_c2u(&event, false, 9999), Some(2002));
+    }
+
+    #[test]
+    fn source_id_shim_for_c2u_never_emits_for_keepalive() {
+        let event = PayloadEvent::SyncKeepalive(WirePayload {
+            src_is_icmp: true,
+            src_ident: 2002,
+            src_seq: 9,
+            dst_proto: SupportedProtocol::ICMP,
+            payload: &[],
+            pub_len: 0,
+            src_id_from_shim: Some(2002),
+        });
+
+        assert_eq!(source_id_shim_for_c2u(&event, false, 9999), None);
     }
 }

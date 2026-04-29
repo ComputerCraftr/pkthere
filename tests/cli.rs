@@ -11,7 +11,7 @@ use crate::common::{assert_cli_rejects, assert_cli_runs, render_app_bin_path};
 use crate::common::{run_cli_args_expect_running_with_stdout, run_cli_args_with_stdout};
 use crate::orchestrator::{
     IpFamily, NODE1_IPV4_STR, default_test_icmp_upstream_arg, default_test_upstream_arg,
-    localhost_addr,
+    localhost_addr, render_icmp_arg,
 };
 use std::time::Duration;
 
@@ -471,7 +471,7 @@ fn rejects_max_payload_too_large() {
 #[test]
 fn rejects_max_payload_exceeding_icmp_tunnel_limit() {
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = format!("ICMP:{}:1234", localhost_addr(IpFamily::V4, 0).ip());
+    let there = render_icmp_arg(localhost_addr(IpFamily::V4, 0).ip(), 1234);
     assert_cli_rejects(
         &["--here", &here, "--there", &there, "--max-payload", "65507"],
         &["exceeds the maximum supported by the selected protocols and address families (65506)"],
@@ -492,7 +492,7 @@ fn runs_with_max_payload_for_pure_ipv6() {
 #[test]
 fn rejects_max_payload_for_mixed_ipv4_ipv6() {
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = format!("ICMP:{}:1234", localhost_addr(IpFamily::V6, 0).ip());
+    let there = render_icmp_arg(localhost_addr(IpFamily::V6, 0).ip(), 1234);
     assert_cli_rejects(
         &["--here", &here, "--there", &there, "--max-payload", "65526"],
         &["exceeds the maximum supported by the selected protocols and address families (65506)"],
@@ -502,7 +502,7 @@ fn rejects_max_payload_for_mixed_ipv4_ipv6() {
 #[test]
 fn rejects_duplicate_icmp_sync_pps() {
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = format!("ICMP:{}:2222", localhost_addr(IpFamily::V4, 0).ip());
+    let there = render_icmp_arg(localhost_addr(IpFamily::V4, 0).ip(), 2222);
     assert_cli_rejects(
         &[
             "--here",
@@ -515,6 +515,24 @@ fn rejects_duplicate_icmp_sync_pps() {
             "20",
         ],
         &["--icmp-sync-pps specified multiple times"],
+    );
+}
+
+#[test]
+fn rejects_bare_ipv6_icmp_upstream_without_brackets() {
+    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V6, 0));
+    assert_cli_rejects(
+        &["--here", &here, "--there", "ICMP:::1:1234"],
+        &["ICMP IPv6 addresses must use brackets"],
+    );
+}
+
+#[test]
+fn rejects_malformed_bracketed_ipv6_icmp_with_extra_segment() {
+    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V6, 0));
+    assert_cli_rejects(
+        &["--here", &here, "--there", "ICMP:[::1]:1:2:3"],
+        &["must use ICMP:<host>:<remote_id> or ICMP:[<ipv6>]:<remote_id>[:<local_id>]"],
     );
 }
 

@@ -53,14 +53,35 @@ pub fn localhost_addr(family: IpFamily, port: u16) -> SocketAddr {
 
 pub fn default_test_upstream_arg(proto: &str, addr: SocketAddr) -> String {
     if proto.eq_ignore_ascii_case("icmp") {
-        format!("ICMP:{}:0", addr.ip())
+        render_icmp_arg(addr.ip(), 0)
     } else {
         format!("{proto}:{addr}")
     }
 }
 
 pub fn default_test_icmp_upstream_arg(ip: IpAddr) -> String {
-    format!("ICMP:{ip}:0")
+    render_icmp_arg(ip, 0)
+}
+
+pub fn render_icmp_arg(ip: IpAddr, remote_id: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("ICMP:{ip}:{remote_id}"),
+        IpAddr::V6(ip) => format!("ICMP:[{ip}]:{remote_id}"),
+    }
+}
+
+pub fn render_icmp_arg_with_local(ip: IpAddr, remote_id: u16, local_id: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("ICMP:{ip}:{remote_id}:{local_id}"),
+        IpAddr::V6(ip) => format!("ICMP:[{ip}]:{remote_id}:{local_id}"),
+    }
+}
+
+pub fn render_canonical_ip_id(ip: IpAddr, id: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{id}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{id}"),
+    }
 }
 
 fn spawn_udp_echo_server_impl(
@@ -107,8 +128,9 @@ pub fn spawn_udp_echo_server(family: IpFamily) -> io::Result<(SocketAddr, thread
 mod tests {
     use super::{
         IpFamily, default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
+        render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
     };
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv6Addr};
 
     #[test]
     fn default_test_upstream_arg_uses_dynamic_icmp_id() {
@@ -133,6 +155,22 @@ mod tests {
         assert_eq!(
             default_test_icmp_upstream_arg(IpAddr::V4(super::NODE1_IPV4)),
             format!("ICMP:{}:0", super::NODE1_IPV4_STR)
+        );
+    }
+
+    #[test]
+    fn render_icmp_arg_brackets_ipv6() {
+        assert_eq!(
+            render_icmp_arg(IpAddr::V6(Ipv6Addr::LOCALHOST), 1234),
+            "ICMP:[::1]:1234"
+        );
+        assert_eq!(
+            render_icmp_arg_with_local(IpAddr::V6(Ipv6Addr::LOCALHOST), 2002, 1001),
+            "ICMP:[::1]:2002:1001"
+        );
+        assert_eq!(
+            render_canonical_ip_id(IpAddr::V6(Ipv6Addr::LOCALHOST), 77),
+            "[::1]:77"
         );
     }
 }

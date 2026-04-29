@@ -49,7 +49,10 @@ impl CanonicalAddr {
 
 impl fmt::Display for CanonicalAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.addr.ip(), self.id)
+        match self.addr {
+            SocketAddr::V4(addr) => write!(f, "{}:{}", addr.ip(), self.id),
+            SocketAddr::V6(addr) => write!(f, "[{}]:{}", addr.ip(), self.id),
+        }
     }
 }
 
@@ -88,5 +91,20 @@ mod tests {
             canonical.as_sock_addr().as_socket().expect("sockaddr"),
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 3333, 7, 9))
         );
+    }
+
+    #[test]
+    fn display_formats_ipv4_and_ipv6_canonical_addrs_unambiguously() {
+        let v4 = CanonicalAddr::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1111)),
+            2222,
+        );
+        let v6 = CanonicalAddr::new(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1111, 0, 0)),
+            3333,
+        );
+
+        assert_eq!(v4.to_string(), "127.0.0.1:2222");
+        assert_eq!(v6.to_string(), "[::1]:3333");
     }
 }

@@ -4,7 +4,8 @@ use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::params::CanonicalAddr;
 use crate::net::payload::{
-    IcmpIdPolicy, PayloadEvent, PayloadOrigin, send_payload, validate_payload,
+    IcmpIdPolicy, PayloadEvent, PayloadOrigin, send_payload, source_id_shim_for_c2u,
+    validate_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketManager;
@@ -326,6 +327,11 @@ pub fn run_client_to_upstream_thread(
                         synthetic_event
                     };
                     let wire = event.wire();
+                    let source_id_for_shim = source_id_shim_for_c2u(
+                        &event,
+                        sync_cache.latest_valid,
+                        handles.upstream_local.id,
+                    );
                     let send_res = send_payload(
                         &handles.upstream_sock,
                         handles.upstream_connected,
@@ -335,11 +341,7 @@ pub fn run_client_to_upstream_thread(
                         cache.route.icmp_header_id,
                         C2U,
                         prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
-                        if !sync_cache.latest_valid {
-                            Some(handles.upstream_local.id)
-                        } else {
-                            None
-                        },
+                        source_id_for_shim,
                     );
                     handle_send_result(
                         C2U,
@@ -455,6 +457,11 @@ pub fn run_client_to_upstream_thread(
                                 if wire.src_is_icmp {
                                     remember_request_seq(sync_state, &mut sync_cache, &wire);
                                 }
+                                let source_id_for_shim = source_id_shim_for_c2u(
+                                    &event,
+                                    sync_cache.latest_valid,
+                                    handles.upstream_local.id,
+                                );
                                 let send_res = send_payload(
                                     &handles.upstream_sock,
                                     handles.upstream_connected,
@@ -464,11 +471,7 @@ pub fn run_client_to_upstream_thread(
                                     cache.route.icmp_header_id,
                                     C2U,
                                     prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
-                                    if !sync_cache.latest_valid {
-                                        Some(handles.upstream_local.id)
-                                    } else {
-                                        None
-                                    },
+                                    source_id_for_shim,
                                 );
 
                                 handle_send_result(
@@ -548,6 +551,11 @@ pub fn run_client_to_upstream_thread(
                         synthetic_event
                     };
                     let wire = event.wire();
+                    let source_id_for_shim = source_id_shim_for_c2u(
+                        &event,
+                        sync_cache.latest_valid,
+                        handles.upstream_local.id,
+                    );
                     let send_res = send_payload(
                         &handles.upstream_sock,
                         handles.upstream_connected,
@@ -557,11 +565,7 @@ pub fn run_client_to_upstream_thread(
                         cache.route.icmp_header_id,
                         C2U,
                         prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
-                        if !sync_cache.latest_valid {
-                            Some(handles.upstream_local.id)
-                        } else {
-                            None
-                        },
+                        source_id_for_shim,
                     );
                     handle_send_result(
                         C2U,
@@ -762,6 +766,11 @@ pub fn run_client_to_upstream_thread(
                                 if wire.src_is_icmp {
                                     remember_request_seq(sync_state, &mut sync_cache, &wire);
                                 }
+                                let source_id_for_shim = source_id_shim_for_c2u(
+                                    &event,
+                                    sync_cache.latest_valid,
+                                    handles.upstream_local.id,
+                                );
                                 let send_res = send_payload(
                                     &handles.upstream_sock,
                                     handles.upstream_connected,
@@ -771,11 +780,7 @@ pub fn run_client_to_upstream_thread(
                                     cache.route.icmp_header_id,
                                     C2U,
                                     prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
-                                    if !sync_cache.latest_valid {
-                                        Some(handles.upstream_local.id)
-                                    } else {
-                                        None
-                                    },
+                                    source_id_for_shim,
                                 );
                                 handle_send_result(
                                     C2U,
@@ -835,6 +840,11 @@ pub fn run_client_to_upstream_thread(
                                 if wire.src_is_icmp {
                                     remember_request_seq(sync_state, &mut sync_cache, &wire);
                                 }
+                                let source_id_for_shim = source_id_shim_for_c2u(
+                                    &event,
+                                    sync_cache.latest_valid,
+                                    handles.upstream_local.id,
+                                );
                                 let send_res = send_payload(
                                     &handles.upstream_sock,
                                     handles.upstream_connected,
@@ -844,11 +854,7 @@ pub fn run_client_to_upstream_thread(
                                     cache.route.icmp_header_id,
                                     C2U,
                                     prepare_send(C2U, &wire, true, sync_state, &mut sync_cache),
-                                    if !sync_cache.latest_valid {
-                                        Some(handles.upstream_local.id)
-                                    } else {
-                                        None
-                                    },
+                                    source_id_for_shim,
                                 );
                                 handle_send_result(
                                     C2U,
