@@ -14,7 +14,7 @@ mod timing;
 pub mod user_policy;
 
 pub use forwarder::{
-    ForwarderConfig, SocketMode, launch_forwarder, try_launch_forwarder,
+    ForwarderConfig, SocketMode, collect_forwarder_output, launch_forwarder, try_launch_forwarder,
     wait_for_child_exit_success,
 };
 pub use matrix::{

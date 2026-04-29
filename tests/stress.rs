@@ -42,6 +42,8 @@ fn stress_test_ipv4_case(proto: &str) {
         fast_stats: false,
         stats_interval_mins: Some(1),
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_sock

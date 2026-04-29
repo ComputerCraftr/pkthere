@@ -8,10 +8,10 @@ use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
     CLIENT_WAIT_MS, DRAIN_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS,
     MAX_WAIT_SECS, MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES,
-    SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client, default_test_icmp_upstream_arg,
-    expect_no_echo, json_addr, launch_forwarder, localhost_addr, random_unprivileged_port,
-    render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local, run_matrix_cases,
-    send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
+    SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client, collect_forwarder_output,
+    default_test_icmp_upstream_arg, expect_no_echo, json_addr, launch_forwarder, localhost_addr,
+    random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
+    run_matrix_cases, send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
     wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_match_or_last,
     wait_for_stats_matching,
 };
@@ -33,6 +33,8 @@ fn locked_worker_flow<'a>(stats: &'a serde_json::Value) -> &'a serde_json::Value
         .expect("expected at least one worker flow entry")
 }
 
+const DEBUG_TRACE_LOGS: &[&str] = &["packets", "drops", "handles"];
+
 #[test]
 #[cfg_attr(
     not(supports_kernel_icmp_echo),
@@ -53,6 +55,8 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: Some(5),
+        debug_logs: &[],
+        capture_stderr: false,
     });
     client_sock
         .connect(session.listen_addr)
@@ -117,6 +121,8 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: Some(2),
+        debug_logs: &[],
+        capture_stderr: false,
     });
     client_sock
         .connect(session.listen_addr)
@@ -220,6 +226,8 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
     client_sock
         .connect(session.listen_addr)
@@ -274,6 +282,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     })
     .expect("could not launch ICMP endpoint node on raw-capable host");
 
@@ -288,6 +298,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: Some(5),
+        debug_logs: &[],
+        capture_stderr: false,
     })
     .expect("could not launch pure ICMP middle node");
 
@@ -301,6 +313,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: Some(5),
+        debug_logs: &[],
+        capture_stderr: false,
     });
     client_sock
         .connect(node1.listen_addr)
@@ -377,6 +391,104 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 }
 
 #[test]
+#[ignore = "manual debug trace; run with -- --nocapture and inspect printed node logs"]
+fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
+    crate::orchestrator::require_raw_icmp_supported()
+        .expect("ICMP multihop debug test was enabled, but runtime raw ICMP capability is missing");
+
+    let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
+    let (udp_up_addr, _udp_up_thread) = IpFamily::V4
+        .spawn_echo()
+        .expect("IPv4 loopback upstream bind");
+    let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
+
+    let node3_ip = NODE3_IPV4;
+    let mut node3 = try_launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: default_test_icmp_upstream_arg(node3_ip.into()),
+        there: format!("UDP:{udp_up_addr}"),
+        timeout_action: "exit",
+        timeout_secs: Some(6),
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+        debug_logs: DEBUG_TRACE_LOGS,
+        capture_stderr: true,
+    })
+    .expect("could not launch ICMP endpoint node on raw-capable host");
+
+    let node2_ip = NODE2_IPV4_STR;
+    let mut node2 = try_launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
+        there: default_test_icmp_upstream_arg(node3_ip.into()),
+        timeout_action: "exit",
+        timeout_secs: Some(6),
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: Some(5),
+        debug_logs: DEBUG_TRACE_LOGS,
+        capture_stderr: true,
+    })
+    .expect("could not launch pure ICMP middle node");
+
+    let mut node1 = launch_forwarder(ForwarderConfig {
+        mode: crate::orchestrator::SocketMode::Connected,
+        here: IpFamily::V4.listen_arg().to_string(),
+        there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
+        timeout_action: "exit",
+        timeout_secs: Some(6),
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: Some(5),
+        debug_logs: DEBUG_TRACE_LOGS,
+        capture_stderr: true,
+    });
+    client_sock
+        .connect(node1.listen_addr)
+        .expect("connect client to first forwarder");
+
+    let payload = b"multihop-icmp-bridge";
+    client_sock.send(payload).expect("send multihop payload");
+    let mut buf = [0u8; 2048];
+    let first_reply = client_sock.recv(&mut buf).expect("recv multihop reply");
+    assert_eq!(&buf[..first_reply], payload);
+
+    client_sock
+        .send(&[])
+        .expect("send zero-length multihop payload");
+    client_sock
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set read timeout");
+    let zero_reply = client_sock.recv(&mut buf);
+
+    wait_for_child_exit_success(&mut node1.child, Duration::from_secs(10));
+    wait_for_child_exit_success(&mut node2.child, Duration::from_secs(10));
+    wait_for_child_exit_success(&mut node3.child, Duration::from_secs(10));
+
+    let (node1_stdout, node1_stderr) =
+        collect_forwarder_output(&mut node1).expect("collect node1 output");
+    let (node2_stdout, node2_stderr) =
+        collect_forwarder_output(&mut node2).expect("collect node2 output");
+    let (node3_stdout, node3_stderr) =
+        collect_forwarder_output(&mut node3).expect("collect node3 output");
+
+    println!("=== zero-length recv result ===");
+    println!("{zero_reply:?}");
+    println!("=== node1 stdout ===\n{node1_stdout}");
+    println!("=== node1 stderr ===\n{node1_stderr}");
+    println!("=== node2 stdout ===\n{node2_stdout}");
+    println!("=== node2 stderr ===\n{node2_stderr}");
+    println!("=== node3 stdout ===\n{node3_stdout}");
+    println!("=== node3 stderr ===\n{node3_stderr}");
+
+    panic!("debug trace complete; inspect per-node logs above");
+}
+
+#[test]
 fn enforce_max_payload() {
     for (family, max_payload, recv_buf_len) in [
         (IpFamily::V4, 0usize, 2048usize),
@@ -409,6 +521,8 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         fast_stats: false,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_sock.connect(session.listen_addr).expect(&format!(
@@ -510,6 +624,8 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         fast_stats: false,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_sock.connect(session.listen_addr).expect(&format!(
@@ -637,6 +753,8 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_a
@@ -743,6 +861,8 @@ fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>)
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_a
@@ -822,6 +942,8 @@ fn unconnected_udp_listener_rejects_payloads_from_wrong_port_case(case: MatrixCa
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_a
@@ -912,6 +1034,8 @@ fn test_raw_icmp_independent_ids() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     // Node B: ICMP:2002 -> ICMP:1001 (to Node C) (on addr_b)
@@ -926,6 +1050,8 @@ fn test_raw_icmp_independent_ids() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     // Node A: UDP -> ICMP:2002 (to Node B)
@@ -939,6 +1065,8 @@ fn test_raw_icmp_independent_ids() {
         fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
+        debug_logs: &[],
+        capture_stderr: false,
     });
 
     client_sock

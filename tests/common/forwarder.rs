@@ -2,9 +2,9 @@ use crate::app_bin::find_app_bin;
 use crate::core::{ChildGuard, take_child_stdout, wait_for_listen_addr_from};
 use crate::orchestrator::{MAX_WAIT_SECS, TIMEOUT_SECS};
 
-use std::io;
+use std::io::{self, Read};
 use std::net::SocketAddr;
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,11 +24,14 @@ pub struct ForwarderConfig<'a> {
     pub fast_stats: bool,
     pub stats_interval_mins: Option<u32>,
     pub icmp_sync_pps: Option<u32>,
+    pub debug_logs: &'a [&'a str],
+    pub capture_stderr: bool,
 }
 
 pub struct ForwarderSession {
     pub child: ChildGuard,
     pub out: ChildStdout,
+    pub err: Option<ChildStderr>,
     pub listen_addr: SocketAddr,
 }
 
@@ -60,7 +63,11 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         .arg("--on-timeout")
         .arg(cfg.timeout_action)
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(if cfg.capture_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        });
 
     if let Some(max_payload) = cfg.max_payload {
         cmd.arg("--max-payload").arg(max_payload.to_string());
@@ -75,6 +82,9 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
     if cfg.fast_stats {
         cmd.arg("--debug-fast-stats");
     }
+    for debug_log in cfg.debug_logs {
+        cmd.arg("--debug-log").arg(debug_log);
+    }
 
     cfg.mode.apply(&mut cmd);
 
@@ -83,6 +93,7 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
     let mut child = ChildGuard::new(cmd.spawn()?);
     let mut out =
         take_child_stdout(&mut child).ok_or_else(|| io::Error::other("child stdout missing"))?;
+    let err = child.stderr.take();
     let Some(listen_addr) = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS) else {
         if let Some(status) = child.try_wait()? {
             return Err(io::Error::other(format!(
@@ -101,8 +112,21 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
     Ok(ForwarderSession {
         child,
         out,
+        err,
         listen_addr,
     })
+}
+
+pub fn collect_forwarder_output(session: &mut ForwarderSession) -> io::Result<(String, String)> {
+    let mut stdout = String::new();
+    session.out.read_to_string(&mut stdout)?;
+
+    let mut stderr = String::new();
+    if let Some(err) = session.err.as_mut() {
+        err.read_to_string(&mut stderr)?;
+    }
+
+    Ok((stdout, stderr))
 }
 
 pub fn wait_for_child_exit_success(child: &mut ChildGuard, max_wait: Duration) {
