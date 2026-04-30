@@ -7,13 +7,14 @@ mod orchestrator;
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
     CLIENT_WAIT_MS, DRAIN_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS,
-    MAX_WAIT_SECS, MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, SOCKET_MODES,
-    SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client, collect_forwarder_output,
-    default_test_icmp_upstream_arg, expect_no_echo, json_addr, launch_forwarder, localhost_addr,
-    random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
-    run_matrix_cases, send_until_locked, spawn_upstream_echo_or_skip, try_launch_forwarder,
-    wait_for_child_exit_success, wait_for_locked_client_from, wait_for_stats_match_or_last,
-    wait_for_stats_matching,
+    MAX_WAIT_SECS, MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, OutputCapture,
+    SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client,
+    collect_forwarder_output, default_test_icmp_upstream_arg, expect_no_echo, json_addr,
+    launch_forwarder, localhost_addr, random_unprivileged_port, render_canonical_ip_id,
+    render_icmp_arg, render_icmp_arg_with_local, run_matrix_cases, send_until_locked,
+    snapshot_forwarder_output, spawn_upstream_echo_or_skip, terminate_forwarder,
+    try_launch_forwarder, wait_for_child_exit_success, wait_for_locked_client_from,
+    wait_for_stats_match_or_last, wait_for_stats_matching,
 };
 
 use std::io::ErrorKind;
@@ -34,6 +35,42 @@ fn locked_worker_flow<'a>(stats: &'a serde_json::Value) -> &'a serde_json::Value
 }
 
 const DEBUG_TRACE_LOGS: &[&str] = &["packets", "drops", "handles"];
+
+fn finalize_debug_forwarder_output(
+    name: &str,
+    session: &mut crate::orchestrator::forwarder::ForwarderSession,
+) -> (String, String) {
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < give_up {
+        match session.child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("wait error for {name}: {e}"),
+        }
+    }
+
+    if session
+        .child
+        .try_wait()
+        .expect("wait error while finalizing debug forwarder")
+        .is_none()
+    {
+        terminate_forwarder(session);
+    }
+
+    collect_forwarder_output(session).unwrap_or_else(|e| {
+        let snapshot = snapshot_forwarder_output(session).unwrap_or_else(|_| {
+            (
+                format!("<failed to collect stdout for {name}: {e}>"),
+                String::new(),
+            )
+        });
+        panic!(
+            "failed to collect {name} output cleanly: {e}\n=== partial stdout ===\n{}\n=== partial stderr ===\n{}",
+            snapshot.0, snapshot.1
+        );
+    })
+}
 
 #[test]
 #[cfg_attr(
@@ -57,6 +94,7 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
         icmp_sync_pps: Some(5),
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
     client_sock
         .connect(session.listen_addr)
@@ -123,6 +161,7 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
         icmp_sync_pps: Some(2),
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
     client_sock
         .connect(session.listen_addr)
@@ -228,6 +267,7 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
     client_sock
         .connect(session.listen_addr)
@@ -284,6 +324,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     })
     .expect("could not launch ICMP endpoint node on raw-capable host");
 
@@ -300,6 +341,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         icmp_sync_pps: Some(5),
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     })
     .expect("could not launch pure ICMP middle node");
 
@@ -315,6 +357,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         icmp_sync_pps: Some(5),
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
     client_sock
         .connect(node1.listen_addr)
@@ -392,7 +435,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 
 #[test]
 #[ignore = "manual debug trace; run with -- --nocapture and inspect printed node logs"]
-fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
+fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop debug test was enabled, but runtime raw ICMP capability is missing");
 
@@ -415,6 +458,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
         icmp_sync_pps: None,
         debug_logs: DEBUG_TRACE_LOGS,
         capture_stderr: true,
+        capture_mode: OutputCapture::Buffered,
     })
     .expect("could not launch ICMP endpoint node on raw-capable host");
 
@@ -431,6 +475,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
         icmp_sync_pps: Some(5),
         debug_logs: DEBUG_TRACE_LOGS,
         capture_stderr: true,
+        capture_mode: OutputCapture::Buffered,
     })
     .expect("could not launch pure ICMP middle node");
 
@@ -446,6 +491,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
         icmp_sync_pps: Some(5),
         debug_logs: DEBUG_TRACE_LOGS,
         capture_stderr: true,
+        capture_mode: OutputCapture::Buffered,
     });
     client_sock
         .connect(node1.listen_addr)
@@ -465,16 +511,9 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
         .expect("set read timeout");
     let zero_reply = client_sock.recv(&mut buf);
 
-    wait_for_child_exit_success(&mut node1.child, Duration::from_secs(10));
-    wait_for_child_exit_success(&mut node2.child, Duration::from_secs(10));
-    wait_for_child_exit_success(&mut node3.child, Duration::from_secs(10));
-
-    let (node1_stdout, node1_stderr) =
-        collect_forwarder_output(&mut node1).expect("collect node1 output");
-    let (node2_stdout, node2_stderr) =
-        collect_forwarder_output(&mut node2).expect("collect node2 output");
-    let (node3_stdout, node3_stderr) =
-        collect_forwarder_output(&mut node3).expect("collect node3 output");
+    let (node1_stdout, node1_stderr) = finalize_debug_forwarder_output("node1", &mut node1);
+    let (node2_stdout, node2_stderr) = finalize_debug_forwarder_output("node2", &mut node2);
+    let (node3_stdout, node3_stderr) = finalize_debug_forwarder_output("node3", &mut node3);
 
     println!("=== zero-length recv result ===");
     println!("{zero_reply:?}");
@@ -484,8 +523,6 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace() {
     println!("=== node2 stderr ===\n{node2_stderr}");
     println!("=== node3 stdout ===\n{node3_stdout}");
     println!("=== node3 stderr ===\n{node3_stderr}");
-
-    panic!("debug trace complete; inspect per-node logs above");
 }
 
 #[test]
@@ -523,6 +560,7 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_sock.connect(session.listen_addr).expect(&format!(
@@ -626,6 +664,7 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_sock.connect(session.listen_addr).expect(&format!(
@@ -755,6 +794,7 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_a
@@ -863,6 +903,7 @@ fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>)
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_a
@@ -944,6 +985,7 @@ fn unconnected_udp_listener_rejects_payloads_from_wrong_port_case(case: MatrixCa
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_a
@@ -1036,6 +1078,7 @@ fn test_raw_icmp_independent_ids() {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     // Node B: ICMP:2002 -> ICMP:1001 (to Node C) (on addr_b)
@@ -1052,6 +1095,7 @@ fn test_raw_icmp_independent_ids() {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     // Node A: UDP -> ICMP:2002 (to Node B)
@@ -1067,6 +1111,7 @@ fn test_raw_icmp_independent_ids() {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_sock

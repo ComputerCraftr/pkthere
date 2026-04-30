@@ -3,7 +3,10 @@ use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::params::CanonicalAddr;
-use crate::net::payload::{PayloadEvent, WirePayload, send_payload};
+use crate::net::payload::{
+    IcmpPayloadMeta, OwnedPayloadData, PayloadData, PayloadEvent, outbound_payload_event,
+    send_payload,
+};
 use crate::net::session::handle_send_result;
 use crate::net::sock_mgr::SocketHandles;
 use crate::net::sync_icmp::{
@@ -13,56 +16,55 @@ use crate::net::sync_icmp::{
 use crate::stats::StatsSink;
 use std::time::Instant;
 
-pub(crate) struct BufferedSyncPayload {
-    src_is_icmp: bool,
-    src_ident: u16,
-    src_seq: u16,
-    dst_proto: SupportedProtocol,
-    payload: Vec<u8>,
+pub(crate) struct BufferedPayload {
+    data: OwnedPayloadData,
+    icmp: Option<IcmpPayloadMeta>,
 }
 
-impl BufferedSyncPayload {
+impl BufferedPayload {
     #[inline]
-    pub(crate) fn from_wire(wire: &WirePayload<'_>) -> Self {
+    pub(crate) fn from_event(event: &PayloadEvent<'_>) -> Self {
+        let (dst_proto, bytes, icmp) = match event {
+            PayloadEvent::UserPayload { data, icmp } => (data.dst_proto, data.bytes, *icmp),
+            _ => unreachable!("only user payloads are buffered for sync replay"),
+        };
         Self {
-            src_is_icmp: wire.src_is_icmp,
-            src_ident: wire.src_ident,
-            src_seq: wire.src_seq,
-            dst_proto: wire.dst_proto,
-            payload: wire.payload.to_vec(),
+            data: OwnedPayloadData {
+                dst_proto,
+                bytes: bytes.to_vec(),
+            },
+            icmp,
         }
     }
 
     #[inline]
     pub(crate) fn as_event(&self) -> PayloadEvent<'_> {
-        PayloadEvent::UserPayload(WirePayload {
-            src_is_icmp: self.src_is_icmp,
-            src_ident: self.src_ident,
-            src_seq: self.src_seq,
-            dst_proto: self.dst_proto,
-            payload: &self.payload,
-            pub_len: self.payload.len(),
-            src_id_from_shim: None,
-        })
+        PayloadEvent::UserPayload {
+            data: self.data.as_borrowed(),
+            icmp: self.icmp,
+        }
     }
 }
 
 pub(crate) enum BufferedSyncUpdate {
-    Replace(BufferedSyncPayload),
+    Replace(BufferedPayload),
     Keep,
 }
 
 #[inline]
 fn empty_icmp_reply_event(seq: u16) -> PayloadEvent<'static> {
-    PayloadEvent::SessionControl(WirePayload {
-        src_is_icmp: true,
-        src_ident: 0,
-        src_seq: seq,
-        dst_proto: SupportedProtocol::ICMP,
-        payload: &[],
-        pub_len: 0,
-        src_id_from_shim: None,
-    })
+    PayloadEvent::SessionControl {
+        data: PayloadData {
+            dst_proto: SupportedProtocol::ICMP,
+            bytes: &[],
+        },
+        icmp: IcmpPayloadMeta {
+            logical_src_ident: 0,
+            transport_src_ident: 0,
+            seq,
+            shim_src_ident: None,
+        },
+    }
 }
 
 #[inline]
@@ -75,19 +77,33 @@ fn send_local_session_control_reply(
     flow_state: &FlowRuntimeState,
     handles: &mut SocketHandles,
     route: &CachedSendRoute,
-    wire: &WirePayload<'_>,
+    event: &PayloadEvent<'_>,
 ) {
-    let reply_event = empty_icmp_reply_event(wire.src_seq);
+    let seq = match event {
+        PayloadEvent::SessionControl { icmp, .. } => icmp.seq,
+        _ => unreachable!("local session-control reply requires session-control event"),
+    };
+    let reply_event = empty_icmp_reply_event(seq);
+    let outbound =
+        match outbound_payload_event(&reply_event, route.icmp_header_id, false, Some(seq), None) {
+            Ok(outbound) => outbound,
+            Err(e) => {
+                log_debug_dir!(
+                    cfg.debug_logs.drops,
+                    worker_id,
+                    false,
+                    "session-control reply build error: {}",
+                    e
+                );
+                return;
+            }
+        };
     let send_res = send_payload(
         &handles.client_sock,
         handles.client_connected,
         handles.listen_sock_type,
         &route.dest_sa,
-        &reply_event,
-        route.icmp_header_id,
-        false,
-        Some(wire.src_seq),
-        None, // Local session-control replies never propose a Source ID
+        &outbound,
     );
     handle_send_result(
         false,
@@ -118,9 +134,9 @@ pub(crate) fn handle_c2u_session_control(
     sync_state: &SharedSyncIcmpState,
     sync_cache: &mut SyncIcmpCache,
     default_reply_route: Option<&CachedSendRoute>,
-    wire: &WirePayload<'_>,
+    event: &PayloadEvent<'_>,
 ) {
-    match classify_c2u_session_control(cfg, wire, sync_state, sync_cache) {
+    match classify_c2u_session_control(cfg, event, sync_state, sync_cache) {
         Ok(C2uSessionControlDecision::Consume) => {}
         Ok(C2uSessionControlDecision::ReplyLocally) => {
             let reply_route = default_reply_route.cloned().or_else(|| {
@@ -147,7 +163,7 @@ pub(crate) fn handle_c2u_session_control(
                     flow_state,
                     handles,
                     reply_route,
-                    wire,
+                    event,
                 );
             } else {
                 log_debug_dir!(
@@ -183,13 +199,16 @@ pub(crate) fn buffer_sync_event(
     event: PayloadEvent<'_>,
 ) -> BufferedSyncUpdate {
     match event {
-        PayloadEvent::UserPayload(wire) => {
-            if wire.src_is_icmp {
-                remember_request_seq(sync_state, sync_cache, &wire);
+        PayloadEvent::UserPayload { .. } => {
+            if let PayloadEvent::UserPayload {
+                icmp: Some(icmp), ..
+            } = event
+            {
+                remember_request_seq(sync_state, sync_cache, &icmp);
             }
-            BufferedSyncUpdate::Replace(BufferedSyncPayload::from_wire(&wire))
+            BufferedSyncUpdate::Replace(BufferedPayload::from_event(&event))
         }
-        PayloadEvent::SessionControl(wire) => {
+        PayloadEvent::SessionControl { .. } => {
             handle_c2u_session_control(
                 worker_id,
                 t_start,
@@ -201,7 +220,7 @@ pub(crate) fn buffer_sync_event(
                 sync_state,
                 sync_cache,
                 default_reply_route,
-                &wire,
+                &event,
             );
             BufferedSyncUpdate::Keep
         }
@@ -225,10 +244,10 @@ pub(crate) fn sync_session_on_lock_transition(
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferedSyncPayload, BufferedSyncUpdate};
+    use super::{BufferedPayload, BufferedSyncUpdate};
     use crate::cli::SupportedProtocol;
     use crate::net::params::CanonicalAddr;
-    use crate::net::payload::{PayloadEvent, WirePayload};
+    use crate::net::payload::PayloadEvent;
     use crate::net::sock_mgr::SocketHandles;
     use crate::worker_support::cache::CachedClientState;
     use socket2::{Socket, Type};
@@ -265,26 +284,25 @@ mod tests {
 
     #[test]
     fn buffered_sync_payload_round_trips_validated_user_data() {
-        let event = PayloadEvent::UserPayload(WirePayload {
-            src_is_icmp: true,
-            src_ident: 1234,
-            src_seq: 77,
-            dst_proto: SupportedProtocol::ICMP,
-            payload: b"payload",
-            pub_len: 7,
-            src_id_from_shim: None,
-        });
+        let event =
+            PayloadEvent::user_payload(1234, 1234, 77, SupportedProtocol::ICMP, b"payload", None);
 
-        let buffered = BufferedSyncPayload::from_wire(event.wire_payload().unwrap());
+        let buffered = BufferedPayload::from_event(&event);
         let replay = buffered.as_event();
-        let wire = replay.wire_payload().unwrap();
         assert!(replay.is_user_payload());
-        assert!(wire.src_is_icmp);
-        assert_eq!(wire.src_ident, 1234);
-        assert_eq!(wire.src_seq, 77);
-        assert_eq!(wire.dst_proto, SupportedProtocol::ICMP);
-        assert_eq!(wire.payload, b"payload");
-        assert_eq!(wire.len(), 7);
+        match replay {
+            PayloadEvent::UserPayload {
+                data,
+                icmp: Some(icmp),
+            } => {
+                assert_eq!(icmp.logical_src_ident, 1234);
+                assert_eq!(icmp.transport_src_ident, 1234);
+                assert_eq!(icmp.seq, 77);
+                assert_eq!(data.dst_proto, SupportedProtocol::ICMP);
+                assert_eq!(data.bytes, b"payload");
+            }
+            other => panic!("unexpected replay event: {other:?}"),
+        }
     }
 
     #[test]

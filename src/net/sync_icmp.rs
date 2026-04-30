@@ -1,5 +1,5 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::net::payload::{PayloadEvent, PayloadOrigin, WirePayload};
+use crate::net::payload::{IcmpPayloadMeta, PayloadEvent, PayloadOrigin};
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering as AtomOrdering};
@@ -165,15 +165,13 @@ pub(crate) fn reset_session(
 pub(crate) fn remember_request_seq(
     shared: &SharedSyncIcmpState,
     cache: &mut SyncIcmpCache,
-    wire: &WirePayload<'_>,
+    icmp: &IcmpPayloadMeta,
 ) {
-    if wire.src_is_icmp {
-        shared
-            .reply_icmp_seq
-            .0
-            .store(wire.src_seq, AtomOrdering::Relaxed);
-        cache.reply_icmp_seq = wire.src_seq;
-    }
+    shared
+        .reply_icmp_seq
+        .0
+        .store(icmp.seq, AtomOrdering::Relaxed);
+    cache.reply_icmp_seq = icmp.seq;
 }
 
 pub(crate) fn classify_u2c(
@@ -183,37 +181,37 @@ pub(crate) fn classify_u2c(
     shared: &SharedSyncIcmpState,
     cache: &mut SyncIcmpCache,
 ) -> io::Result<U2cDecision> {
-    if !event.src_is_icmp() {
-        return Ok(U2cDecision::ForwardPayload);
-    }
-    if event.is_cadence_packet() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "ICMP cadence packet arrived from wire (id={}, seq={})",
-                event.src_ident(),
-                event.src_seq()
-            ),
-        ));
-    }
-    let wire = event
-        .wire_payload()
-        .expect("non-cadence ICMP events must carry wire payload");
+    let icmp = match event {
+        PayloadEvent::UserPayload {
+            icmp: Some(icmp), ..
+        } => icmp,
+        PayloadEvent::UserPayload { icmp: None, .. } => return Ok(U2cDecision::ForwardPayload),
+        PayloadEvent::SessionControl { icmp, .. } => icmp,
+        PayloadEvent::CadencePacket { icmp } => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ICMP cadence packet arrived from wire (id={}, seq={})",
+                    icmp.logical_src_ident, icmp.seq
+                ),
+            ));
+        }
+    };
 
     // Always perform deduplication for ICMP to handle potential OS-level double-delivery
     // of loopback packets (observed on macOS with ICMP DGRAM sockets).
     // Use the SHARED generation for deduplication to ensure consistency across
     // multiple worker threads even during session resets.
     let shared_gen = shared.generation.0.load(AtomOrdering::Relaxed);
-    let stamp = pack_dedup_stamp(shared_gen, wire.src_seq);
-    let slot_idx = (wire.src_seq as usize) & (DEDUP_SLOT_COUNT - 1);
+    let stamp = pack_dedup_stamp(shared_gen, icmp.seq);
+    let slot_idx = (icmp.seq as usize) & (DEDUP_SLOT_COUNT - 1);
     let slot = &shared.dedup_slots[slot_idx].0;
     let mut prev = slot.load(AtomOrdering::Relaxed);
 
     log_debug!(
         cfg.debug_logs.packets,
         "[classify_u2c] seq={} stamp={:016x} slot_idx={} prev={:016x} shared_gen={}",
-        wire.src_seq,
+        icmp.seq,
         stamp,
         slot_idx,
         prev,
@@ -258,9 +256,9 @@ pub(crate) fn classify_u2c(
     }
 
     let latest_seq = cache.latest_sent_seq;
-    let lag = latest_seq.wrapping_sub(wire.src_seq) as usize;
+    let lag = latest_seq.wrapping_sub(icmp.seq) as usize;
     if lag > cache.catchup_window {
-        let ahead = wire.src_seq.wrapping_sub(latest_seq);
+        let ahead = icmp.seq.wrapping_sub(latest_seq);
         let msg = if ahead != 0 && ahead <= u16::MAX / 2 {
             "ICMP sync mode: future reply sequence"
         } else {
@@ -282,18 +280,25 @@ pub(crate) fn classify_u2c(
 
 pub(crate) fn classify_c2u_session_control(
     cfg: &RuntimeConfig,
-    wire: &WirePayload<'_>,
+    event: &PayloadEvent<'_>,
     shared: &SharedSyncIcmpState,
     cache: &mut SyncIcmpCache,
 ) -> io::Result<C2uSessionControlDecision> {
-    if !wire.src_is_icmp {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMP session-control packet arrived while sync mode is disabled",
-        ));
-    }
-    remember_request_seq(shared, cache, wire);
-    if wire.dst_proto == SupportedProtocol::ICMP {
+    let icmp = match event {
+        PayloadEvent::SessionControl { icmp, .. } => icmp,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ICMP session-control packet arrived while sync mode is disabled",
+            ));
+        }
+    };
+    remember_request_seq(shared, cache, icmp);
+    let dst_proto = match event {
+        PayloadEvent::SessionControl { data, .. } => data.dst_proto,
+        _ => unreachable!("session-control classification requires a session-control event"),
+    };
+    if dst_proto == SupportedProtocol::ICMP {
         if !sync_icmp_enabled(cfg) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -313,7 +318,13 @@ pub(crate) fn prepare_send(
     shared: &SharedSyncIcmpState,
     cache: &mut SyncIcmpCache,
 ) -> Option<u16> {
-    if !will_forward || event.dst_proto() != SupportedProtocol::ICMP {
+    let dst_proto = match event {
+        PayloadEvent::UserPayload { data, .. } | PayloadEvent::SessionControl { data, .. } => {
+            data.dst_proto
+        }
+        PayloadEvent::CadencePacket { .. } => SupportedProtocol::ICMP,
+    };
+    if !will_forward || dst_proto != SupportedProtocol::ICMP {
         return None;
     }
 
@@ -378,15 +389,34 @@ mod tests {
         }
     }
 
-    fn test_wire<'a>(payload: &'a [u8], seq: u16, dst_proto: SupportedProtocol) -> WirePayload<'a> {
-        WirePayload {
-            src_is_icmp: true,
-            src_ident: 0,
-            src_seq: seq,
-            dst_proto,
-            payload,
-            pub_len: payload.len(),
-            src_id_from_shim: None,
+    fn test_user_event<'a>(
+        bytes: &'a [u8],
+        seq: u16,
+        dst_proto: SupportedProtocol,
+    ) -> PayloadEvent<'a> {
+        PayloadEvent::UserPayload {
+            data: crate::net::payload::PayloadData { dst_proto, bytes },
+            icmp: Some(IcmpPayloadMeta {
+                logical_src_ident: 0,
+                transport_src_ident: 0,
+                seq,
+                shim_src_ident: None,
+            }),
+        }
+    }
+
+    fn test_session_control_event(seq: u16, dst_proto: SupportedProtocol) -> PayloadEvent<'static> {
+        PayloadEvent::SessionControl {
+            data: crate::net::payload::PayloadData {
+                dst_proto,
+                bytes: &[],
+            },
+            icmp: IcmpPayloadMeta {
+                logical_src_ident: 0,
+                transport_src_ident: 0,
+                seq,
+                shim_src_ident: None,
+            },
         }
     }
 
@@ -406,7 +436,7 @@ mod tests {
         let shared = Arc::new(SharedSyncIcmpState::new(cfg.icmp_sync_pps));
         let mut seed = shared.cache();
         seed.generation = shared.generation.0.load(AtomOrdering::Relaxed);
-        let seed_event = PayloadEvent::UserPayload(test_wire(b"x", 0, SupportedProtocol::ICMP));
+        let seed_event = test_user_event(b"x", 0, SupportedProtocol::ICMP);
         prepare_send(true, &seed_event, true, &shared, &mut seed);
 
         let thread_count = 16;
@@ -418,11 +448,7 @@ mod tests {
             let s = shared.clone();
             handles.push(thread::spawn(move || {
                 let mut cache = s.cache();
-                let event = PayloadEvent::UserPayload(test_wire(
-                    b"race",
-                    cache.latest_sent_seq,
-                    SupportedProtocol::UDP,
-                ));
+                let event = test_user_event(b"race", cache.latest_sent_seq, SupportedProtocol::UDP);
                 b.wait();
                 classify_u2c(&c, &event, PayloadOrigin::Wire, &s, &mut cache)
             }));
@@ -448,15 +474,15 @@ mod tests {
         let cfg = test_config();
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let seed_event = PayloadEvent::UserPayload(test_wire(b"x", 0, SupportedProtocol::ICMP));
+        let seed_event = test_user_event(b"x", 0, SupportedProtocol::ICMP);
         prepare_send(true, &seed_event, true, &shared, &mut cache);
         shared.latest.seq.store(100, AtomOrdering::Relaxed);
         cache.latest_sent_seq = 100;
 
-        let seq100 = PayloadEvent::UserPayload(test_wire(b"100", 100, SupportedProtocol::UDP));
+        let seq100 = test_user_event(b"100", 100, SupportedProtocol::UDP);
         assert!(classify_u2c(&cfg, &seq100, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
 
-        let seq99 = PayloadEvent::UserPayload(test_wire(b"99", 99, SupportedProtocol::UDP));
+        let seq99 = test_user_event(b"99", 99, SupportedProtocol::UDP);
         assert!(classify_u2c(&cfg, &seq99, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
         assert!(
             classify_u2c(&cfg, &seq99, PayloadOrigin::Wire, &shared, &mut cache)
@@ -465,11 +491,11 @@ mod tests {
                 .contains("duplicate")
         );
 
-        let stale = PayloadEvent::UserPayload(test_wire(
+        let stale = test_user_event(
             b"stale",
             100u16.wrapping_sub((cache.catchup_window() + 1) as u16),
             SupportedProtocol::UDP,
-        ));
+        );
         assert!(
             classify_u2c(&cfg, &stale, PayloadOrigin::Wire, &shared, &mut cache)
                 .unwrap_err()
@@ -490,7 +516,7 @@ mod tests {
         cache.latest_sent_seq = 1025;
         cache.latest_valid = true;
 
-        let stale = PayloadEvent::UserPayload(test_wire(b"stale", 0, SupportedProtocol::UDP));
+        let stale = test_user_event(b"stale", 0, SupportedProtocol::UDP);
         assert!(
             classify_u2c(&cfg, &stale, PayloadOrigin::Wire, &shared, &mut cache)
                 .unwrap_err()
@@ -498,13 +524,13 @@ mod tests {
                 .contains("stale")
         );
 
-        let latest = PayloadEvent::UserPayload(test_wire(b"latest", 1025, SupportedProtocol::UDP));
+        let latest = test_user_event(b"latest", 1025, SupportedProtocol::UDP);
         assert_eq!(
             classify_u2c(&cfg, &latest, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
             U2cDecision::ForwardPayload
         );
 
-        let dup = PayloadEvent::UserPayload(test_wire(b"latest", 1025, SupportedProtocol::UDP));
+        let dup = test_user_event(b"latest", 1025, SupportedProtocol::UDP);
         assert!(
             classify_u2c(&cfg, &dup, PayloadOrigin::Wire, &shared, &mut cache)
                 .unwrap_err()
@@ -525,7 +551,7 @@ mod tests {
         cache.latest_sent_seq = 5;
         cache.latest_valid = true;
 
-        let event = PayloadEvent::UserPayload(test_wire(b"future", 7, SupportedProtocol::UDP));
+        let event = test_user_event(b"future", 7, SupportedProtocol::UDP);
         assert!(
             classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache)
                 .unwrap_err()
@@ -546,7 +572,7 @@ mod tests {
         cache.latest_sent_seq = 1;
         cache.latest_valid = true;
 
-        let event = PayloadEvent::UserPayload(test_wire(b"wrap", u16::MAX, SupportedProtocol::UDP));
+        let event = test_user_event(b"wrap", u16::MAX, SupportedProtocol::UDP);
         assert_eq!(
             classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
             U2cDecision::ForwardPayload
@@ -564,7 +590,7 @@ mod tests {
         cache.latest_sent_seq = 5;
         cache.latest_valid = true;
 
-        let event = PayloadEvent::SessionControl(test_wire(&[], 5, SupportedProtocol::UDP));
+        let event = test_session_control_event(5, SupportedProtocol::UDP);
         assert_eq!(
             classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
             U2cDecision::ConsumeSessionControl
@@ -584,7 +610,7 @@ mod tests {
         cache.latest_sent_seq = 5;
         cache.latest_valid = true;
 
-        let event = PayloadEvent::SessionControl(test_wire(&[], 5, SupportedProtocol::ICMP));
+        let event = test_session_control_event(5, SupportedProtocol::ICMP);
         assert_eq!(
             classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
             U2cDecision::ForwardSessionControl
@@ -599,9 +625,14 @@ mod tests {
         cfg.upstream_proto = SupportedProtocol::UDP;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let wire = test_wire(&[], 11, SupportedProtocol::UDP);
         assert_eq!(
-            classify_c2u_session_control(&cfg, &wire, &shared, &mut cache).unwrap(),
+            classify_c2u_session_control(
+                &cfg,
+                &test_session_control_event(11, SupportedProtocol::UDP),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
             C2uSessionControlDecision::ReplyLocally
         );
     }
@@ -614,9 +645,14 @@ mod tests {
         cfg.upstream_proto = SupportedProtocol::ICMP;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let wire = test_wire(&[], 11, SupportedProtocol::ICMP);
         assert_eq!(
-            classify_c2u_session_control(&cfg, &wire, &shared, &mut cache).unwrap(),
+            classify_c2u_session_control(
+                &cfg,
+                &test_session_control_event(11, SupportedProtocol::ICMP),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
             C2uSessionControlDecision::Consume
         );
     }
@@ -628,7 +664,7 @@ mod tests {
         cfg.icmp_sync_pps = 0;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let event1 = PayloadEvent::SessionControl(test_wire(&[], 1, SupportedProtocol::UDP));
+        let event1 = test_session_control_event(1, SupportedProtocol::UDP);
         assert_eq!(
             classify_u2c(&cfg, &event1, PayloadOrigin::Wire, &shared, &mut cache)
                 .unwrap_err()
@@ -636,7 +672,7 @@ mod tests {
             "ICMP session-control packet arrived while sync mode is disabled"
         );
 
-        let event2 = PayloadEvent::SessionControl(test_wire(&[], 2, SupportedProtocol::UDP));
+        let event2 = test_session_control_event(2, SupportedProtocol::UDP);
         assert!(
             classify_u2c(
                 &cfg,
@@ -657,7 +693,7 @@ mod tests {
         let cfg = test_config();
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let event = PayloadEvent::cadence_packet(true, 0x1234, 7);
+        let event = PayloadEvent::cadence_packet(0x1234, 7);
         assert!(
             classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache)
                 .unwrap_err()
@@ -675,12 +711,16 @@ mod tests {
         cfg.icmp_sync_pps = 0;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let wire = test_wire(&[], 11, SupportedProtocol::ICMP);
         assert!(
-            classify_c2u_session_control(&cfg, &wire, &shared, &mut cache)
-                .unwrap_err()
-                .to_string()
-                .contains("sync mode is disabled")
+            classify_c2u_session_control(
+                &cfg,
+                &test_session_control_event(11, SupportedProtocol::ICMP),
+                &shared,
+                &mut cache
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("sync mode is disabled")
         );
     }
 
@@ -691,7 +731,7 @@ mod tests {
         cfg.icmp_sync_pps = 0;
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
-        let event = PayloadEvent::UserPayload(test_wire(b"plain-icmp", 77, SupportedProtocol::UDP));
+        let event = test_user_event(b"plain-icmp", 77, SupportedProtocol::UDP);
         assert_eq!(
             classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
             U2cDecision::ForwardPayload
@@ -708,7 +748,7 @@ mod tests {
         shared.latest.valid.store(true, AtomOrdering::Relaxed);
         cache.latest_sent_seq = 12;
         cache.latest_valid = true;
-        let event = PayloadEvent::UserPayload(test_wire(b"first", 12, SupportedProtocol::UDP));
+        let event = test_user_event(b"first", 12, SupportedProtocol::UDP);
         assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).is_ok());
         reset_session(&cfg, &shared, &mut cache);
         shared.latest.seq.store(12, AtomOrdering::Relaxed);
@@ -735,7 +775,7 @@ mod tests {
         cache_a.latest_valid = true;
         cache_b.latest_valid = true;
 
-        let event = PayloadEvent::UserPayload(test_wire(b"a", 44, SupportedProtocol::UDP));
+        let event = test_user_event(b"a", 44, SupportedProtocol::UDP);
         assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared_a, &mut cache_a).is_ok());
         assert!(classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared_b, &mut cache_b).is_ok());
     }

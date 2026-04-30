@@ -7,8 +7,9 @@ mod orchestrator;
 
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    ForwarderConfig, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, SocketMode,
-    bind_udp_client, launch_forwarder, spawn_upstream_echo_or_skip, wait_for_child_exit_success,
+    ForwarderConfig, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, OutputCapture, SUPPORTED_PROTOCOLS,
+    SocketMode, bind_udp_client, launch_forwarder, spawn_upstream_echo_or_skip,
+    wait_for_child_exit_success,
 };
 
 use std::io;
@@ -44,6 +45,7 @@ fn stress_test_ipv4_case(proto: &str) {
         icmp_sync_pps: None,
         debug_logs: &[],
         capture_stderr: false,
+        capture_mode: OutputCapture::Direct,
     });
 
     client_sock

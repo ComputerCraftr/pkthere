@@ -1,6 +1,7 @@
 use crate::cli::SupportedProtocol;
 use crate::net::payload::PayloadEvent;
 use std::fmt;
+use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,22 +24,38 @@ impl ClientFlowKey {
         src: SocketAddr,
         listen_proto: SupportedProtocol,
         event: &PayloadEvent<'_>,
-    ) -> Self {
-        match listen_proto {
+    ) -> io::Result<Self> {
+        Ok(match listen_proto {
             SupportedProtocol::UDP => Self::Udp(src),
-            SupportedProtocol::ICMP => match src {
-                SocketAddr::V4(addr) => Self::IcmpV4 {
-                    ip: *addr.ip(),
-                    ident: event.src_ident(),
-                },
-                SocketAddr::V6(addr) => Self::IcmpV6 {
-                    ip: *addr.ip(),
-                    ident: event.src_ident(),
-                    flowinfo: addr.flowinfo(),
-                    scope_id: addr.scope_id(),
-                },
-            },
-        }
+            SupportedProtocol::ICMP => {
+                let transport_src_ident = match event {
+                    PayloadEvent::UserPayload { icmp, .. } => {
+                        icmp.as_ref()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "ICMP listen path requires ICMP metadata",
+                                )
+                            })?
+                            .transport_src_ident
+                    }
+                    PayloadEvent::SessionControl { icmp, .. }
+                    | PayloadEvent::CadencePacket { icmp } => icmp.transport_src_ident,
+                };
+                match src {
+                    SocketAddr::V4(addr) => Self::IcmpV4 {
+                        ip: *addr.ip(),
+                        ident: transport_src_ident,
+                    },
+                    SocketAddr::V6(addr) => Self::IcmpV6 {
+                        ip: *addr.ip(),
+                        ident: transport_src_ident,
+                        flowinfo: addr.flowinfo(),
+                        scope_id: addr.scope_id(),
+                    },
+                }
+            }
+        })
     }
 
     #[inline]

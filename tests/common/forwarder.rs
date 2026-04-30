@@ -5,13 +5,21 @@ use crate::orchestrator::{MAX_WAIT_SECS, TIMEOUT_SECS};
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SocketMode {
     Connected,
     Unconnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputCapture {
+    Direct,
+    Buffered,
 }
 
 pub struct ForwarderConfig<'a> {
@@ -26,13 +34,57 @@ pub struct ForwarderConfig<'a> {
     pub icmp_sync_pps: Option<u32>,
     pub debug_logs: &'a [&'a str],
     pub capture_stderr: bool,
+    pub capture_mode: OutputCapture,
+}
+
+pub enum SessionStdout {
+    Direct(ChildStdout),
+    Buffered,
+}
+
+impl Read for SessionStdout {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct(stdout) => stdout.read(buf),
+            Self::Buffered => Err(io::Error::other(
+                "buffered forwarder stdout is not readable directly; use captured output helpers",
+            )),
+        }
+    }
+}
+
+struct CaptureHandle {
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
+    stdout_thread: Option<JoinHandle<io::Result<()>>>,
+    stderr_thread: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl CaptureHandle {
+    fn snapshot(&self) -> (String, String) {
+        let stdout =
+            String::from_utf8_lossy(&self.stdout.lock().expect("capture stdout lock")).into_owned();
+        let stderr =
+            String::from_utf8_lossy(&self.stderr.lock().expect("capture stderr lock")).into_owned();
+        (stdout, stderr)
+    }
+
+    fn join(&mut self) -> io::Result<(String, String)> {
+        if let Some(thread) = self.stdout_thread.take() {
+            join_capture_thread(thread, "stdout")?;
+        }
+        if let Some(thread) = self.stderr_thread.take() {
+            join_capture_thread(thread, "stderr")?;
+        }
+        Ok(self.snapshot())
+    }
 }
 
 pub struct ForwarderSession {
     pub child: ChildGuard,
-    pub out: ChildStdout,
-    pub err: Option<ChildStderr>,
+    pub out: SessionStdout,
     pub listen_addr: SocketAddr,
+    capture: Option<CaptureHandle>,
 }
 
 impl SocketMode {
@@ -109,24 +161,44 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         ));
     };
 
+    let (out, capture) = match cfg.capture_mode {
+        OutputCapture::Direct => (SessionStdout::Direct(out), None),
+        OutputCapture::Buffered => (
+            SessionStdout::Buffered,
+            Some(spawn_capture_threads(out, err)),
+        ),
+    };
+
     Ok(ForwarderSession {
         child,
         out,
-        err,
         listen_addr,
+        capture,
     })
 }
 
 pub fn collect_forwarder_output(session: &mut ForwarderSession) -> io::Result<(String, String)> {
-    let mut stdout = String::new();
-    session.out.read_to_string(&mut stdout)?;
-
-    let mut stderr = String::new();
-    if let Some(err) = session.err.as_mut() {
-        err.read_to_string(&mut stderr)?;
+    if let Some(capture) = session.capture.as_mut() {
+        return capture.join();
     }
 
-    Ok((stdout, stderr))
+    let mut stdout = String::new();
+    session.out.read_to_string(&mut stdout)?;
+    Ok((stdout, String::new()))
+}
+
+pub fn snapshot_forwarder_output(session: &ForwarderSession) -> io::Result<(String, String)> {
+    match session.capture.as_ref() {
+        Some(capture) => Ok(capture.snapshot()),
+        None => Err(io::Error::other(
+            "forwarder session does not use buffered output capture",
+        )),
+    }
+}
+
+pub fn terminate_forwarder(session: &mut ForwarderSession) {
+    let _ = session.child.kill();
+    let _ = session.child.wait();
 }
 
 pub fn wait_for_child_exit_success(child: &mut ChildGuard, max_wait: Duration) {
@@ -148,5 +220,45 @@ pub fn wait_for_child_exit_success(child: &mut ChildGuard, max_wait: Duration) {
     match status_opt {
         Some(status) => assert!(status.success(), "forwarder did not exit cleanly: {status}"),
         None => panic!("forwarder did not exit within {:?}", max_wait),
+    }
+}
+
+fn spawn_capture_threads(out: ChildStdout, err: Option<ChildStderr>) -> CaptureHandle {
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let stdout_thread = Some(spawn_capture_thread(out, Arc::clone(&stdout)));
+    let stderr_thread = err.map(|err| spawn_capture_thread(err, Arc::clone(&stderr)));
+    CaptureHandle {
+        stdout,
+        stderr,
+        stdout_thread,
+        stderr_thread,
+    }
+}
+
+fn spawn_capture_thread<R: Read + Send + 'static>(
+    mut reader: R,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => return Ok(()),
+                Ok(n) => buffer
+                    .lock()
+                    .expect("capture buffer lock")
+                    .extend_from_slice(&chunk[..n]),
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    })
+}
+
+fn join_capture_thread(thread: JoinHandle<io::Result<()>>, name: &str) -> io::Result<()> {
+    match thread.join() {
+        Ok(res) => res,
+        Err(_) => Err(io::Error::other(format!("{name} capture thread panicked"))),
     }
 }

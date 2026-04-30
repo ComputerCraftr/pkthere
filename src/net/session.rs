@@ -110,33 +110,14 @@ pub(crate) fn handle_send_result(
 mod tests {
     use super::counts_as_session_activity;
     use crate::cli::SupportedProtocol;
-    use crate::net::payload::{PayloadEvent, WirePayload};
+    use crate::net::payload::PayloadEvent;
 
     #[test]
     fn forwarded_user_data_counts_as_activity_even_when_zero_length() {
-        let zero = PayloadEvent::UserPayload(WirePayload {
-            src_is_icmp: false,
-            src_ident: 0,
-            src_seq: 0,
-            dst_proto: SupportedProtocol::UDP,
-            payload: &[],
-            pub_len: 0,
-            src_id_from_shim: None,
-        });
-        let session_control = PayloadEvent::SessionControl(WirePayload {
-            src_is_icmp: true,
-            src_ident: 0,
-            src_seq: 1,
-            dst_proto: SupportedProtocol::ICMP,
-            payload: &[],
-            pub_len: 0,
-            src_id_from_shim: None,
-        });
-        let cadence = PayloadEvent::CadencePacket {
-            src_is_icmp: true,
-            src_ident: 0,
-            src_seq: 2,
-        };
+        let zero = PayloadEvent::user_payload_plain(SupportedProtocol::UDP, &[]);
+        let session_control =
+            PayloadEvent::session_control(0, 0, 1, SupportedProtocol::ICMP, &[], None);
+        let cadence = PayloadEvent::cadence_packet(0, 2);
 
         assert!(counts_as_session_activity(&zero, true));
         assert!(!counts_as_session_activity(&zero, false));

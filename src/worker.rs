@@ -4,8 +4,8 @@ use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::params::CanonicalAddr;
 use crate::net::payload::{
-    IcmpIdPolicy, PayloadEvent, PayloadOrigin, send_payload, source_id_shim_for_c2u,
-    validate_payload,
+    IcmpIdPolicy, PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload,
+    source_id_shim_for_c2u, validate_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketManager;
@@ -15,7 +15,7 @@ use crate::net::sync_icmp::{
 };
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
-    AlignedBuf, BufferedSyncPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer,
+    AlignedBuf, BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer,
     as_uninit_mut, buffer_sync_event, handle_c2u_session_control, sync_session_on_lock_transition,
     wait_socket_until_readable,
 };
@@ -210,16 +210,26 @@ pub fn run_upstream_to_client_thread(
                         "classify_u2c error: {}"
                     );
                     let send_res = if decision.should_send() {
+                        let outbound = result_or_log_continue!(
+                            outbound_payload_event(
+                                &event,
+                                cache.route.icmp_header_id,
+                                C2U,
+                                prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
+                                None,
+                            ),
+                            log_debug_dir,
+                            cfg.debug_logs.drops,
+                            worker_id,
+                            C2U,
+                            "outbound payload build error: {}"
+                        );
                         send_payload(
                             &handles.client_sock,
                             handles.client_connected,
                             cache.dest_sock_type,
                             &cache.route.dest_sa,
-                            &event,
-                            cache.route.icmp_header_id,
-                            C2U,
-                            prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                            None, // Replies never propose a Source ID
+                            &outbound,
                         )
                     } else {
                         Ok(true)
@@ -269,7 +279,7 @@ pub fn run_client_to_upstream_thread(
     const C2U: bool = true;
     let mut buf = AlignedBuf::new();
     let sync_icmp_mode = sync_icmp_enabled(cfg);
-    let mut latest_sync_payload: Option<BufferedSyncPayload> = None;
+    let mut latest_sync_payload: Option<BufferedPayload> = None;
 
     let mut handles = sock_mgr.refresh_handles();
     let mut was_locked = false;
@@ -292,7 +302,15 @@ pub fn run_client_to_upstream_thread(
                     continue;
                 }
 
-                let pacer = sync_pacer.expect("sync pacing state must exist in sync mode");
+                let Some(pacer) = sync_pacer else {
+                    log_error_dir!(
+                        worker_id,
+                        C2U,
+                        "sync pacing state missing while ICMP sync mode is enabled"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
                 let now = Instant::now();
                 if pacer.try_acquire_send(now) {
                     let buffered_payload = latest_sync_payload.take();
@@ -329,16 +347,26 @@ pub fn run_client_to_upstream_thread(
                         sync_cache.latest_valid,
                         handles.upstream_local.id,
                     );
+                    let outbound = result_or_log_continue!(
+                        outbound_payload_event(
+                            &event,
+                            cache.route.icmp_header_id,
+                            C2U,
+                            prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
+                            source_id_for_shim,
+                        ),
+                        log_debug_dir,
+                        cfg.debug_logs.drops,
+                        worker_id,
+                        C2U,
+                        "outbound payload build error: {}"
+                    );
                     let send_res = send_payload(
                         &handles.upstream_sock,
                         handles.upstream_connected,
                         cache.dest_sock_type,
                         &cache.route.dest_sa,
-                        &event,
-                        cache.route.icmp_header_id,
-                        C2U,
-                        prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                        source_id_for_shim,
+                        &outbound,
                     );
                     handle_send_result(
                         C2U,
@@ -453,25 +481,44 @@ pub fn run_client_to_upstream_thread(
                         );
 
                         match event {
-                            PayloadEvent::UserPayload(ref wire) => {
-                                if wire.src_is_icmp {
-                                    remember_request_seq(sync_state, &mut sync_cache, &wire);
+                            PayloadEvent::UserPayload { .. } => {
+                                if let PayloadEvent::UserPayload {
+                                    icmp: Some(icmp), ..
+                                } = &event
+                                {
+                                    remember_request_seq(sync_state, &mut sync_cache, icmp);
                                 }
                                 let source_id_for_shim = source_id_shim_for_c2u(
                                     &event,
                                     sync_cache.latest_valid,
                                     handles.upstream_local.id,
                                 );
+                                let outbound = result_or_log_continue!(
+                                    outbound_payload_event(
+                                        &event,
+                                        cache.route.icmp_header_id,
+                                        C2U,
+                                        prepare_send(
+                                            C2U,
+                                            &event,
+                                            true,
+                                            sync_state,
+                                            &mut sync_cache
+                                        ),
+                                        source_id_for_shim,
+                                    ),
+                                    log_debug_dir,
+                                    cfg.debug_logs.drops,
+                                    worker_id,
+                                    C2U,
+                                    "outbound payload build error: {}"
+                                );
                                 let send_res = send_payload(
                                     &handles.upstream_sock,
                                     handles.upstream_connected,
                                     cache.dest_sock_type,
                                     &cache.route.dest_sa,
-                                    &event,
-                                    cache.route.icmp_header_id,
-                                    C2U,
-                                    prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                                    source_id_for_shim,
+                                    &outbound,
                                 );
 
                                 handle_send_result(
@@ -490,7 +537,7 @@ pub fn run_client_to_upstream_thread(
                                     None,
                                 );
                             }
-                            PayloadEvent::SessionControl(wire) => handle_c2u_session_control(
+                            PayloadEvent::SessionControl { .. } => handle_c2u_session_control(
                                 worker_id,
                                 t_start,
                                 t_recv,
@@ -501,7 +548,7 @@ pub fn run_client_to_upstream_thread(
                                 sync_state,
                                 &mut sync_cache,
                                 cache.session_control_reply_route.as_ref(),
-                                &wire,
+                                &event,
                             ),
                             PayloadEvent::CadencePacket { .. } => log_debug_dir!(
                                 cfg.debug_logs.drops,
@@ -523,7 +570,15 @@ pub fn run_client_to_upstream_thread(
             }
         } else {
             if sync_icmp_mode && locked_now {
-                let pacer = sync_pacer.expect("sync pacing state must exist in sync mode");
+                let Some(pacer) = sync_pacer else {
+                    log_error_dir!(
+                        worker_id,
+                        C2U,
+                        "sync pacing state missing while ICMP sync mode is enabled"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
                 let now = Instant::now();
                 if pacer.try_acquire_send(now) {
                     let buffered_payload = latest_sync_payload.take();
@@ -560,16 +615,26 @@ pub fn run_client_to_upstream_thread(
                         sync_cache.latest_valid,
                         handles.upstream_local.id,
                     );
+                    let outbound = result_or_log_continue!(
+                        outbound_payload_event(
+                            &event,
+                            cache.route.icmp_header_id,
+                            C2U,
+                            prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
+                            source_id_for_shim,
+                        ),
+                        log_debug_dir,
+                        cfg.debug_logs.drops,
+                        worker_id,
+                        C2U,
+                        "outbound payload build error: {}"
+                    );
                     let send_res = send_payload(
                         &handles.upstream_sock,
                         handles.upstream_connected,
                         cache.dest_sock_type,
                         &cache.route.dest_sa,
-                        &event,
-                        cache.route.icmp_header_id,
-                        C2U,
-                        prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                        source_id_for_shim,
+                        &outbound,
                     );
                     handle_send_result(
                         C2U,
@@ -635,7 +700,14 @@ pub fn run_client_to_upstream_thread(
                                 continue;
                             }
                         };
-                        let flow_key = ClientFlowKey::from_wire(src, cfg.listen_proto, &event);
+                        let flow_key = result_or_log_continue!(
+                            ClientFlowKey::from_wire(src, cfg.listen_proto, &event),
+                            log_debug_dir,
+                            cfg.debug_logs.drops,
+                            worker_id,
+                            C2U,
+                            "flow key derivation error: {}"
+                        );
                         if Some(flow_key) == handles.locked_flow {
                             match buffer_sync_event(
                                 worker_id,
@@ -699,7 +771,14 @@ pub fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let flow = ClientFlowKey::from_wire(src, cfg.listen_proto, &event);
+                        let flow = result_or_log_continue!(
+                            ClientFlowKey::from_wire(src, cfg.listen_proto, &event),
+                            log_debug_dir,
+                            cfg.debug_logs.drops,
+                            worker_id,
+                            C2U,
+                            "flow key derivation error: {}"
+                        );
 
                         if cfg.worker_flow_mode == WorkerFlowMode::SingleFlow
                             && flow_claims.is_some_and(|flow_claims| {
@@ -770,25 +849,44 @@ pub fn run_client_to_upstream_thread(
                         }
 
                         match event {
-                            PayloadEvent::UserPayload(ref wire) => {
-                                if wire.src_is_icmp {
-                                    remember_request_seq(sync_state, &mut sync_cache, &wire);
+                            PayloadEvent::UserPayload { .. } => {
+                                if let PayloadEvent::UserPayload {
+                                    icmp: Some(icmp), ..
+                                } = &event
+                                {
+                                    remember_request_seq(sync_state, &mut sync_cache, icmp);
                                 }
                                 let source_id_for_shim = source_id_shim_for_c2u(
                                     &event,
                                     sync_cache.latest_valid,
                                     handles.upstream_local.id,
                                 );
+                                let outbound = result_or_log_continue!(
+                                    outbound_payload_event(
+                                        &event,
+                                        cache.route.icmp_header_id,
+                                        C2U,
+                                        prepare_send(
+                                            C2U,
+                                            &event,
+                                            true,
+                                            sync_state,
+                                            &mut sync_cache
+                                        ),
+                                        source_id_for_shim,
+                                    ),
+                                    log_debug_dir,
+                                    cfg.debug_logs.drops,
+                                    worker_id,
+                                    C2U,
+                                    "outbound payload build error: {}"
+                                );
                                 let send_res = send_payload(
                                     &handles.upstream_sock,
                                     handles.upstream_connected,
                                     cache.dest_sock_type,
                                     &cache.route.dest_sa,
-                                    &event,
-                                    cache.route.icmp_header_id,
-                                    C2U,
-                                    prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                                    source_id_for_shim,
+                                    &outbound,
                                 );
                                 handle_send_result(
                                     C2U,
@@ -806,7 +904,7 @@ pub fn run_client_to_upstream_thread(
                                     None,
                                 );
                             }
-                            PayloadEvent::SessionControl(wire) => handle_c2u_session_control(
+                            PayloadEvent::SessionControl { .. } => handle_c2u_session_control(
                                 worker_id,
                                 t_start,
                                 t_recv,
@@ -817,7 +915,7 @@ pub fn run_client_to_upstream_thread(
                                 sync_state,
                                 &mut sync_cache,
                                 cache.session_control_reply_route.as_ref(),
-                                &wire,
+                                &event,
                             ),
                             PayloadEvent::CadencePacket { .. } => log_debug_dir!(
                                 cfg.debug_logs.drops,
@@ -843,31 +941,56 @@ pub fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        if Some(ClientFlowKey::from_wire(src, cfg.listen_proto, &event))
-                            != handles.locked_flow
-                        {
+                        let flow = result_or_log_continue!(
+                            ClientFlowKey::from_wire(src, cfg.listen_proto, &event),
+                            log_debug_dir,
+                            cfg.debug_logs.drops,
+                            worker_id,
+                            C2U,
+                            "flow key derivation error: {}"
+                        );
+                        if Some(flow) != handles.locked_flow {
                             continue;
                         }
                         match event {
-                            PayloadEvent::UserPayload(ref wire) => {
-                                if wire.src_is_icmp {
-                                    remember_request_seq(sync_state, &mut sync_cache, &wire);
+                            PayloadEvent::UserPayload { .. } => {
+                                if let PayloadEvent::UserPayload {
+                                    icmp: Some(icmp), ..
+                                } = &event
+                                {
+                                    remember_request_seq(sync_state, &mut sync_cache, icmp);
                                 }
                                 let source_id_for_shim = source_id_shim_for_c2u(
                                     &event,
                                     sync_cache.latest_valid,
                                     handles.upstream_local.id,
                                 );
+                                let outbound = result_or_log_continue!(
+                                    outbound_payload_event(
+                                        &event,
+                                        cache.route.icmp_header_id,
+                                        C2U,
+                                        prepare_send(
+                                            C2U,
+                                            &event,
+                                            true,
+                                            sync_state,
+                                            &mut sync_cache
+                                        ),
+                                        source_id_for_shim,
+                                    ),
+                                    log_debug_dir,
+                                    cfg.debug_logs.drops,
+                                    worker_id,
+                                    C2U,
+                                    "outbound payload build error: {}"
+                                );
                                 let send_res = send_payload(
                                     &handles.upstream_sock,
                                     handles.upstream_connected,
                                     cache.dest_sock_type,
                                     &cache.route.dest_sa,
-                                    &event,
-                                    cache.route.icmp_header_id,
-                                    C2U,
-                                    prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                                    source_id_for_shim,
+                                    &outbound,
                                 );
                                 handle_send_result(
                                     C2U,
@@ -885,7 +1008,7 @@ pub fn run_client_to_upstream_thread(
                                     None,
                                 );
                             }
-                            PayloadEvent::SessionControl(wire) => handle_c2u_session_control(
+                            PayloadEvent::SessionControl { .. } => handle_c2u_session_control(
                                 worker_id,
                                 t_start,
                                 t_recv,
@@ -896,7 +1019,7 @@ pub fn run_client_to_upstream_thread(
                                 sync_state,
                                 &mut sync_cache,
                                 cache.session_control_reply_route.as_ref(),
-                                &wire,
+                                &event,
                             ),
                             PayloadEvent::CadencePacket { .. } => log_debug_dir!(
                                 cfg.debug_logs.drops,
