@@ -7,4 +7,5 @@ pub(crate) mod payload_support;
 pub mod session;
 pub mod sock_mgr;
 pub mod socket;
+pub(crate) mod socket_policy;
 pub mod sync_icmp;

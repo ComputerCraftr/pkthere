@@ -72,7 +72,7 @@ pub const fn parse_icmp_echo_header(payload: &[u8]) -> (bool, &[u8], usize, usiz
 
 #[allow(dead_code)]
 pub fn probe_kernel_icmp_echo() -> std::io::Result<()> {
-    use socket2::{Domain, Protocol, Socket, Type};
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::time::{Duration, Instant};
@@ -113,7 +113,7 @@ pub fn probe_kernel_icmp_echo() -> std::io::Result<()> {
     request[3] = checksum_bytes[1];
 
     let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    sock.connect(&dest.into())?;
+    sock.connect(&SockAddr::from(dest))?;
     sock.send(&request)?;
 
     let mut recv_buf = [std::mem::MaybeUninit::uninit(); 2048];

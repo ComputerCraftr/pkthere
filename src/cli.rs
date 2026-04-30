@@ -314,7 +314,9 @@ fn parse_icmp_cli_target(
 pub fn parse_args() -> RequestedConfig {
     // One place for usage. Program name is filled dynamically.
     fn print_usage_and_exit(code: i32) -> ! {
-        let prog = env::args().next().unwrap_or_else(|| "pkthere".into());
+        let prog = env::args()
+            .next()
+            .unwrap_or_else(|| String::from("pkthere"));
         log_error!(
             "Usage: {prog} --here <protocol:listen_ip:port_id> --there <protocol:upstream_host_or_ip:port_id>\n\
              \n\
@@ -341,7 +343,7 @@ pub fn parse_args() -> RequestedConfig {
              \t--group NAME             Drop privileges to this group (Unix only)\n\
              \t--debug-no-connect       Keep sockets unconnected for debug/relock behavior\n\
              \t--debug-fast-stats       Shorten stats cadence for tests/debugging\n\
-             \t--debug-log WHAT         Enable debug log category WHAT = drops|handles|packets (repeatable)\n\
+             \t--debug-log WHAT         Enable one debug log category WHAT = drops|handles|packets (repeatable)\n\
              \t-h, --help               Show this help and exit"
         );
         process::exit(code)
@@ -584,21 +586,15 @@ pub fn parse_args() -> RequestedConfig {
             }
             "--debug-log" => {
                 let val = get_next_value(&mut args_iter, "--debug-log");
-                for part in val.split(',') {
-                    let flag = part.trim();
-                    if flag.is_empty() {
-                        continue;
-                    }
-                    match flag {
-                        "drops" => debug_logs.drops = true,
-                        "handles" => debug_logs.handles = true,
-                        "packets" => debug_logs.packets = true,
-                        _ => {
-                            log_error!(
-                                "--debug-log expects drops, handles, or packets (got '{flag}')"
-                            );
-                            print_usage_and_exit(2)
-                        }
+                match val.as_str() {
+                    "drops" => debug_logs.drops = true,
+                    "handles" => debug_logs.handles = true,
+                    "packets" => debug_logs.packets = true,
+                    _ => {
+                        log_error!(
+                            "--debug-log expects exactly one of drops, handles, or packets per flag occurrence (got '{val}')"
+                        );
+                        print_usage_and_exit(2)
                     }
                 }
             }

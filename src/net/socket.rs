@@ -143,6 +143,24 @@ pub fn make_upstream_socket_for(
         )
     };
 
+    // Pre-generate remote ID if wildcard
+    let mut remote_id = dest.id;
+    let mut local_id = req_local_id;
+
+    if is_icmp {
+        let (l, r) = choose_upstream_icmp_ids(
+            local_id,
+            remote_id,
+            0, // actual_local_port not known yet
+            reuse_remote_id,
+            sock_type == Type::RAW,
+        );
+        local_id = l;
+        remote_id = r;
+    }
+
+    let mut final_dest = CanonicalAddr::new(dest.addr, remote_id);
+
     // Best-effort bigger buffers
     sock.set_recv_buffer_size(1 << 20)?;
     sock.set_send_buffer_size(1 << 20)?;
@@ -153,8 +171,8 @@ pub fn make_upstream_socket_for(
     sock.set_write_timeout(Some(read_timeout))?;
 
     // Connect
-    let dest_sa = dest.as_sock_addr();
-    sock.connect(&dest_sa.into())?;
+    let dest_sa = final_dest.as_sock_addr();
+    sock.connect(&dest_sa)?;
 
     let actual_local_sa = sock.local_addr()?.as_socket().ok_or_else(|| {
         io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
@@ -163,29 +181,24 @@ pub fn make_upstream_socket_for(
     // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
     let final_local_port = actual_local_sa.port();
 
-    let (local_id, remote_id) = if is_icmp {
+    let (assigned_local_id, assigned_remote_id) = if is_icmp {
+        // Re-run with the actual assigned local port.
+        // On macOS DGRAM, the kernel might have forced the local port to match the remote port.
+        // On Linux DGRAM, the kernel assigns a random local port, which forces BOTH local and remote IDs.
         choose_upstream_icmp_ids(
-            req_local_id,
-            dest.id,
+            local_id,
+            remote_id,
             final_local_port,
             reuse_remote_id,
             sock_type == Type::RAW,
         )
     } else {
-        (final_local_port, dest.id)
+        (final_local_port, final_dest.id)
     };
 
-    let local = CanonicalAddr::new(actual_local_sa, local_id);
-    let dest = if is_icmp {
-        let new_dest = CanonicalAddr::new(dest.addr, remote_id);
-        if new_dest.id != 0 && new_dest.id != dest.id {
-            sock.connect(&new_dest.as_sock_addr().into())?;
-        }
-        new_dest
-    } else {
-        dest
-    };
-    Ok((sock, local, dest, sock_type))
+    let local = CanonicalAddr::new(actual_local_sa, assigned_local_id);
+    final_dest.id = assigned_remote_id;
+    Ok((sock, local, final_dest, sock_type))
 }
 
 #[inline]
@@ -318,17 +331,21 @@ mod tests {
             SupportedProtocol::UDP,
         );
 
-        // Use id 0 for ICMP to trigger the assignment logic.
+        // Use ID 0 for ICMP to trigger the assignment logic.
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         let (dest, proto) = (
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
             SupportedProtocol::ICMP,
         );
 
-        let (sock, local, _remote, sock_type) = make_upstream_socket_for(dest, proto, 0, false)
+        let (sock, local, remote, sock_type) = make_upstream_socket_for(dest, proto, 0, false)
             .expect("make_upstream_socket_for failed");
 
-        assert_ne!(local.id, 0, "Local port should be assigned after connect");
+        assert_ne!(remote.id, 0, "Connected remote port ID should be nonzero");
+        assert_ne!(
+            local.id, 0,
+            "Local port ID should be assigned after connect"
+        );
         assert_eq!(
             sock_type,
             Type::DGRAM,

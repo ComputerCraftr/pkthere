@@ -186,7 +186,7 @@ fn rejects_invalid_debug_value() {
     let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
     assert_cli_rejects(
         &["--here", &here, "--there", &there, "--debug-log", "foo"],
-        &["--debug-log", "drops", "handles"],
+        &["--debug-log", "exactly one", "drops", "handles", "packets"],
     );
 }
 
@@ -197,6 +197,23 @@ fn rejects_removed_legacy_debug_flag() {
     assert_cli_rejects(
         &["--here", &here, "--there", &there, "--debug", "no-connect"],
         &["unknown arg: --debug"],
+    );
+}
+
+#[test]
+fn rejects_comma_separated_debug_log_values() {
+    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
+    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
+    assert_cli_rejects(
+        &[
+            "--here",
+            &here,
+            "--there",
+            &there,
+            "--debug-log",
+            "drops,handles",
+        ],
+        &["--debug-log", "exactly one", "drops,handles"],
     );
 }
 
@@ -338,9 +355,10 @@ fn help_mentions_worker_mode_and_dynamic_port_id_semantics() {
         "--there icmp:host:0      dynamic local icmp source id",
         "fixed remote icmp peer/listener id n (requires raw sockets on linux/android)",
         "--icmp-sync-pps n        global total best-effort icmp sync request target in packets/s",
+        "--reresolve-mode what    which sockets to re-resolve: upstream|listen|both|none (default: upstream)",
         "--debug-no-connect       keep sockets unconnected for debug/relock behavior",
         "--debug-fast-stats       shorten stats cadence for tests/debugging",
-        "--debug-log what         enable debug log category what = drops|handles",
+        "--debug-log what         enable one debug log category what = drops|handles|packets (repeatable)",
     ] {
         assert!(
             err_lower.contains(expected),

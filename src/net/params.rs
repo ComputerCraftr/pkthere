@@ -45,6 +45,34 @@ impl CanonicalAddr {
         };
         SockAddr::from(canonical)
     }
+
+    #[inline]
+    pub fn with_resolved_ip(self, resolved: SocketAddr) -> Self {
+        let addr = match (self.addr, resolved) {
+            (SocketAddr::V4(_current), SocketAddr::V4(resolved)) => {
+                SocketAddr::V4(SocketAddrV4::new(*resolved.ip(), self.id))
+            }
+            (SocketAddr::V6(current), SocketAddr::V6(resolved)) => {
+                SocketAddr::V6(SocketAddrV6::new(
+                    *resolved.ip(),
+                    self.id,
+                    current.flowinfo(),
+                    current.scope_id(),
+                ))
+            }
+            (_, SocketAddr::V4(resolved)) => {
+                SocketAddr::V4(SocketAddrV4::new(*resolved.ip(), self.id))
+            }
+            (_, SocketAddr::V6(resolved)) => SocketAddr::V6(SocketAddrV6::new(
+                *resolved.ip(),
+                self.id,
+                resolved.flowinfo(),
+                resolved.scope_id(),
+            )),
+        };
+
+        Self { addr, id: self.id }
+    }
 }
 
 impl fmt::Display for CanonicalAddr {
@@ -90,6 +118,51 @@ mod tests {
         assert_eq!(
             canonical.as_sock_addr().as_socket().expect("sockaddr"),
             SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 3333, 7, 9))
+        );
+    }
+
+    #[test]
+    fn with_resolved_ip_preserves_canonical_id() {
+        let canonical = CanonicalAddr::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1111)),
+            2222,
+        );
+
+        let refreshed = canonical.with_resolved_ip(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(127, 0, 0, 2),
+            9999,
+        )));
+
+        assert_eq!(refreshed.id, 2222);
+        assert_eq!(
+            refreshed.addr,
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2222))
+        );
+    }
+
+    #[test]
+    fn with_resolved_ip_preserves_ipv6_flowinfo_and_scope() {
+        let canonical = CanonicalAddr::new(
+            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1111, 7, 9)),
+            3333,
+        );
+
+        let refreshed = canonical.with_resolved_ip(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4),
+            4444,
+            0,
+            0,
+        )));
+
+        assert_eq!(refreshed.id, 3333);
+        assert_eq!(
+            refreshed.addr,
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0xfe80, 0, 0, 0, 1, 2, 3, 4),
+                3333,
+                7,
+                9,
+            ))
         );
     }
 

@@ -2,8 +2,8 @@
 mod policy;
 
 #[test]
-fn rust_source_files_stay_under_1100_lines() {
-    policy::assert_rust_source_files_stay_under_1100_lines();
+fn rust_source_files_stay_under_1000_lines() {
+    policy::assert_rust_source_files_stay_under_1000_lines();
 }
 
 #[test]

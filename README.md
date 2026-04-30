@@ -14,8 +14,8 @@ Protocols and behaviors:
 
 - **UDP**: forwards datagrams unchanged and preserves source ports.
 - **ICMP Echo**: adds payload to request/reply, supports both v4 and v6.
-- **Connected/unconnected modes**: optional `--debug no-connect` leaves the client socket unconnected for diagnostics.
-- **Drop logging**: `--debug log-drops` prints reasons when packets are rejected.
+- **Connected/unconnected modes**: optional `--debug-no-connect` leaves the client socket unconnected for diagnostics.
+- **Targeted debug logging**: repeat `--debug-log WHAT` for categories like `drops`, `handles`, or `packets`.
 - **Payload limits**: enforce MTU-like behavior with `--max-payload`.
 - **Stats**: periodic JSON lines show aggregate per-direction byte/packet counts and latency metrics. The `worker_flows` array provides per-worker details including locked status and client addresses.
 
@@ -23,8 +23,11 @@ Notable CLI options:
 
 - `--max-payload N` – drop packets larger than `N` bytes.
 - `--debug-no-connect` – leave client socket unconnected (useful for multi-hop or diagnostics).
-- `--debug-log drops|handles` – enable targeted debug logging.
+- `--debug-fast-stats` – shorten the stats cadence for tests or debugging.
+- `--debug-log WHAT` – enable one debug category per flag; repeat for multiple categories.
 - `--stats-interval-mins N` – periodic JSON stats interval (0 disables stats thread).
+- `--icmp-sync-pps N` – global total best-effort ICMP sync request target in packets/s.
+- `--reresolve-secs N` / `--reresolve-mode WHAT` – periodically re-resolve upstream, listener, both, or neither.
 - `--user/--group NAME` (Unix) – drop privileges after binding low ports.
 
 Worker flow modes:
@@ -41,6 +44,13 @@ Dynamic `:0` semantics:
 - `--there ICMP:host:0` means a dynamic local ICMP source ID chosen by the kernel ping socket.
 - Nonzero ICMP IDs remain fixed listener/peer IDs (on Linux/Android, requesting a fixed nonzero ICMP ID forces the use of privileged raw sockets).
 
+Re-resolve and worker behavior:
+
+- `--reresolve-mode upstream` is the default; `listen`, `both`, and `none` are also supported.
+- `shared-flow` keeps one global locked flow shared across all worker pairs.
+- `single-flow` keeps worker-pair-local locked flows and worker-pair-local ICMP sync state.
+- `--icmp-sync-pps` is a global total budget shared across all workers and flows, not a per-worker multiplier.
+
 Build:
 
 - `cargo build --release`
@@ -51,7 +61,7 @@ Run examples:
 - `./target/release/pkthere --here UDP:0.0.0.0:5354 --there UDP:one.one.one.one:53 --timeout-secs 45 --on-timeout drop`
 - `./target/release/pkthere --here UDP:0.0.0.0:5354 --there UDP:[2606:4700:4700::1001]:53 --on-timeout exit`
 - `./target/release/pkthere --here UDP:127.0.0.1:0 --there UDP:1.1.1.1:53`
-- `./target/release/pkthere --here ICMP:0.0.0.0:1234 --there ICMP:8.8.8.8:33434 --debug-log drops`
+- `./target/release/pkthere --here ICMP:0.0.0.0:1234 --there ICMP:8.8.8.8:33434 --debug-log drops --debug-log handles`
 - `./target/release/pkthere --here ICMP:0.0.0.0:0 --there UDP:1.1.1.1:53`
 - `./target/release/pkthere --here UDP:127.0.0.1:5354 --there ICMP:8.8.8.8:0`
 

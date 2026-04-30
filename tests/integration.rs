@@ -314,7 +314,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     let node3_ip = NODE3_IPV4;
     let node3 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: default_test_icmp_upstream_arg(node3_ip.into()),
+        here: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
         timeout_secs: Some(10),
@@ -332,7 +332,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     let node2 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
-        there: default_test_icmp_upstream_arg(node3_ip.into()),
+        there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         timeout_action: "exit",
         timeout_secs: Some(10),
         max_payload: None,
@@ -448,7 +448,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     let node3_ip = NODE3_IPV4;
     let mut node3 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
-        here: default_test_icmp_upstream_arg(node3_ip.into()),
+        here: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
         timeout_secs: Some(6),
@@ -466,7 +466,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     let mut node2 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
-        there: default_test_icmp_upstream_arg(node3_ip.into()),
+        there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         timeout_action: "exit",
         timeout_secs: Some(6),
         max_payload: None,

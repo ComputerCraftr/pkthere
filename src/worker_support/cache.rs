@@ -3,7 +3,7 @@ use crate::net::params::CanonicalAddr;
 use crate::net::payload::IcmpIdPolicy;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use socket2::{SockAddr, Type};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CachedSendRoute {
@@ -98,9 +98,9 @@ impl CachedClientState {
                 log_handles,
             }
         } else {
-            let remote = handles
-                .client_peer
-                .unwrap_or_else(|| CanonicalAddr::new(SocketAddr::new([0, 0, 0, 0].into(), 0), 0));
+            let remote = handles.client_peer.unwrap_or_else(|| {
+                CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), 0)
+            });
             Self {
                 c2u,
                 worker_id,

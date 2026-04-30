@@ -87,7 +87,7 @@ fn next_nonzero_icmp_id() -> u16 {
 pub(crate) fn choose_upstream_icmp_ids(
     req_local_id: u16,
     req_remote_id: u16,
-    actual_local_port: u16,
+    reported_local_port: u16,
     reuse_remote_id: bool,
     is_raw_socket: bool,
 ) -> (u16, u16) {
@@ -100,7 +100,11 @@ pub(crate) fn choose_upstream_icmp_ids(
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let untrustworthy = false;
 
-    let trustworthy_local_port = if untrustworthy { 0 } else { actual_local_port };
+    let trustworthy_local_port = if untrustworthy {
+        0
+    } else {
+        reported_local_port
+    };
 
     // For DGRAM sockets, the kernel-assigned port (ID) MUST match both local and remote.
     // If the kernel didn't assign one (or we couldn't trust it), we still force them

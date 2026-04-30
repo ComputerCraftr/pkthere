@@ -5,9 +5,12 @@ use crate::net::params::CanonicalAddr;
 use crate::net::socket::{
     disconnect_socket, family_changed, make_socket, make_upstream_socket_for, resolve_first,
 };
+use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
 use socket2::{SockAddr, Socket, Type};
 
+use crate::log_info;
 use std::io;
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 
@@ -58,6 +61,53 @@ struct UpstreamState {
     sock_type: Type,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReresolveAction {
+    NoChange,
+    UpdateMetadataOnly,
+    ReconnectInPlace,
+    ReplaceSocket,
+}
+
+#[inline]
+fn decide_listener_reresolve(
+    prev: CanonicalAddr,
+    resolved: SocketAddr,
+) -> (CanonicalAddr, ReresolveAction) {
+    let fresh = prev.with_resolved_ip(resolved);
+    if fresh.addr.ip() == prev.addr.ip() {
+        (prev, ReresolveAction::NoChange)
+    } else {
+        (fresh, ReresolveAction::ReplaceSocket)
+    }
+}
+
+#[inline]
+fn decide_upstream_reresolve(
+    prev: CanonicalAddr,
+    resolved: SocketAddr,
+    connected: bool,
+    proto: SupportedProtocol,
+    sock_type: Type,
+) -> (CanonicalAddr, ReresolveAction) {
+    let fresh = prev.with_resolved_ip(resolved);
+    if fresh.addr.ip() == prev.addr.ip() {
+        return (prev, ReresolveAction::NoChange);
+    }
+    if family_changed(prev.addr, fresh.addr) {
+        return (fresh, ReresolveAction::ReplaceSocket);
+    }
+
+    let capability = socket_reuse_capability(SocketRole::Upstream, proto, sock_type);
+    if !connected {
+        (fresh, ReresolveAction::UpdateMetadataOnly)
+    } else if capability.can_reconnect_in_place {
+        (fresh, ReresolveAction::ReconnectInPlace)
+    } else {
+        (fresh, ReresolveAction::ReplaceSocket)
+    }
+}
+
 /// Manages both local and upstream sockets and publishes versioned updates.
 ///
 /// **STRICT LOCK ORDER**:
@@ -68,7 +118,6 @@ pub struct SocketManager {
     listen_target: String,                   // unresolved --here host:port
     listen_proto: SupportedProtocol,         // never changes
     upstream_target: String,                 // unresolved --there host:port
-    upstream_request: CanonicalAddr,
     upstream_local_id: u16,
     upstream: Mutex<UpstreamState>,    // cold-path updates only
     upstream_proto: SupportedProtocol, // never changes
@@ -105,7 +154,6 @@ impl SocketManager {
             listen_target,
             listen_proto,
             upstream_target,
-            upstream_request: upstream,
             upstream_local_id,
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
@@ -256,69 +304,102 @@ impl SocketManager {
         &self,
         context: &str,
     ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool)> {
-        let fresh = CanonicalAddr::new(
-            resolve_first(&self.upstream_target)?,
-            self.upstream_request.id,
+        let resolved = resolve_first(&self.upstream_target)?;
+        let mut up_guard = self.upstream.lock().unwrap();
+        let prev_addr = up_guard.remote;
+        let prev_local = up_guard.local;
+        let prev_connected = up_guard.connected;
+        let prev_sock_type = up_guard.sock_type;
+        let (fresh, action) = decide_upstream_reresolve(
+            prev_addr,
+            resolved,
+            prev_connected,
+            self.upstream_proto,
+            prev_sock_type,
         );
 
-        // Compare against previous before updating to compute correct family flip
-        let mut up_guard = self.upstream.lock().unwrap();
-        let (fam_flip, changed) = {
-            let prev_addr = up_guard.remote;
-            let changed = prev_addr != fresh;
-            let fam_flip = if changed {
+        let changed = action != ReresolveAction::NoChange;
+        let fam_flip = changed && family_changed(prev_addr.addr, fresh.addr);
+
+        match action {
+            ReresolveAction::NoChange => Ok((
+                up_guard.sock.try_clone()?,
+                prev_addr,
+                prev_local,
+                prev_sock_type,
+                false,
+            )),
+            ReresolveAction::UpdateMetadataOnly => {
+                log_info!(
+                    "{context}: upstream {} (IP changed; metadata updated)",
+                    fresh
+                );
                 up_guard.remote = fresh;
-                family_changed(prev_addr.addr, fresh.addr)
-            } else {
-                false
-            };
-            (fam_flip, changed)
-        };
+                Ok((
+                    up_guard.sock.try_clone()?,
+                    up_guard.remote,
+                    up_guard.local,
+                    up_guard.sock_type,
+                    true,
+                ))
+            }
+            ReresolveAction::ReconnectInPlace => {
+                log_info!(
+                    "{context}: upstream {} (IP changed; upstream socket reconnected)",
+                    fresh
+                );
+                if let Err(reconnect_err) = disconnect_socket(&up_guard.sock)
+                    .and_then(|_| up_guard.sock.connect(&fresh.as_sock_addr()))
+                {
+                    log_info!(
+                        "{context}: upstream {} reconnect failed ({}); replacing socket",
+                        fresh,
+                        reconnect_err
+                    );
+                    let (new_sock, local, remote, new_type) = make_upstream_socket_for(
+                        fresh,
+                        self.upstream_proto,
+                        self.upstream_local_id,
+                        self.upstream_local_id == 0,
+                    )?;
+                    up_guard.local = local;
+                    up_guard.remote = remote;
+                    up_guard.connected = true;
+                    up_guard.sock = new_sock.try_clone()?;
+                    up_guard.sock_type = new_type;
+                    return Ok((new_sock, remote, local, new_type, true));
+                }
 
-        // Prepare a socket to return while also updating the internal socket state.
-        let (ret_sock, eff_remote, eff_local, eff_type) = if fam_flip {
-            log_info!("{context}: upstream {fresh} (family changed; upstream socket swapped)");
-            // Family changed: create a new **connected** upstream socket and swap it in.
-            let (new_sock, local, remote, new_type) = make_upstream_socket_for(
-                fresh,
-                self.upstream_proto,
-                self.upstream_local_id,
-                self.upstream_local_id == 0,
-            )?;
-            up_guard.local = local;
-            up_guard.remote = remote;
-            up_guard.connected = true;
-            up_guard.sock = new_sock.try_clone()?;
-            up_guard.sock_type = new_type;
-            (new_sock, remote, local, new_type)
-        } else if changed {
-            log_info!("{context}: upstream {fresh}");
-            let (new_sock, local, remote, new_type) = make_upstream_socket_for(
-                fresh,
-                self.upstream_proto,
-                self.upstream_local_id,
-                self.upstream_local_id == 0,
-            )?;
-            up_guard.local = local;
-            up_guard.remote = remote;
-            up_guard.connected = true;
-            up_guard.sock = new_sock.try_clone()?;
-            up_guard.sock_type = new_type;
-            (new_sock, remote, local, new_type)
-        } else {
-            // No change: just return a clone of the current socket
-            let s = up_guard.sock.try_clone()?;
-            let t = up_guard.sock_type;
-            (s, up_guard.remote, up_guard.local, t)
-        };
-
-        Ok((
-            ret_sock,
-            eff_remote,
-            eff_local,
-            eff_type,
-            fam_flip || changed,
-        ))
+                up_guard.remote = fresh;
+                up_guard.connected = true;
+                Ok((
+                    up_guard.sock.try_clone()?,
+                    up_guard.remote,
+                    up_guard.local,
+                    up_guard.sock_type,
+                    true,
+                ))
+            }
+            ReresolveAction::ReplaceSocket => {
+                log_info!(
+                    "{context}: upstream {} ({}IP changed; upstream socket swapped)",
+                    fresh,
+                    if fam_flip { "family and " } else { "" }
+                );
+                let (new_sock, local, remote, new_type) = make_upstream_socket_for(
+                    fresh,
+                    self.upstream_proto,
+                    self.upstream_local_id,
+                    self.upstream_local_id == 0,
+                )?;
+                up_guard.local = local;
+                up_guard.remote = remote;
+                up_guard.connected = true;
+                up_guard.sock = new_sock.try_clone()?;
+                up_guard.sock_type = new_type;
+                Ok((new_sock, remote, local, new_type, true))
+            }
+        }
     }
 
     fn reresolve_listen(
@@ -332,49 +413,41 @@ impl SocketManager {
         bool,
         Type,
     )> {
-        let fresh = resolve_first(&self.listen_target)?;
+        let resolved = resolve_first(&self.listen_target)?;
 
         let mut cl_guard = self.client_listen.lock().unwrap();
-        let (fam_flip, changed) = {
-            let prev_addr = cl_guard.listen.addr;
-            let changed = prev_addr.ip() != fresh.ip();
-            let fam_flip = if changed {
-                cl_guard.listen.addr = fresh;
-                family_changed(prev_addr, fresh)
-            } else {
-                false
-            };
-            (fam_flip, changed)
-        };
+        let prev_listen = cl_guard.listen;
+        let (fresh, action) = decide_listener_reresolve(prev_listen, resolved);
 
-        let (ret_sock, cflow, cpeer, cconn, ltype) = if fam_flip || changed {
-            log_info!("{context}: listen {fresh} (listener swapped)");
-            let (new_sock, local_canonical, new_type) = make_socket(
-                fresh,
-                self.listen_proto,
-                1000,
-                true,
-                self.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
-            )?;
-
-            cl_guard.listen = local_canonical;
-            cl_guard.flow = None;
-            cl_guard.peer = None;
-            cl_guard.connected = false;
-            cl_guard.sock = new_sock.try_clone()?;
-            cl_guard.sock_type = new_type;
-            (new_sock, None, None, false, new_type)
-        } else {
-            (
+        match action {
+            ReresolveAction::NoChange => Ok((
                 cl_guard.sock.try_clone()?,
                 cl_guard.flow,
                 cl_guard.peer,
                 cl_guard.connected,
+                false,
                 cl_guard.sock_type,
-            )
-        };
+            )),
+            ReresolveAction::ReplaceSocket => {
+                log_info!("{context}: listen {} (listener swapped)", fresh);
+                let (new_sock, local_canonical, new_type) = make_socket(
+                    fresh.addr,
+                    self.listen_proto,
+                    1000,
+                    true,
+                    self.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
+                )?;
 
-        Ok((ret_sock, cflow, cpeer, cconn, fam_flip || changed, ltype))
+                cl_guard.listen = local_canonical;
+                cl_guard.flow = None;
+                cl_guard.peer = None;
+                cl_guard.connected = false;
+                cl_guard.sock = new_sock.try_clone()?;
+                cl_guard.sock_type = new_type;
+                Ok((new_sock, None, None, false, true, new_type))
+            }
+            _ => unreachable!("listener re-resolve only supports no-op or replacement"),
+        }
     }
 
     /// Re-resolve both ends and publish any changes. When `allow_listen_rebind`
@@ -573,5 +646,50 @@ mod tests {
         assert_eq!(cached.version, mgr.get_version());
         assert_eq!(cached.locked_flow, Some(ClientFlowKey::Udp(addr)));
         assert!(!cached.client_connected);
+    }
+
+    #[test]
+    fn listener_reresolve_uses_canonical_refresh_rules() {
+        let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777), 8888);
+        let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1234);
+        let (fresh, action) = decide_listener_reresolve(prev, resolved);
+
+        assert_eq!(action, ReresolveAction::ReplaceSocket);
+        assert_eq!(fresh.id, 8888);
+        assert_eq!(fresh.addr.port(), 8888);
+        assert_eq!(fresh.addr.ip(), resolved.ip());
+    }
+
+    #[test]
+    fn upstream_same_family_connected_prefers_reconnect_when_policy_allows() {
+        let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
+        let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9999);
+        let (fresh, action) =
+            decide_upstream_reresolve(prev, resolved, true, SupportedProtocol::UDP, Type::DGRAM);
+
+        assert_eq!(fresh.id, 5555);
+        assert_eq!(fresh.addr.port(), 5555);
+        assert_eq!(fresh.addr.ip(), resolved.ip());
+        assert_eq!(action, ReresolveAction::ReconnectInPlace);
+    }
+
+    #[test]
+    fn upstream_raw_same_family_change_falls_back_to_replace() {
+        let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
+        let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9999);
+        let (_, action) =
+            decide_upstream_reresolve(prev, resolved, true, SupportedProtocol::ICMP, Type::RAW);
+
+        assert_eq!(action, ReresolveAction::ReplaceSocket);
+    }
+
+    #[test]
+    fn upstream_unconnected_same_family_change_only_updates_metadata() {
+        let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
+        let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9999);
+        let (_, action) =
+            decide_upstream_reresolve(prev, resolved, false, SupportedProtocol::UDP, Type::DGRAM);
+
+        assert_eq!(action, ReresolveAction::UpdateMetadataOnly);
     }
 }

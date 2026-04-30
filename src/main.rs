@@ -19,6 +19,7 @@ use flow_state::FlowRuntimeState;
 use net::icmp_support::listener_requires_raw_icmp;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
+use net::socket_policy::should_force_listener_no_connect_on_timeout;
 use net::sync_icmp::SharedSyncIcmpState;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
@@ -118,18 +119,6 @@ fn main() -> io::Result<()> {
     let mut requested_cfg = parse_args();
     let worker_count = requested_cfg.workers.max(1);
 
-    // Disconnect does not work for raw listen sockets and FreeBSD UDP
-    // disconnect is unreliable; keep sockets unconnected so we can relock.
-    #[cfg(not(target_os = "freebsd"))]
-    let broken_disconnect = requested_cfg.listen_proto == SupportedProtocol::ICMP;
-
-    #[cfg(target_os = "freebsd")]
-    let broken_disconnect = true;
-
-    if requested_cfg.on_timeout == TimeoutAction::Drop && broken_disconnect {
-        requested_cfg.debug_behavior.no_connect = true;
-    }
-
     // Listener for the local client (this may require root for low ports)
     let (client_sock, actual_listen, listen_sock_type) = make_socket(
         requested_cfg.listen_request.addr,
@@ -138,6 +127,12 @@ fn main() -> io::Result<()> {
         worker_count != 1,
         requested_cfg.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
     )?;
+
+    if requested_cfg.on_timeout == TimeoutAction::Drop
+        && should_force_listener_no_connect_on_timeout(requested_cfg.listen_proto, listen_sock_type)
+    {
+        requested_cfg.debug_behavior.no_connect = true;
+    }
 
     let cfg = Arc::new(realize_config(requested_cfg, actual_listen)?);
 
