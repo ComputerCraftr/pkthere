@@ -1,5 +1,7 @@
 use crate::core::{strip_log_prefix, wait_for_stats_json_from};
-use crate::orchestrator::{CLIENT_WAIT_MS, JSON_WAIT_MS};
+use crate::orchestrator::{
+    CLIENT_WAIT_MS, ForwarderSession, JSON_WAIT_MS, snapshot_forwarder_output_tail,
+};
 
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -9,15 +11,47 @@ use std::time::{Duration, Instant};
 pub struct StatsWaitOutcome {
     pub matched: bool,
     pub last_seen: Option<serde_json::Value>,
+    pub recent_stdout_tail: Option<String>,
+    pub recent_stderr_tail: Option<String>,
+}
+
+impl StatsWaitOutcome {
+    pub fn into_matched_stats(self) -> Option<serde_json::Value> {
+        if self.matched { self.last_seen } else { None }
+    }
+
+    pub fn with_output_tails(mut self, stdout: String, stderr: String) -> Self {
+        self.recent_stdout_tail = (!stdout.trim().is_empty()).then_some(stdout);
+        self.recent_stderr_tail = (!stderr.trim().is_empty()).then_some(stderr);
+        self
+    }
+
+    pub fn failure_details(&self) -> String {
+        let mut parts = vec![format!(
+            "last seen stats: {}",
+            self.last_seen
+                .as_ref()
+                .map(|stats| stats.to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        )];
+
+        if let Some(stdout) = &self.recent_stdout_tail {
+            parts.push(format!("recent stdout tail:\n{stdout}"));
+        }
+        if let Some(stderr) = &self.recent_stderr_tail {
+            parts.push(format!("recent stderr tail:\n{stderr}"));
+        }
+
+        parts.join("\n")
+    }
 }
 
 pub fn wait_for_stats_matching<R: Read>(
     reader: &mut R,
     max_wait: Duration,
     predicate: impl FnMut(&serde_json::Value) -> bool,
-) -> Option<serde_json::Value> {
-    let outcome = wait_for_stats_match_or_last(reader, max_wait, predicate);
-    outcome.last_seen.filter(|_| outcome.matched)
+) -> StatsWaitOutcome {
+    wait_for_stats_match_or_last(reader, max_wait, predicate)
 }
 
 pub fn wait_for_stats_match_or_last<R: Read>(
@@ -35,6 +69,8 @@ pub fn wait_for_stats_match_or_last<R: Read>(
                 return StatsWaitOutcome {
                     matched: true,
                     last_seen,
+                    recent_stdout_tail: None,
+                    recent_stderr_tail: None,
                 };
             }
         }
@@ -43,7 +79,34 @@ pub fn wait_for_stats_match_or_last<R: Read>(
     StatsWaitOutcome {
         matched: false,
         last_seen,
+        recent_stdout_tail: None,
+        recent_stderr_tail: None,
     }
+}
+
+pub fn wait_for_session_stats_matching(
+    session: &mut ForwarderSession,
+    max_wait: Duration,
+    predicate: impl FnMut(&serde_json::Value) -> bool,
+) -> StatsWaitOutcome {
+    let outcome = wait_for_stats_match_or_last(&mut session.out, max_wait, predicate);
+    match snapshot_forwarder_output_tail(session, 20) {
+        Ok((stdout, stderr)) => outcome.with_output_tails(stdout, stderr),
+        Err(_) => outcome,
+    }
+}
+
+pub fn expect_session_stats_matching(
+    session: &mut ForwarderSession,
+    max_wait: Duration,
+    context: &str,
+    predicate: impl FnMut(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let outcome = wait_for_session_stats_matching(session, max_wait, predicate);
+    assert!(outcome.matched, "{context}\n{}", outcome.failure_details());
+    outcome
+        .into_matched_stats()
+        .expect("matched stats outcome must include last_seen")
 }
 
 pub fn send_until_locked<R: Read>(

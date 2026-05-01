@@ -8,7 +8,6 @@ use crate::net::socket::{
 use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
 use socket2::{SockAddr, Socket, Type};
 
-use crate::log_info;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Mutex;

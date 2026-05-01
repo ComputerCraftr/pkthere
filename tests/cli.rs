@@ -526,15 +526,22 @@ fn rejects_malformed_ipv6_icmp_upstream_shapes() {
 #[test]
 fn rejects_duplicate_single_value_flags() {
     let (here, there) = udp_cli_pair(IpFamily::V4, 1, 2);
-    let mut cases = vec![(
+    #[cfg(unix)]
+    let cases = vec![
+        (
+            vec!["--reresolve-mode", "upstream", "--reresolve-mode", "both"],
+            vec!["--reresolve-mode specified multiple times"],
+        ),
+        (
+            vec!["--user", "nobody", "--user", "daemon"],
+            vec!["--user specified multiple times"],
+        ),
+    ];
+    #[cfg(not(unix))]
+    let cases = vec![(
         vec!["--reresolve-mode", "upstream", "--reresolve-mode", "both"],
         vec!["--reresolve-mode specified multiple times"],
     )];
-    #[cfg(unix)]
-    cases.push((
-        vec!["--user", "nobody", "--user", "daemon"],
-        vec!["--user specified multiple times"],
-    ));
 
     for (extra_args, expected) in cases {
         let mut args = vec!["--here", here.as_str(), "--there", there.as_str()];

@@ -14,9 +14,9 @@ mod timing;
 pub mod user_policy;
 
 pub use forwarder::{
-    ForwarderConfig, OutputCapture, SocketMode, collect_forwarder_output, launch_forwarder,
-    snapshot_forwarder_output, terminate_forwarder, try_launch_forwarder,
-    wait_for_child_exit_success,
+    ForwarderConfig, ForwarderSession, OutputCapture, SocketMode, collect_forwarder_output,
+    launch_forwarder, snapshot_forwarder_output, snapshot_forwarder_output_tail,
+    terminate_forwarder, try_launch_forwarder, wait_for_child_exit_success,
 };
 pub use matrix::{
     IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, NODE1_IPV4, NODE1_IPV4_STR, NODE2_IPV4,
@@ -29,8 +29,9 @@ pub use raw_icmp::{
     platform_supports_dgram_icmp, require_kernel_echo_reply_supported, require_raw_icmp_supported,
 };
 pub use runtime_asserts::{
-    StatsWaitOutcome, expect_no_echo, json_addr, send_until_locked, wait_for_locked_client_from,
-    wait_for_stats_match_or_last, wait_for_stats_matching,
+    StatsWaitOutcome, expect_no_echo, expect_session_stats_matching, json_addr, send_until_locked,
+    wait_for_locked_client_from, wait_for_session_stats_matching, wait_for_stats_match_or_last,
+    wait_for_stats_matching,
 };
 pub use timing::{
     CLIENT_WAIT_MS, DRAIN_WAIT_MS, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, TIMEOUT_SECS,

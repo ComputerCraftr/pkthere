@@ -9,12 +9,12 @@ use crate::orchestrator::{
     CLIENT_WAIT_MS, DRAIN_WAIT_MS, ForwarderConfig, IPV4_ONLY_FAMILIES, IpFamily, JSON_WAIT_MS,
     MAX_WAIT_SECS, MatrixCase, NODE1_IPV4_STR, NODE2_IPV4_STR, NODE3_IPV4, OutputCapture,
     SOCKET_MODES, SUPPORTED_PROTOCOLS, bind_client_or_skip, bind_udp_client,
-    collect_forwarder_output, default_test_icmp_upstream_arg, expect_no_echo, json_addr,
-    launch_forwarder, localhost_addr, random_unprivileged_port, render_canonical_ip_id,
-    render_icmp_arg, render_icmp_arg_with_local, run_matrix_cases, send_until_locked,
-    snapshot_forwarder_output, spawn_upstream_echo_or_skip, terminate_forwarder,
-    try_launch_forwarder, wait_for_child_exit_success, wait_for_locked_client_from,
-    wait_for_stats_match_or_last, wait_for_stats_matching,
+    collect_forwarder_output, default_test_icmp_upstream_arg, expect_no_echo,
+    expect_session_stats_matching, json_addr, launch_forwarder, localhost_addr,
+    random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
+    run_matrix_cases, send_until_locked, snapshot_forwarder_output, spawn_upstream_echo_or_skip,
+    terminate_forwarder, try_launch_forwarder, wait_for_child_exit_success,
+    wait_for_locked_client_from,
 };
 
 use std::io::ErrorKind;
@@ -312,7 +312,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect("ICMP listen id 2");
 
     let node3_ip = NODE3_IPV4;
-    let node3 = try_launch_forwarder(ForwarderConfig {
+    let mut node3 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         there: format!("UDP:{udp_up_addr}"),
@@ -329,7 +329,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     .expect("could not launch ICMP endpoint node on raw-capable host");
 
     let node2_ip = NODE2_IPV4_STR;
-    let node2 = try_launch_forwarder(ForwarderConfig {
+    let mut node2 = try_launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
@@ -345,7 +345,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     })
     .expect("could not launch pure ICMP middle node");
 
-    let node1 = launch_forwarder(ForwarderConfig {
+    let mut node1 = launch_forwarder(ForwarderConfig {
         mode: crate::orchestrator::SocketMode::Connected,
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
@@ -364,8 +364,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         .expect("connect client to first forwarder");
 
     // Verify node2 (pure ICMP) uses RAW listener and DGRAM upstream (where supported)
-    let mut node2_out = node2.out;
-    let stats2 = wait_for_stats_json_from(&mut node2_out, JSON_WAIT_MS).expect("node2 stats");
+    let stats2 = wait_for_stats_json_from(&mut node2.out, JSON_WAIT_MS).expect("node2 stats");
     assert_eq!(
         stats2["worker_flows"][0]["client_sock_type"], "RAW",
         "middle node listener must be RAW"
@@ -381,8 +380,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     );
 
     // Verify node3 (ICMP endpoint) uses RAW listener
-    let mut node3_out = node3.out;
-    let stats3 = wait_for_stats_json_from(&mut node3_out, JSON_WAIT_MS).expect("node3 stats");
+    let stats3 = wait_for_stats_json_from(&mut node3.out, JSON_WAIT_MS).expect("node3 stats");
     assert_eq!(
         stats3["worker_flows"][0]["client_sock_type"], "RAW",
         "endpoint node listener must be RAW"
@@ -414,21 +412,21 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         Err(e) => panic!("unexpected recv error: {e}"),
     }
 
-    for (i, mut out) in [node1.out, node2_out, node3_out].into_iter().enumerate() {
-        let outcome = wait_for_stats_match_or_last(&mut out, Duration::from_secs(5), |stats| {
-            stats["c2u_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
-                && stats["u2c_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
-                && stats["c2u_pkts"].as_u64().unwrap_or(0) == 2
-                && stats["u2c_pkts"].as_u64().unwrap_or(0) == 2
-        });
-        assert!(
-            outcome.matched,
-            "did not see expected stats JSON line from node {}. last seen stats: {}",
-            i + 1,
-            outcome
-                .last_seen
-                .map(|stats| stats.to_string())
-                .unwrap_or_else(|| "<none>".to_string())
+    for (name, session) in [
+        ("node 1", &mut node1),
+        ("node 2", &mut node2),
+        ("node 3", &mut node3),
+    ] {
+        let _stats = expect_session_stats_matching(
+            session,
+            Duration::from_secs(5),
+            &format!("did not see expected stats JSON line from {name}"),
+            |stats| {
+                stats["c2u_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
+                    && stats["u2c_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
+                    && stats["c2u_pkts"].as_u64().unwrap_or(0) == 2
+                    && stats["u2c_pkts"].as_u64().unwrap_or(0) == 2
+            },
         );
     }
 }
@@ -924,11 +922,15 @@ fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>)
 
     expect_no_echo(&client_a, &mut [0u8; 256]);
 
-    let stats = wait_for_stats_matching(&mut session.out, MAX_WAIT_SECS, |candidate| {
-        candidate["locked"].as_bool().unwrap_or(false)
-            && candidate["u2c_errs"].as_u64().unwrap_or(0) > 0
-    })
-    .expect("did not see forwarding errors in stats JSON");
+    let stats = expect_session_stats_matching(
+        &mut session,
+        MAX_WAIT_SECS,
+        "did not see forwarding errors in stats JSON",
+        |candidate| {
+            candidate["locked"].as_bool().unwrap_or(false)
+                && candidate["u2c_errs"].as_u64().unwrap_or(0) > 0
+        },
+    );
     assert_eq!(
         json_addr(&locked_worker_flow(&stats)["client_addr"]).expect("stats client addr"),
         client_a.local_addr().expect("client A local addr")
@@ -1128,10 +1130,12 @@ fn test_raw_icmp_independent_ids() {
     assert_eq!(&buf[..n], payload);
 
     // Verify Node B used the independent IDs correctly in its stats
-    let stats_b = wait_for_stats_matching(&mut node_b.out, Duration::from_secs(5), |s| {
-        s["c2u_pkts"].as_u64().unwrap_or(0) >= 1
-    })
-    .expect("did not see stats for node B");
+    let stats_b = expect_session_stats_matching(
+        &mut node_b,
+        Duration::from_secs(5),
+        "did not see stats for node B",
+        |s| s["c2u_pkts"].as_u64().unwrap_or(0) >= 1,
+    );
 
     let worker_b = locked_worker_flow(&stats_b);
     let client_addr_b = worker_b["client_addr"].as_str().expect("client_addr");

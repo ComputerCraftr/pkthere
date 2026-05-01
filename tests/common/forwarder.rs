@@ -38,14 +38,25 @@ pub struct ForwarderConfig<'a> {
 }
 
 pub enum SessionStdout {
-    Direct(ChildStdout),
+    Direct {
+        stdout: ChildStdout,
+        seen: Arc<Mutex<Vec<u8>>>,
+    },
     Buffered,
 }
 
 impl Read for SessionStdout {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
-            Self::Direct(stdout) => stdout.read(buf),
+            Self::Direct { stdout, seen } => {
+                let n = stdout.read(buf)?;
+                if n > 0 {
+                    seen.lock()
+                        .expect("direct stdout capture lock")
+                        .extend_from_slice(&buf[..n]);
+                }
+                Ok(n)
+            }
             Self::Buffered => Err(io::Error::other(
                 "buffered forwarder stdout is not readable directly; use captured output helpers",
             )),
@@ -84,6 +95,7 @@ pub struct ForwarderSession {
     pub child: ChildGuard,
     pub out: SessionStdout,
     pub listen_addr: SocketAddr,
+    direct_stdout: Option<Arc<Mutex<Vec<u8>>>>,
     capture: Option<CaptureHandle>,
 }
 
@@ -161,10 +173,21 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         ));
     };
 
-    let (out, capture) = match cfg.capture_mode {
-        OutputCapture::Direct => (SessionStdout::Direct(out), None),
+    let (out, direct_stdout, capture) = match cfg.capture_mode {
+        OutputCapture::Direct => {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            (
+                SessionStdout::Direct {
+                    stdout: out,
+                    seen: Arc::clone(&seen),
+                },
+                Some(seen),
+                None,
+            )
+        }
         OutputCapture::Buffered => (
             SessionStdout::Buffered,
+            None,
             Some(spawn_capture_threads(out, err)),
         ),
     };
@@ -173,6 +196,7 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         child,
         out,
         listen_addr,
+        direct_stdout,
         capture,
     })
 }
@@ -182,18 +206,36 @@ pub fn collect_forwarder_output(session: &mut ForwarderSession) -> io::Result<(S
         return capture.join();
     }
 
-    let mut stdout = String::new();
-    session.out.read_to_string(&mut stdout)?;
-    Ok((stdout, String::new()))
+    let mut sink = String::new();
+    session.out.read_to_string(&mut sink)?;
+    snapshot_forwarder_output(session)
 }
 
 pub fn snapshot_forwarder_output(session: &ForwarderSession) -> io::Result<(String, String)> {
     match session.capture.as_ref() {
         Some(capture) => Ok(capture.snapshot()),
-        None => Err(io::Error::other(
-            "forwarder session does not use buffered output capture",
-        )),
+        None => match session.direct_stdout.as_ref() {
+            Some(stdout) => Ok((
+                String::from_utf8_lossy(&stdout.lock().expect("direct stdout capture lock"))
+                    .into_owned(),
+                String::new(),
+            )),
+            None => Err(io::Error::other(
+                "forwarder session does not expose captured output",
+            )),
+        },
     }
+}
+
+pub fn snapshot_forwarder_output_tail(
+    session: &ForwarderSession,
+    max_lines: usize,
+) -> io::Result<(String, String)> {
+    let (stdout, stderr) = snapshot_forwarder_output(session)?;
+    Ok((
+        render_output_tail(&stdout, max_lines),
+        render_output_tail(&stderr, max_lines),
+    ))
 }
 
 pub fn terminate_forwarder(session: &mut ForwarderSession) {
@@ -261,4 +303,10 @@ fn join_capture_thread(thread: JoinHandle<io::Result<()>>, name: &str) -> io::Re
         Ok(res) => res,
         Err(_) => Err(io::Error::other(format!("{name} capture thread panicked"))),
     }
+}
+
+fn render_output_tail(text: &str, max_lines: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
