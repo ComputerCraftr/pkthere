@@ -133,21 +133,14 @@ mod tests {
     use std::net::{IpAddr, Ipv6Addr};
 
     #[test]
-    fn default_test_upstream_arg_uses_dynamic_icmp_id() {
+    fn default_test_upstream_arg_preserves_protocol_specific_shape() {
         let addr = localhost_addr(IpFamily::V4, 4444);
-        assert_eq!(
-            default_test_upstream_arg("ICMP", addr),
-            format!("ICMP:{}:0", super::NODE1_IPV4_STR)
-        );
-    }
-
-    #[test]
-    fn default_test_upstream_arg_preserves_udp_socket_addr() {
-        let addr = localhost_addr(IpFamily::V4, 4444);
-        assert_eq!(
-            default_test_upstream_arg("UDP", addr),
-            format!("UDP:{}:4444", super::NODE1_IPV4_STR)
-        );
+        for (proto, expected) in [
+            ("ICMP", format!("ICMP:{}:0", super::NODE1_IPV4_STR)),
+            ("UDP", format!("UDP:{}:4444", super::NODE1_IPV4_STR)),
+        ] {
+            assert_eq!(default_test_upstream_arg(proto, addr), expected);
+        }
     }
 
     #[test]

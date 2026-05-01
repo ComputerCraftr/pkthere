@@ -3,7 +3,7 @@ use crate::flow_key::ClientFlowKey;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-pub struct FlowClaimTable {
+pub(crate) struct FlowClaimTable {
     claims: Mutex<HashMap<ClientFlowKey, usize>>,
 }
 

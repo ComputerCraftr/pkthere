@@ -1,5 +1,6 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::net::icmp_parse::{be16_16, parse_icmp_echo_header};
+use crate::net::byte_order::be16_16;
+use crate::net::icmp_echo_parse::parse_icmp_echo_header;
 use crate::net::payload_support::{
     ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_HAS_SOURCE_ID, ICMP_SHIM_IS_DATA,
 };

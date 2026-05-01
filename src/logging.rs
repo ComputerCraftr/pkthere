@@ -3,14 +3,14 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomOrdering};
 
 #[doc(hidden)]
-pub const fn log_dir_label(c2u: bool) -> &'static str {
+pub(crate) const fn log_dir_label(c2u: bool) -> &'static str {
     if c2u { "c2u" } else { "u2c" }
 }
 
 static STDOUT_BROKEN: AtomicBool = AtomicBool::new(false);
 
 #[doc(hidden)]
-pub fn emit_stdout(args: fmt::Arguments<'_>) {
+pub(crate) fn emit_stdout(args: fmt::Arguments<'_>) {
     if STDOUT_BROKEN.load(AtomOrdering::Relaxed) {
         return;
     }
@@ -24,7 +24,7 @@ pub fn emit_stdout(args: fmt::Arguments<'_>) {
 }
 
 #[doc(hidden)]
-pub fn emit_stderr(args: fmt::Arguments<'_>) {
+pub(crate) fn emit_stderr(args: fmt::Arguments<'_>) {
     let _ = writeln!(io::stderr().lock(), "{args}");
 }
 

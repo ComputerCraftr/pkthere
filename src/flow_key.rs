@@ -5,7 +5,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ClientFlowKey {
+pub(crate) enum ClientFlowKey {
     Udp(SocketAddr),
     IcmpV4 {
         ip: std::net::Ipv4Addr,

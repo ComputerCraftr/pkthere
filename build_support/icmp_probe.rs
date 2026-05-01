@@ -1,0 +1,75 @@
+#[path = "../src/net/icmp_echo_parse.rs"]
+mod icmp_echo_parse;
+
+use icmp_echo_parse::parse_icmp_echo_header;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::{Duration, Instant};
+
+pub fn probe_kernel_icmp_echo() -> io::Result<()> {
+    let (sock, _sock_type) =
+        if let Ok(s) = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)) {
+            (s, Type::DGRAM)
+        } else if let Ok(s) = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)) {
+            (s, Type::RAW)
+        } else {
+            return Err(io::Error::other("could not create ICMP socket"));
+        };
+
+    sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+
+    let mut request = [
+        8u8, 0, 0, 0, 0, 0, 0, 0, b'p', b'k', b't', b'h', b'e', b'r', b'e',
+    ];
+    let mut sum = 0u32;
+    let (chunks, remainder) = request.as_chunks::<2>();
+    for chunk in chunks {
+        sum += u16::from_be_bytes(*chunk) as u32;
+    }
+    if let [last] = remainder {
+        sum += (*last as u32) << 8;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let checksum = !(sum as u16);
+    let checksum_bytes = checksum.to_be_bytes();
+    request[2] = checksum_bytes[0];
+    request[3] = checksum_bytes[1];
+
+    let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    sock.connect(&SockAddr::from(dest))?;
+    sock.send(&request)?;
+
+    let mut recv_buf = [std::mem::MaybeUninit::uninit(); 2048];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(500) {
+        match sock.recv(&mut recv_buf) {
+            Ok(n) => {
+                if n < 8 {
+                    continue;
+                }
+                let buf = unsafe {
+                    &*(&recv_buf[..n] as *const [std::mem::MaybeUninit<u8>] as *const [u8])
+                };
+
+                let (ok, _raw, _start, _end, _ident, _seq, is_req) = parse_icmp_echo_header(buf);
+                if ok && !is_req {
+                    return Ok(());
+                }
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "kernel did not provide ICMP echo reply on localhost",
+    ))
+}

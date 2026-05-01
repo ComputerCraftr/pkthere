@@ -8,7 +8,7 @@ use std::io;
 use std::{env, process};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SupportedProtocol {
+pub(crate) enum SupportedProtocol {
     UDP,
     ICMP,
 }
@@ -37,13 +37,13 @@ impl std::fmt::Display for SupportedProtocol {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeoutAction {
+pub(crate) enum TimeoutAction {
     Drop,
     Exit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReresolveMode {
+pub(crate) enum ReresolveMode {
     None,
     Upstream,
     Listen,
@@ -51,13 +51,13 @@ pub enum ReresolveMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkerFlowMode {
+pub(crate) enum WorkerFlowMode {
     SharedFlow,
     SingleFlow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ListenMode {
+pub(crate) enum ListenMode {
     Fixed,
     Dynamic, // WildcardLearn for ICMP, Ephemeral for UDP
 }
@@ -109,20 +109,20 @@ impl ReresolveMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DebugBehavior {
+pub(crate) struct DebugBehavior {
     pub no_connect: bool,
     pub fast_stats: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DebugLogs {
+pub(crate) struct DebugLogs {
     pub drops: bool,
     pub handles: bool,
     pub packets: bool,
 }
 
 #[derive(Clone, Debug)]
-pub struct RequestedConfig {
+pub(crate) struct RequestedConfig {
     pub listen_request: CanonicalAddr, // CLI UDP port or ICMP listener id
     pub listen_proto: SupportedProtocol, // UDP | ICMP
     pub listen_mode: ListenMode,       // Fixed or Dynamic (:0)
@@ -149,7 +149,7 @@ pub struct RequestedConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct RuntimeConfig {
+pub(crate) struct RuntimeConfig {
     pub listen: CanonicalAddr, // actual bound UDP port or ICMP local id
     pub listen_proto: SupportedProtocol, // UDP | ICMP
     pub listen_mode: ListenMode, // Fixed or Dynamic (:0)
@@ -175,7 +175,7 @@ pub struct RuntimeConfig {
     pub debug_logs: DebugLogs,
 }
 
-pub fn realize_config(
+pub(crate) fn realize_config(
     requested: RequestedConfig,
     listen: CanonicalAddr,
 ) -> io::Result<RuntimeConfig> {
@@ -311,7 +311,7 @@ fn parse_icmp_cli_target(
     parse_ids(parts[0], &parts[1..])
 }
 
-pub fn parse_args() -> RequestedConfig {
+pub(crate) fn parse_args() -> RequestedConfig {
     // One place for usage. Program name is filled dynamically.
     fn print_usage_and_exit(code: i32) -> ! {
         let prog = env::args()

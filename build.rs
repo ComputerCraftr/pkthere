@@ -1,7 +1,7 @@
 use socket2::{Domain, Protocol, Socket, Type};
 
-#[path = "src/net/icmp_parse.rs"]
-mod icmp_parse;
+#[path = "build_support/icmp_probe.rs"]
+mod icmp_probe;
 
 fn main() {
     println!("cargo::rustc-check-cfg=cfg(supports_kernel_icmp_echo)");
@@ -20,11 +20,13 @@ fn main() {
     }
 
     // 2. Probe for kernel echo response (can work via DGRAM or RAW)
-    if allow_kernel_echo_env || icmp_parse::probe_kernel_icmp_echo().is_ok() {
+    if allow_kernel_echo_env || icmp_probe::probe_kernel_icmp_echo().is_ok() {
         println!("cargo:rustc-cfg=supports_kernel_icmp_echo");
     }
 
     println!("cargo:rerun-if-env-changed=PKTHERE_ALLOW_RAW_ICMP");
     println!("cargo:rerun-if-env-changed=PKTHERE_ALLOW_KERNEL_ICMP_ECHO");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support/icmp_probe.rs");
+    println!("cargo:rerun-if-changed=src/net/icmp_echo_parse.rs");
 }

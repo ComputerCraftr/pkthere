@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomOrdering};
 use std::time::Instant;
 
-pub struct FlowRuntimeState {
+pub(crate) struct FlowRuntimeState {
     locked: AtomicBool,
     last_seen_s: AtomicU64,
 }

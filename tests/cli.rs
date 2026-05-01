@@ -18,6 +18,13 @@ use std::time::Duration;
 const CLI_WAIT: Duration = Duration::from_millis(500);
 const CLI_REJECT_WAIT: Duration = Duration::from_secs(2);
 
+fn udp_cli_pair(family: IpFamily, here_port: u16, there_port: u16) -> (String, String) {
+    (
+        default_test_upstream_arg("UDP", localhost_addr(family, here_port)),
+        default_test_upstream_arg("UDP", localhost_addr(family, there_port)),
+    )
+}
+
 #[test]
 fn rejects_missing_required_flags_here() {
     let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 53));
@@ -191,16 +198,6 @@ fn rejects_invalid_debug_value() {
 }
 
 #[test]
-fn rejects_removed_legacy_debug_flag() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--debug", "no-connect"],
-        &["unknown arg: --debug"],
-    );
-}
-
-#[test]
 fn rejects_comma_separated_debug_log_values() {
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
     let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
@@ -215,6 +212,29 @@ fn rejects_comma_separated_debug_log_values() {
         ],
         &["--debug-log", "exactly one", "drops,handles"],
     );
+}
+
+#[test]
+fn rejects_invalid_single_value_cli_options_against_base_udp_config() {
+    let (here, there) = udp_cli_pair(IpFamily::V4, 1, 2);
+    for (extra_args, expected) in [
+        (vec!["--debug", "no-connect"], vec!["unknown arg: --debug"]),
+        (
+            vec!["--icmp-sync-pps", "10"],
+            vec!["--icmp-sync-pps requires --there ICMP"],
+        ),
+        (vec!["--workers", "0"], vec!["--workers must be >= 1"]),
+        (
+            vec!["--max-payload", "65508"],
+            vec![
+                "exceeds the maximum supported by the selected protocols and address families (65507)",
+            ],
+        ),
+    ] {
+        let mut args = vec!["--here", here.as_str(), "--there", there.as_str()];
+        args.extend(extra_args);
+        assert_cli_rejects(&args, &expected);
+    }
 }
 
 #[test]
@@ -266,59 +286,22 @@ fn rejects_zero_icmp_sync_pps_with_udp_upstream() {
 }
 
 #[test]
-fn rejects_icmp_sync_pps_with_non_icmp_upstream() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--icmp-sync-pps", "10"],
-        &["--icmp-sync-pps requires --there ICMP"],
-    );
-}
-
-#[test]
-fn rejects_workers_zero() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--workers", "0"],
-        &["--workers must be >= 1"],
-    );
-}
-
-#[test]
-fn runs_with_worker_flow_mode_shared_flow() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 0));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_runs(
-        &[
-            "--here",
-            &here,
-            "--there",
-            &there,
-            "--worker-flow-mode",
-            "shared-flow",
-        ],
-        CLI_WAIT,
-        &["--worker-flow-mode"],
-    );
-}
-
-#[test]
-fn runs_with_worker_flow_mode_single_flow() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 0));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_runs(
-        &[
-            "--here",
-            &here,
-            "--there",
-            &there,
-            "--worker-flow-mode",
-            "single-flow",
-        ],
-        CLI_WAIT,
-        &["--worker-flow-mode"],
-    );
+fn runs_with_each_supported_worker_flow_mode() {
+    let (here, there) = udp_cli_pair(IpFamily::V4, 0, 2);
+    for mode in ["shared-flow", "single-flow"] {
+        assert_cli_runs(
+            &[
+                "--here",
+                &here,
+                "--there",
+                &there,
+                "--worker-flow-mode",
+                mode,
+            ],
+            CLI_WAIT,
+            &["--worker-flow-mode"],
+        );
+    }
 }
 
 #[test]
@@ -477,16 +460,6 @@ fn startup_logs_clarify_global_icmp_sync_budget() {
 }
 
 #[test]
-fn rejects_max_payload_too_large() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--max-payload", "65508"],
-        &["exceeds the maximum supported by the selected protocols and address families (65507)"],
-    );
-}
-
-#[test]
 fn rejects_max_payload_exceeding_icmp_tunnel_limit() {
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
     let there = render_icmp_arg(localhost_addr(IpFamily::V4, 0).ip(), 1234);
@@ -537,53 +510,37 @@ fn rejects_duplicate_icmp_sync_pps() {
 }
 
 #[test]
-fn rejects_bare_ipv6_icmp_upstream_without_brackets() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V6, 0));
-    assert_cli_rejects(
-        &["--here", &here, "--there", "ICMP:::1:1234"],
-        &["ICMP IPv6 addresses must use brackets"],
-    );
+fn rejects_malformed_ipv6_icmp_upstream_shapes() {
+    let (here, _there) = udp_cli_pair(IpFamily::V6, 0, 9);
+    for (there, expected) in [
+        ("ICMP:::1:1234", "ICMP IPv6 addresses must use brackets"),
+        (
+            "ICMP:[::1]:1:2:3",
+            "must use ICMP:<host>:<remote_id> or ICMP:[<ipv6>]:<remote_id>[:<local_id>]",
+        ),
+    ] {
+        assert_cli_rejects(&["--here", &here, "--there", there], &[expected]);
+    }
 }
 
 #[test]
-fn rejects_malformed_bracketed_ipv6_icmp_with_extra_segment() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V6, 0));
-    assert_cli_rejects(
-        &["--here", &here, "--there", "ICMP:[::1]:1:2:3"],
-        &["must use ICMP:<host>:<remote_id> or ICMP:[<ipv6>]:<remote_id>[:<local_id>]"],
-    );
-}
+fn rejects_duplicate_single_value_flags() {
+    let (here, there) = udp_cli_pair(IpFamily::V4, 1, 2);
+    let mut cases = vec![(
+        vec!["--reresolve-mode", "upstream", "--reresolve-mode", "both"],
+        vec!["--reresolve-mode specified multiple times"],
+    )];
+    #[cfg(unix)]
+    cases.push((
+        vec!["--user", "nobody", "--user", "daemon"],
+        vec!["--user specified multiple times"],
+    ));
 
-#[cfg(unix)]
-#[test]
-fn rejects_duplicate_user_flags() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_rejects(
-        &[
-            "--here", &here, "--there", &there, "--user", "nobody", "--user", "daemon",
-        ],
-        &["--user specified multiple times"],
-    );
-}
-
-#[test]
-fn rejects_duplicate_reresolve_mode() {
-    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 1));
-    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 2));
-    assert_cli_rejects(
-        &[
-            "--here",
-            &here,
-            "--there",
-            &there,
-            "--reresolve-mode",
-            "upstream",
-            "--reresolve-mode",
-            "both",
-        ],
-        &["--reresolve-mode specified multiple times"],
-    );
+    for (extra_args, expected) in cases {
+        let mut args = vec!["--here", here.as_str(), "--there", there.as_str()];
+        args.extend(extra_args);
+        assert_cli_rejects(&args, &expected);
+    }
 }
 
 #[cfg(unix)]

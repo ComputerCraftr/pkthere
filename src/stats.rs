@@ -17,13 +17,13 @@ pub(crate) trait StatsSink {
     fn drop_oversize(&self, c2u: bool);
 }
 
-pub struct Stats {
+pub(crate) struct Stats {
     start: OnceLock<Instant>,
     spawned: AtomicBool,
     shards: Vec<Arc<StatsShard>>,
 }
 
-pub struct StatsShard {
+pub(crate) struct StatsShard {
     agg: Agg,
 }
 

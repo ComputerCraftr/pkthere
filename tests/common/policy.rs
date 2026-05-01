@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
 const BLANKET_ALLOW_ATTR_ALLOWLIST: &[&str] = &["tests/common/orchestrator.rs"];
+const DUPLICATE_FUNCTION_BODY_MIN_LEN: usize = 80;
+const DUPLICATE_TEST_BODY_MIN_LEN: usize = 80;
 
 fn collect_sources_with_exts(root: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     let mut entries = fs::read_dir(root)
@@ -247,6 +249,186 @@ fn contains_call(body: &str, name: &str) -> bool {
     false
 }
 
+fn strip_cfg_test_items(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = text.to_string();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if !starts_with_keyword(bytes, i, "#") {
+            i += 1;
+            continue;
+        }
+
+        let Some(rest) = text.get(i..) else {
+            break;
+        };
+        if !rest.starts_with("#[cfg(test)]") {
+            i += 1;
+            continue;
+        }
+
+        let item_start = i;
+        i += "#[cfg(test)]".len();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        while i < bytes.len()
+            && (starts_with_keyword(bytes, i, "pub")
+                || starts_with_keyword(bytes, i, "const")
+                || starts_with_keyword(bytes, i, "unsafe")
+                || starts_with_keyword(bytes, i, "async"))
+        {
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+
+        if i >= bytes.len() {
+            break;
+        }
+
+        let item_end = if starts_with_keyword(bytes, i, "fn")
+            || starts_with_keyword(bytes, i, "mod")
+            || starts_with_keyword(bytes, i, "impl")
+        {
+            let Some(open_rel) = text[i..].find('{') else {
+                i += 1;
+                continue;
+            };
+            let open = i + open_rel;
+            let Some(close) = find_matching_brace(text, open) else {
+                i += 1;
+                continue;
+            };
+            close + 1
+        } else {
+            let Some(end_rel) = text[i..].find(';') else {
+                i += 1;
+                continue;
+            };
+            i + end_rel + 1
+        };
+
+        for idx in item_start..item_end {
+            let ch = out.as_bytes()[idx] as char;
+            out.replace_range(idx..idx + 1, if ch == '\n' { "\n" } else { " " });
+        }
+        i = item_end;
+    }
+
+    out
+}
+
+fn normalize_function_body(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn detect_duplicate_function_sources_in_rust_text(text: &str) -> Vec<(usize, String, String)> {
+    let sanitized = sanitize_rust_source(text);
+    let production_only = strip_cfg_test_items(&sanitized);
+    let mut defs_by_body = std::collections::BTreeMap::<String, Vec<(usize, String)>>::new();
+
+    for (name_start, name, body_open) in find_function_defs(&production_only) {
+        let Some(body_close) = find_matching_brace(&production_only, body_open) else {
+            continue;
+        };
+        let body = normalize_function_body(&production_only[body_open + 1..body_close]);
+        if body.len() < DUPLICATE_FUNCTION_BODY_MIN_LEN {
+            continue;
+        }
+        let line = production_only[..name_start]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+            + 1;
+        defs_by_body.entry(body).or_default().push((line, name));
+    }
+
+    defs_by_body
+        .into_iter()
+        .filter(|(_, defs)| defs.len() > 1)
+        .flat_map(|(body, defs)| {
+            defs.into_iter()
+                .map(move |(line, name)| (line, name, body.clone()))
+        })
+        .collect()
+}
+
+fn collect_preceding_attrs(text: &str, name_start: usize) -> Vec<String> {
+    let mut attrs = Vec::new();
+    let line_start = text[..name_start]
+        .rfind('\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let head = &text[..line_start];
+    let mut lines = head.lines().collect::<Vec<_>>();
+
+    while let Some(line) = lines.pop() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            attrs.push(trimmed.to_string());
+            continue;
+        }
+        break;
+    }
+
+    attrs.reverse();
+    attrs
+}
+
+fn is_test_function(path: &Path, attrs: &[String]) -> bool {
+    let rel = path.to_string_lossy();
+    rel.contains("tests/")
+        && attrs
+            .iter()
+            .any(|attr| attr.contains("test") || attr.contains("cfg_attr") && attr.contains("test"))
+}
+
+fn detect_duplicate_test_bodies_in_rust_text(
+    path: &Path,
+    text: &str,
+) -> Vec<(usize, String, String)> {
+    let sanitized = sanitize_rust_source(text);
+    let mut defs_by_body = std::collections::BTreeMap::<String, Vec<(usize, String)>>::new();
+
+    for (name_start, name, body_open) in find_function_defs(&sanitized) {
+        let attrs = collect_preceding_attrs(text, name_start);
+        if !is_test_function(path, &attrs) {
+            continue;
+        }
+        let Some(body_close) = find_matching_brace(&sanitized, body_open) else {
+            continue;
+        };
+        let body = normalize_function_body(&sanitized[body_open + 1..body_close]);
+        if body.len() < DUPLICATE_TEST_BODY_MIN_LEN {
+            continue;
+        }
+        let line = sanitized[..name_start]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+            + 1;
+        defs_by_body.entry(body).or_default().push((line, name));
+    }
+
+    defs_by_body
+        .into_iter()
+        .filter(|(_, defs)| defs.len() > 1)
+        .flat_map(|(body, defs)| {
+            defs.into_iter()
+                .map(move |(line, name)| (line, name, body.clone()))
+        })
+        .collect()
+}
+
 fn detect_direct_recursion_in_rust_text(text: &str) -> Vec<(usize, String)> {
     let sanitized = sanitize_rust_source(text);
     let mut violations = Vec::new();
@@ -339,9 +521,94 @@ pub fn assert_blanket_dead_code_and_unused_import_allows_are_scoped() {
     );
 }
 
+pub fn assert_no_duplicate_function_sources_in_scoped_rust_sources() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    collect_sources_with_exts(&repo_root.join("src"), &["rs"], &mut sources);
+    collect_sources_with_exts(&repo_root.join("build_support"), &["rs"], &mut sources);
+
+    let mut body_to_defs =
+        std::collections::BTreeMap::<String, Vec<(String, usize, String)>>::new();
+
+    for path in sources {
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let rel = path_policy::render_repo_relative_path(repo_root, &path);
+        for (line, name, body) in detect_duplicate_function_sources_in_rust_text(&contents) {
+            body_to_defs
+                .entry(body)
+                .or_default()
+                .push((rel.clone(), line, name));
+        }
+    }
+
+    let mut violations = Vec::new();
+    for defs in body_to_defs.into_values() {
+        if defs.len() < 2 {
+            continue;
+        }
+        let joined = defs
+            .into_iter()
+            .map(|(path, line, name)| format!("{path}:{line}: {name}()"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        violations.push(format!("duplicate function body:\n  {joined}"));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Duplicate non-test function bodies are forbidden in scoped Rust sources:\n{}",
+        violations.join("\n")
+    );
+}
+
+pub fn assert_no_duplicate_test_bodies_in_scoped_rust_sources() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources = Vec::new();
+    collect_sources_with_exts(&repo_root.join("tests"), &["rs"], &mut sources);
+
+    let mut body_to_defs =
+        std::collections::BTreeMap::<String, Vec<(String, usize, String)>>::new();
+
+    for path in sources {
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let rel = path_policy::render_repo_relative_path(repo_root, &path);
+        for (line, name, body) in detect_duplicate_test_bodies_in_rust_text(&path, &contents) {
+            body_to_defs
+                .entry(body)
+                .or_default()
+                .push((rel.clone(), line, name));
+        }
+    }
+
+    let mut violations = Vec::new();
+    for defs in body_to_defs.into_values() {
+        if defs.len() < 2 {
+            continue;
+        }
+        let joined = defs
+            .into_iter()
+            .map(|(path, line, name)| format!("{path}:{line}: {name}()"))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        violations.push(format!("duplicate test body:\n  {joined}"));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Duplicate long #[test] bodies are forbidden in scoped Rust tests:\n{}",
+        violations.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{detect_direct_recursion_in_rust_text, sanitize_rust_source};
+    use super::{
+        detect_direct_recursion_in_rust_text, detect_duplicate_function_sources_in_rust_text,
+        detect_duplicate_test_bodies_in_rust_text, sanitize_rust_source, strip_cfg_test_items,
+    };
+    use std::path::Path;
 
     #[test]
     fn sanitize_rust_source_strips_comments_and_literals() {
@@ -386,5 +653,203 @@ mod tests {
         }
         "#;
         assert!(detect_direct_recursion_in_rust_text(src).is_empty());
+    }
+
+    #[test]
+    fn strip_cfg_test_items_removes_test_only_functions() {
+        let src = r#"
+        fn prod() { real_work(); }
+
+        #[cfg(test)]
+        fn test_only() { duplicate_work(); }
+        "#;
+        let stripped = strip_cfg_test_items(src);
+        assert!(stripped.contains("prod"));
+        assert!(!stripped.contains("test_only"));
+    }
+
+    #[test]
+    fn detects_duplicate_nontrivial_function_bodies() {
+        let src = r#"
+        fn alpha() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+        }
+
+        fn beta() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+        }
+        "#;
+
+        let violations = detect_duplicate_function_sources_in_rust_text(src);
+        assert_eq!(violations.len(), 2);
+        assert!(violations.iter().any(|(_, name, _)| name == "alpha"));
+        assert!(violations.iter().any(|(_, name, _)| name == "beta"));
+    }
+
+    #[test]
+    fn ignores_duplicate_functions_inside_cfg_test_scope() {
+        let src = r#"
+        fn prod() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            fn helper_a() {
+                let mut sum = 0;
+                for i in 0..16 {
+                    sum += i;
+                }
+                if sum > 10 {
+                    do_work(sum);
+                }
+                let adjusted = sum * 2;
+                if adjusted > 40 {
+                    report(adjusted);
+                }
+            }
+
+            fn helper_b() {
+                let mut sum = 0;
+                for i in 0..16 {
+                    sum += i;
+                }
+                if sum > 10 {
+                    do_work(sum);
+                }
+                let adjusted = sum * 2;
+                if adjusted > 40 {
+                    report(adjusted);
+                }
+            }
+        }
+        "#;
+
+        let violations = detect_duplicate_function_sources_in_rust_text(src);
+        assert_eq!(violations.len(), 0);
+    }
+
+    #[test]
+    fn detects_duplicate_long_test_bodies() {
+        let src = r#"
+        #[test]
+        fn alpha() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+            let final_value = adjusted + 7;
+            if final_value > 50 {
+                publish(final_value);
+            }
+        }
+
+        #[test]
+        fn beta() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+            let final_value = adjusted + 7;
+            if final_value > 50 {
+                publish(final_value);
+            }
+        }
+        "#;
+
+        let violations =
+            detect_duplicate_test_bodies_in_rust_text(Path::new("tests/sample.rs"), src);
+        assert_eq!(violations.len(), 2);
+        assert!(violations.iter().any(|(_, name, _)| name == "alpha"));
+        assert!(violations.iter().any(|(_, name, _)| name == "beta"));
+    }
+
+    #[test]
+    fn ignores_non_test_helpers_for_duplicate_test_body_policy() {
+        let src = r#"
+        fn helper_a() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+            let final_value = adjusted + 7;
+            if final_value > 50 {
+                publish(final_value);
+            }
+        }
+
+        fn helper_b() {
+            let mut sum = 0;
+            for i in 0..16 {
+                sum += i;
+            }
+            if sum > 10 {
+                do_work(sum);
+            }
+            let adjusted = sum * 2;
+            if adjusted > 40 {
+                report(adjusted);
+            }
+            let final_value = adjusted + 7;
+            if final_value > 50 {
+                publish(final_value);
+            }
+        }
+        "#;
+
+        let violations =
+            detect_duplicate_test_bodies_in_rust_text(Path::new("tests/sample.rs"), src);
+        assert_eq!(violations.len(), 0);
     }
 }

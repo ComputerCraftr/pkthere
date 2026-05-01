@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 
 /// Snapshot of sockets and destination used by worker threads.
-pub struct SocketHandles {
+pub(crate) struct SocketHandles {
     pub locked_flow: Option<ClientFlowKey>,
     pub client_peer: Option<CanonicalAddr>,
     pub client_connected: bool,
@@ -30,7 +30,7 @@ pub struct SocketHandles {
 }
 
 #[derive(Clone, Copy)]
-pub struct SocketStateSnapshot {
+pub(crate) struct SocketStateSnapshot {
     pub locked_flow: Option<ClientFlowKey>,
     pub client_peer: Option<CanonicalAddr>,
     pub client_connected: bool,
@@ -113,7 +113,7 @@ fn decide_upstream_reresolve(
 /// **STRICT LOCK ORDER**:
 /// 1. `client_listen`
 /// 2. `upstream`
-pub struct SocketManager {
+pub(crate) struct SocketManager {
     client_listen: Mutex<ClientListenState>, // cold-path updates only
     listen_target: String,                   // unresolved --here host:port
     listen_proto: SupportedProtocol,         // never changes

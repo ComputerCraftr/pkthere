@@ -11,7 +11,7 @@ use crate::net::session::handle_send_result;
 use crate::net::sock_mgr::SocketHandles;
 use crate::net::sync_icmp::{
     C2uSessionControlDecision, SharedSyncIcmpState, SyncIcmpCache, classify_c2u_session_control,
-    remember_request_seq, reset_session,
+    remember_request_seq,
 };
 use crate::stats::StatsSink;
 use std::time::Instant;
@@ -226,20 +226,6 @@ pub(crate) fn buffer_sync_event(
         }
         PayloadEvent::CadencePacket { .. } => BufferedSyncUpdate::Keep,
     }
-}
-
-#[inline]
-pub(crate) fn sync_session_on_lock_transition(
-    cfg: &RuntimeConfig,
-    was_locked: &mut bool,
-    locked: bool,
-    sync_state: &SharedSyncIcmpState,
-    sync_cache: &mut SyncIcmpCache,
-) {
-    if *was_locked && !locked {
-        reset_session(cfg, sync_state, sync_cache);
-    }
-    *was_locked = locked;
 }
 
 #[cfg(test)]

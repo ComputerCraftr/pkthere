@@ -16,7 +16,7 @@ use std::time::Duration;
 /// datagram sockets the kernel may assign an identifier/port). When ICMP is
 /// requested, `force_raw_icmp` can be used to skip the datagram attempt (needed
 /// for listeners that must see incoming Echo Requests).
-pub fn make_socket(
+pub(crate) fn make_socket(
     bind_addr: SocketAddr,
     proto: SupportedProtocol,
     read_timeout_ms: u64,
@@ -112,7 +112,7 @@ fn make_icmp_socket(
 }
 
 /// Create and connect a socket suitable for forwarding data to `dest`.
-pub fn make_upstream_socket_for(
+pub(crate) fn make_upstream_socket_for(
     dest: CanonicalAddr,
     proto: SupportedProtocol,
     req_local_id: u16,
@@ -202,7 +202,7 @@ pub fn make_upstream_socket_for(
 }
 
 #[inline]
-pub fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
+pub(crate) fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
     // Fast path: direct SocketAddr parse (no DNS, no allocations).
     if let Ok(sa) = addr.parse::<SocketAddr>() {
         return Ok(sa);
@@ -215,7 +215,7 @@ pub fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
 }
 
 #[inline]
-pub const fn family_changed(a: SocketAddr, b: SocketAddr) -> bool {
+pub(crate) const fn family_changed(a: SocketAddr, b: SocketAddr) -> bool {
     match (a, b) {
         (SocketAddr::V4(_), SocketAddr::V4(_)) | (SocketAddr::V6(_), SocketAddr::V6(_)) => false,
         _ => true,
@@ -228,7 +228,7 @@ pub const fn family_changed(a: SocketAddr, b: SocketAddr) -> bool {
 /// connecting to an invalid address (NULL or AF_UNSPEC). The error
 /// EAFNOSUPPORT may be harmlessly returned; consider it success.
 #[cfg(unix)]
-pub fn disconnect_socket(sock: &Socket) -> io::Result<()> {
+pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
     let fd = sock.as_raw_fd();
 
     // --- macOS / iOS / *BSD: AF_UNSPEC is sufficient. ---
@@ -295,7 +295,7 @@ pub fn disconnect_socket(sock: &Socket) -> io::Result<()> {
 
 /// Windows: disconnect a UDP socket by connecting to INADDR_ANY/IN6ADDR_ANY and port 0.
 #[cfg(windows)]
-pub fn disconnect_socket(sock: &Socket) -> io::Result<()> {
+pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
     let local = sock.local_addr()?;
     let any_std = match local.as_socket() {
         Some(SocketAddr::V6(_)) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
@@ -308,7 +308,7 @@ pub fn disconnect_socket(sock: &Socket) -> io::Result<()> {
 
 /// Fallback: not supported on this platform.
 #[cfg(all(not(unix), not(windows)))]
-pub fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
+pub(crate) fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Other,
         "Function disconnect_socket is not supported on this OS",
