@@ -2,10 +2,9 @@ use crate::cli::{RuntimeConfig, TimeoutAction, WorkerFlowMode};
 use crate::flow_claim::FlowClaimTable;
 use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
-use crate::net::params::{CanonicalAddr, MAX_WIRE_PAYLOAD};
+use crate::net::params::MAX_WIRE_PAYLOAD;
 use crate::net::payload::{
-    IcmpIdPolicy, PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload,
-    validate_payload,
+    PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload, validate_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketManager;
@@ -15,19 +14,18 @@ use crate::net::sync_icmp::{
 use crate::recv_buf::RecvBuf;
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
-    BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, ReceivedPacket,
-    SocketPeerFilter, SocketPeerRole, buffer_sync_event, handle_c2u_session_control,
-    recv_with_possible_peer_filter, refresh_lock_and_sync_state, send_sync_payload_or_cadence,
-    send_user_payload_event, wait_socket_until_readable,
+    BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, PacketAdmission,
+    PacketAdmissionSpec, RejectionReason, SocketPeerRole, admit_packet, buffer_sync_event,
+    handle_c2u_session_control, log_rejected_packet, recv_packet, refresh_lock_and_sync_state,
+    send_sync_payload_or_cadence, send_user_payload_event, wait_socket_until_readable,
 };
-
-use socket2::SockAddr;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomOrdering};
-use std::thread;
-use std::time::{Duration, Instant};
-
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 pub(crate) fn run_reresolve_thread(
     sock_mgrs: &[Arc<SocketManager>],
     reresolve_secs: u64,
@@ -42,7 +40,6 @@ pub(crate) fn run_reresolve_thread(
         }
     }
 }
-
 pub(crate) fn run_watchdog_thread(
     t_start: Instant,
     cfg: &RuntimeConfig,
@@ -63,7 +60,6 @@ pub(crate) fn run_watchdog_thread(
                 }
                 continue;
             }
-
             let last_s = flow_state.last_seen_s();
             if last_s == 0 || now_s.saturating_sub(last_s) < cfg.timeout_secs {
                 if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
@@ -71,7 +67,6 @@ pub(crate) fn run_watchdog_thread(
                 }
                 continue;
             }
-
             match cfg.on_timeout {
                 TimeoutAction::Drop => {
                     let locked_flow = sock_mgrs[idx].get_client_dest().0;
@@ -80,7 +75,6 @@ pub(crate) fn run_watchdog_thread(
                         cfg.timeout_secs,
                         idx
                     );
-
                     // In SharedFlow mode, we must clear ALL managers because they share a single flow_state.
                     // In SingleFlow mode, we only clear the specific manager.
                     let managers_to_clear: Vec<_> =
@@ -89,7 +83,6 @@ pub(crate) fn run_watchdog_thread(
                         } else {
                             vec![&sock_mgrs[idx]]
                         };
-
                     for mgr in managers_to_clear {
                         let prev = mgr.get_version();
                         let ver = match mgr.clear_client_lock(prev) {
@@ -107,7 +100,6 @@ pub(crate) fn run_watchdog_thread(
                             ver
                         );
                     }
-
                     flow_state.reset();
                     if let (Some(flow_claims), Some(flow)) = (flow_claims, locked_flow) {
                         flow_claims.release(flow, idx);
@@ -156,18 +148,46 @@ pub(crate) fn run_upstream_to_client_thread(
             sync_state,
             &mut sync_cache,
         );
-
-        match recv_with_possible_peer_filter(
+        let upstream_admission = PacketAdmissionSpec {
+            role: SocketPeerRole::Upstream,
+            proto: cfg.upstream_proto,
+            sock_type: handles.upstream_sock_type,
+            expected_remote: Some(handles.upstream),
+            expected_local_icmp_id: Some(handles.upstream_local.id),
+        };
+        match recv_packet(
             &handles.upstream_sock,
             handles.upstream_connected,
             buf.recv_buf_mut(),
-            Some(SocketPeerFilter {
-                role: SocketPeerRole::Upstream,
-                proto: cfg.upstream_proto,
-                expected: handles.upstream,
-            }),
         ) {
-            Ok(ReceivedPacket::Accepted { len, .. }) => {
+            Ok((len, source)) => {
+                let admitted =
+                    match admit_packet(upstream_admission, buf.initialized(len), source.as_ref()) {
+                        PacketAdmission::Accepted(admitted) => admitted,
+                        PacketAdmission::Filtered(rejected) => {
+                            if matches!(rejected.reason, RejectionReason::MalformedIcmpHeader) {
+                                stats.drop_err(C2U);
+                            }
+                            log_rejected_packet(
+                                worker_id,
+                                C2U,
+                                cfg,
+                                SocketPeerRole::Upstream,
+                                rejected,
+                                upstream_admission.expected_remote,
+                                upstream_admission.expected_local_icmp_id,
+                            );
+                            continue;
+                        }
+                        PacketAdmission::UnsupportedSource => {
+                            log_warn_dir!(
+                                worker_id,
+                                C2U,
+                                "recv_from upstream non-IP address family (ignored)"
+                            );
+                            continue;
+                        }
+                    };
                 let t_recv = Instant::now();
 
                 log_debug!(
@@ -177,7 +197,6 @@ pub(crate) fn run_upstream_to_client_thread(
                     len,
                     handles.upstream
                 );
-
                 cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
                 let locked_now = refresh_lock_and_sync_state(
                     cfg,
@@ -186,7 +205,6 @@ pub(crate) fn run_upstream_to_client_thread(
                     sync_state,
                     &mut sync_cache,
                 );
-
                 if locked_now {
                     let event = result_or_log_continue!(
                         validate_payload(
@@ -194,7 +212,9 @@ pub(crate) fn run_upstream_to_client_thread(
                             cfg,
                             stats,
                             buf.initialized(len),
-                            IcmpIdPolicy::Exact(handles.upstream_local.id),
+                            admitted.icmp_info,
+                            admitted.payload_bounds,
+                            None,
                             PayloadOrigin::Wire,
                             true, // Already locked
                         ),
@@ -259,23 +279,6 @@ pub(crate) fn run_upstream_to_client_thread(
                         Some((&mut handles, sock_mgr)),
                     );
                 }
-            }
-            Ok(ReceivedPacket::Filtered { source }) => {
-                log_debug_dir!(
-                    cfg.debug_logs.drops,
-                    worker_id,
-                    C2U,
-                    "dropping packet from unexpected upstream peer {} (expected {})",
-                    source,
-                    handles.upstream
-                );
-            }
-            Ok(ReceivedPacket::UnsupportedSource) => {
-                log_warn_dir!(
-                    worker_id,
-                    C2U,
-                    "recv_from upstream non-IP address family (ignored)"
-                );
             }
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
@@ -373,20 +376,62 @@ pub(crate) fn run_client_to_upstream_thread(
                         continue;
                     }
                 };
+                let client_admission = PacketAdmissionSpec {
+                    role: SocketPeerRole::Client,
+                    proto: cfg.listen_proto,
+                    sock_type: handles.listen_sock_type,
+                    expected_remote: if locked_now {
+                        handles.client_peer
+                    } else {
+                        None
+                    },
+                    expected_local_icmp_id: cache.recv_icmp_local_id,
+                };
 
-                match recv_with_possible_peer_filter(
+                match recv_packet(
                     &handles.client_sock,
                     handles.client_connected,
                     buf.recv_buf_mut(),
-                    None,
                 ) {
-                    Ok(ReceivedPacket::Accepted { len, .. }) => {
+                    Ok((len, source)) => {
+                        let admitted = match admit_packet(
+                            client_admission,
+                            buf.initialized(len),
+                            source.as_ref(),
+                        ) {
+                            PacketAdmission::Accepted(admitted) => admitted,
+                            PacketAdmission::Filtered(rejected) => {
+                                if matches!(rejected.reason, RejectionReason::MalformedIcmpHeader) {
+                                    stats.drop_err(C2U);
+                                }
+                                log_rejected_packet(
+                                    worker_id,
+                                    C2U,
+                                    cfg,
+                                    SocketPeerRole::Client,
+                                    rejected,
+                                    client_admission.expected_remote,
+                                    client_admission.expected_local_icmp_id,
+                                );
+                                continue;
+                            }
+                            PacketAdmission::UnsupportedSource => {
+                                log_warn_dir!(
+                                    worker_id,
+                                    C2U,
+                                    "recv_from client non-IP address family (ignored)"
+                                );
+                                continue;
+                            }
+                        };
                         match validate_payload(
                             C2U,
                             cfg,
                             stats,
                             buf.initialized(len),
-                            cache.recv_icmp_policy,
+                            admitted.icmp_info,
+                            admitted.payload_bounds,
+                            None,
                             PayloadOrigin::Wire,
                             locked_now,
                         ) {
@@ -419,14 +464,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             }
                         }
                     }
-                    Ok(ReceivedPacket::Filtered { .. }) => {}
-                    Ok(ReceivedPacket::UnsupportedSource) => {
-                        log_warn_dir!(
-                            worker_id,
-                            C2U,
-                            "recv_from client non-IP address family (ignored)"
-                        );
-                    }
                     Err(ref e)
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::TimedOut => {}
@@ -439,13 +476,47 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            match recv_with_possible_peer_filter(
+            let client_admission = PacketAdmissionSpec {
+                role: SocketPeerRole::Client,
+                proto: cfg.listen_proto,
+                sock_type: handles.listen_sock_type,
+                expected_remote: None,
+                expected_local_icmp_id: cache.recv_icmp_local_id,
+            };
+            match recv_packet(
                 &handles.client_sock,
                 handles.client_connected,
                 buf.recv_buf_mut(),
-                None,
             ) {
-                Ok(ReceivedPacket::Accepted { len, .. }) => {
+                Ok((len, source)) => {
+                    let admitted =
+                        match admit_packet(client_admission, buf.initialized(len), source.as_ref())
+                        {
+                            PacketAdmission::Accepted(admitted) => admitted,
+                            PacketAdmission::Filtered(rejected) => {
+                                if matches!(rejected.reason, RejectionReason::MalformedIcmpHeader) {
+                                    stats.drop_err(C2U);
+                                }
+                                log_rejected_packet(
+                                    worker_id,
+                                    C2U,
+                                    cfg,
+                                    SocketPeerRole::Client,
+                                    rejected,
+                                    client_admission.expected_remote,
+                                    client_admission.expected_local_icmp_id,
+                                );
+                                continue;
+                            }
+                            PacketAdmission::UnsupportedSource => {
+                                log_warn_dir!(
+                                    worker_id,
+                                    C2U,
+                                    "recv_from client non-IP address family (ignored)"
+                                );
+                                continue;
+                            }
+                        };
                     let t_recv = Instant::now();
 
                     log_debug!(
@@ -462,7 +533,9 @@ pub(crate) fn run_client_to_upstream_thread(
                                 cfg,
                                 stats,
                                 buf.initialized(len),
-                                cache.recv_icmp_policy,
+                                admitted.icmp_info,
+                                admitted.payload_bounds,
+                                None,
                                 PayloadOrigin::Wire,
                                 true, // Already locked
                             ),
@@ -472,7 +545,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-
                         match event {
                             PayloadEvent::UserPayload { .. } => result_or_log_continue!(
                                 send_user_payload_event(
@@ -515,14 +587,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             ),
                         }
                     }
-                }
-                Ok(ReceivedPacket::Filtered { .. }) => {}
-                Ok(ReceivedPacket::UnsupportedSource) => {
-                    log_warn_dir!(
-                        worker_id,
-                        C2U,
-                        "recv_from client non-IP address family (ignored)"
-                    );
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -582,26 +646,60 @@ pub(crate) fn run_client_to_upstream_thread(
                 if !readable {
                     continue;
                 }
-                match recv_with_possible_peer_filter(
+                let client_admission = PacketAdmissionSpec {
+                    role: SocketPeerRole::Client,
+                    proto: cfg.listen_proto,
+                    sock_type: handles.listen_sock_type,
+                    expected_remote: handles.client_peer,
+                    expected_local_icmp_id: cache.recv_icmp_local_id,
+                };
+                match recv_packet(
                     &handles.client_sock,
                     handles.client_connected,
                     buf.recv_buf_mut(),
-                    handles.client_peer.map(|expected| SocketPeerFilter {
-                        role: SocketPeerRole::Client,
-                        proto: cfg.listen_proto,
-                        expected,
-                    }),
                 ) {
-                    Ok(ReceivedPacket::Accepted {
-                        len,
-                        source: Some(src),
-                    }) => {
+                    Ok((len, source)) => {
+                        let admitted = match admit_packet(
+                            client_admission,
+                            buf.initialized(len),
+                            source.as_ref(),
+                        ) {
+                            PacketAdmission::Accepted(admitted) => admitted,
+                            PacketAdmission::Filtered(rejected) => {
+                                if matches!(rejected.reason, RejectionReason::MalformedIcmpHeader) {
+                                    stats.drop_err(C2U);
+                                }
+                                log_rejected_packet(
+                                    worker_id,
+                                    C2U,
+                                    cfg,
+                                    SocketPeerRole::Client,
+                                    rejected,
+                                    client_admission.expected_remote,
+                                    client_admission.expected_local_icmp_id,
+                                );
+                                continue;
+                            }
+                            PacketAdmission::UnsupportedSource => {
+                                log_warn_dir!(
+                                    worker_id,
+                                    C2U,
+                                    "recv_from client non-IP address family (ignored)"
+                                );
+                                continue;
+                            }
+                        };
+                        let Some(src) = admitted.normalized_source else {
+                            continue;
+                        };
                         let event = match validate_payload(
                             C2U,
                             cfg,
                             stats,
                             buf.initialized(len),
-                            cache.recv_icmp_policy,
+                            admitted.icmp_info,
+                            admitted.payload_bounds,
+                            None,
                             PayloadOrigin::Wire,
                             true, // Already locked
                         ) {
@@ -617,14 +715,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 continue;
                             }
                         };
-                        let flow_key = result_or_log_continue!(
-                            ClientFlowKey::from_wire(src, cfg.listen_proto, &event),
-                            log_debug_dir,
-                            cfg.debug_logs.drops,
-                            worker_id,
-                            C2U,
-                            "flow key derivation error: {}"
-                        );
+                        let flow_key = ClientFlowKey::from_wire(src, cfg.listen_proto);
                         if Some(flow_key) == handles.locked_flow {
                             match buffer_sync_event(
                                 worker_id,
@@ -646,24 +737,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             }
                         }
                     }
-                    Ok(ReceivedPacket::Accepted { .. }) => {}
-                    Ok(ReceivedPacket::Filtered { source }) => {
-                        log_debug_dir!(
-                            cfg.debug_logs.drops,
-                            worker_id,
-                            C2U,
-                            "dropping packet from unexpected client peer {} (expected {:?})",
-                            source,
-                            handles.client_peer
-                        );
-                    }
-                    Ok(ReceivedPacket::UnsupportedSource) => {
-                        log_warn_dir!(
-                            worker_id,
-                            C2U,
-                            "recv_from client non-IP address family (ignored)"
-                        );
-                    }
                     Err(ref e)
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::TimedOut => {}
@@ -676,27 +749,55 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            let peer_filter = if flow_state.is_locked() {
-                handles.client_peer.map(|expected| SocketPeerFilter {
-                    role: SocketPeerRole::Client,
-                    proto: cfg.listen_proto,
-                    expected,
-                })
-            } else {
-                None
+            let client_admission = PacketAdmissionSpec {
+                role: SocketPeerRole::Client,
+                proto: cfg.listen_proto,
+                sock_type: handles.listen_sock_type,
+                expected_remote: if flow_state.is_locked() {
+                    handles.client_peer
+                } else {
+                    None
+                },
+                expected_local_icmp_id: cache.recv_icmp_local_id,
             };
-            match recv_with_possible_peer_filter(
+            match recv_packet(
                 &handles.client_sock,
                 handles.client_connected,
                 buf.recv_buf_mut(),
-                peer_filter,
             ) {
-                Ok(ReceivedPacket::Accepted {
-                    len,
-                    source: Some(src),
-                }) => {
+                Ok((len, source)) => {
+                    let admitted =
+                        match admit_packet(client_admission, buf.initialized(len), source.as_ref())
+                        {
+                            PacketAdmission::Accepted(admitted) => admitted,
+                            PacketAdmission::Filtered(rejected) => {
+                                if matches!(rejected.reason, RejectionReason::MalformedIcmpHeader) {
+                                    stats.drop_err(C2U);
+                                }
+                                log_rejected_packet(
+                                    worker_id,
+                                    C2U,
+                                    cfg,
+                                    SocketPeerRole::Client,
+                                    rejected,
+                                    client_admission.expected_remote,
+                                    client_admission.expected_local_icmp_id,
+                                );
+                                continue;
+                            }
+                            PacketAdmission::UnsupportedSource => {
+                                log_warn_dir!(
+                                    worker_id,
+                                    C2U,
+                                    "recv_from client non-IP address family (ignored)"
+                                );
+                                continue;
+                            }
+                        };
+                    let Some(src) = admitted.normalized_source else {
+                        continue;
+                    };
                     let t_recv = Instant::now();
-
                     if !flow_state.is_locked() {
                         let event = result_or_log_continue!(
                             validate_payload(
@@ -704,7 +805,9 @@ pub(crate) fn run_client_to_upstream_thread(
                                 cfg,
                                 stats,
                                 buf.initialized(len),
-                                cache.recv_icmp_policy,
+                                admitted.icmp_info,
+                                admitted.payload_bounds,
+                                None,
                                 PayloadOrigin::Wire,
                                 flow_state.is_locked(),
                             ),
@@ -714,14 +817,7 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let flow = result_or_log_continue!(
-                            ClientFlowKey::from_wire(src, cfg.listen_proto, &event),
-                            log_debug_dir,
-                            cfg.debug_logs.drops,
-                            worker_id,
-                            C2U,
-                            "flow key derivation error: {}"
-                        );
+                        let flow = ClientFlowKey::from_wire(src, cfg.listen_proto);
 
                         if cfg.worker_flow_mode == WorkerFlowMode::SingleFlow
                             && flow_claims.is_some_and(|flow_claims| {
@@ -730,18 +826,11 @@ pub(crate) fn run_client_to_upstream_thread(
                         {
                             continue;
                         }
-
                         reset_session(cfg, sync_state, &mut sync_cache);
                         flow_state.set_locked(true);
                         was_locked = true;
-                        let peer_canonical = if let Some(ident) = flow.icmp_ident() {
-                            CanonicalAddr::new(flow.display_addr(), ident)
-                        } else {
-                            CanonicalAddr::from_socket_addr(src)
-                        };
-                        let peer_addr = Some(peer_canonical);
-                        let src_sa = SockAddr::from(src);
-
+                        let peer_addr = Some(src);
+                        let src_sa = src.as_sock_addr();
                         handles.client_connected = false;
                         if cfg.debug_behavior.client_unconnected {
                             log_info!("Locked to single client {} (not connected)", src);
@@ -752,7 +841,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             handles.client_connected = true;
                             log_info!("Locked to single client {} (connected)", src);
                         }
-
                         handles.version = sock_mgr.set_client_addr_connected(
                             Some(flow),
                             peer_addr,
@@ -768,7 +856,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             handles.client_connected,
                             handles.version
                         );
-
                         if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
                             for mgr in all_sock_mgrs {
                                 if !std::ptr::eq(mgr.as_ref(), sock_mgr) {
@@ -782,7 +869,6 @@ pub(crate) fn run_client_to_upstream_thread(
                                 }
                             }
                         }
-
                         if let Ok(new_handles) = sock_mgr.reresolve(
                             cfg.reresolve_mode.allow_upstream(),
                             false,
@@ -791,7 +877,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             handles = new_handles;
                             cache.refresh_from_handles(cfg, &handles);
                         }
-
                         match event {
                             PayloadEvent::UserPayload { .. } => result_or_log_continue!(
                                 send_user_payload_event(
@@ -840,7 +925,9 @@ pub(crate) fn run_client_to_upstream_thread(
                                 cfg,
                                 stats,
                                 buf.initialized(len),
-                                cache.recv_icmp_policy,
+                                admitted.icmp_info,
+                                admitted.payload_bounds,
+                                None,
                                 PayloadOrigin::Wire,
                                 flow_state.is_locked(),
                             ),
@@ -850,14 +937,7 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let flow = result_or_log_continue!(
-                            ClientFlowKey::from_wire(src, cfg.listen_proto, &event),
-                            log_debug_dir,
-                            cfg.debug_logs.drops,
-                            worker_id,
-                            C2U,
-                            "flow key derivation error: {}"
-                        );
+                        let flow = ClientFlowKey::from_wire(src, cfg.listen_proto);
                         if Some(flow) != handles.locked_flow {
                             continue;
                         }
@@ -903,24 +983,6 @@ pub(crate) fn run_client_to_upstream_thread(
                             ),
                         }
                     }
-                }
-                Ok(ReceivedPacket::Accepted { .. }) => {}
-                Ok(ReceivedPacket::Filtered { source }) => {
-                    log_debug_dir!(
-                        cfg.debug_logs.drops,
-                        worker_id,
-                        C2U,
-                        "dropping packet from unexpected client peer {} (expected {:?})",
-                        source,
-                        handles.client_peer
-                    );
-                }
-                Ok(ReceivedPacket::UnsupportedSource) => {
-                    log_warn_dir!(
-                        worker_id,
-                        C2U,
-                        "recv_from client non-IP address family (ignored)"
-                    );
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock

@@ -2,8 +2,8 @@ use super::{BufferedPayload, CachedClientState};
 use crate::cli::RuntimeConfig;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::{
-    IcmpIdPolicy, PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload,
-    source_id_shim_for_c2u, validate_payload,
+    PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload, source_id_shim_for_c2u,
+    validate_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketHandles;
@@ -111,10 +111,9 @@ pub(crate) fn send_sync_payload_or_cadence(
             cfg,
             stats,
             &[],
-            handles.client_peer.map_or_else(
-                || IcmpIdPolicy::Any,
-                |peer_addr| IcmpIdPolicy::Exact(peer_addr.id),
-            ),
+            None,
+            (0, 0),
+            handles.client_peer.map(|peer_addr| peer_addr.id),
             PayloadOrigin::SyntheticCadencePacket,
             true,
         )

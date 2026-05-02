@@ -398,7 +398,6 @@ mod tests {
             data: crate::net::payload::PayloadData { dst_proto, bytes },
             icmp: Some(IcmpPayloadMeta {
                 logical_src_ident: 0,
-                transport_src_ident: 0,
                 seq,
                 shim_src_ident: None,
             }),
@@ -413,7 +412,6 @@ mod tests {
             },
             icmp: IcmpPayloadMeta {
                 logical_src_ident: 0,
-                transport_src_ident: 0,
                 seq,
                 shim_src_ident: None,
             },

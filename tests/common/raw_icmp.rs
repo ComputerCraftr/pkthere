@@ -3,6 +3,7 @@ use crate::app_bin::find_app_bin;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::process::Command;
 
+use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::sync::OnceLock;
 
@@ -62,12 +63,7 @@ pub fn require_kernel_echo_reply_supported() -> io::Result<()> {
 }
 
 pub fn platform_supports_dgram_icmp() -> bool {
-    socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::ICMPV4),
-    )
-    .is_ok()
+    Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)).is_ok()
 }
 
 pub fn platform_requires_raw_privilege_for_any_icmp() -> bool {
@@ -125,12 +121,7 @@ fn setuid_binary_has_raw_capability() -> bool {
 )))]
 fn fallback_binary_has_raw_capability() -> bool {
     // If we can open a raw ICMP socket in the test runner, the spawned binary can too.
-    socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::RAW,
-        Some(socket2::Protocol::ICMPV4),
-    )
-    .is_ok()
+    Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)).is_ok()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]

@@ -60,7 +60,6 @@ fn empty_icmp_reply_event(seq: u16) -> PayloadEvent<'static> {
         },
         icmp: IcmpPayloadMeta {
             logical_src_ident: 0,
-            transport_src_ident: 0,
             seq,
             shim_src_ident: None,
         },
@@ -270,8 +269,7 @@ mod tests {
 
     #[test]
     fn buffered_sync_payload_round_trips_validated_user_data() {
-        let event =
-            PayloadEvent::user_payload(1234, 1234, 77, SupportedProtocol::ICMP, b"payload", None);
+        let event = PayloadEvent::user_payload(1234, 77, SupportedProtocol::ICMP, b"payload", None);
 
         let buffered = BufferedPayload::from_event(&event);
         let replay = buffered.as_event();
@@ -282,7 +280,6 @@ mod tests {
                 icmp: Some(icmp),
             } => {
                 assert_eq!(icmp.logical_src_ident, 1234);
-                assert_eq!(icmp.transport_src_ident, 1234);
                 assert_eq!(icmp.seq, 77);
                 assert_eq!(data.dst_proto, SupportedProtocol::ICMP);
                 assert_eq!(data.bytes, b"payload");

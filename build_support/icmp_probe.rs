@@ -55,7 +55,8 @@ pub fn probe_kernel_icmp_echo() -> io::Result<()> {
                 }
                 let buf = recv_buf.initialized(n);
 
-                let (ok, _raw, _start, _end, _ident, _seq, is_req) = parse_icmp_echo_header(buf);
+                let (ok, _ident, _seq, is_req, _ip_ver, _payload, _src_ip, _dst_ip) =
+                    parse_icmp_echo_header(buf);
                 if ok && !is_req {
                     return Ok(());
                 }

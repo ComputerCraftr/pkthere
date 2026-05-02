@@ -1,6 +1,5 @@
 use crate::cli::{ListenMode, RuntimeConfig, SupportedProtocol};
 use crate::net::params::CanonicalAddr;
-use crate::net::payload::IcmpIdPolicy;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use socket2::{SockAddr, Type};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -17,26 +16,27 @@ pub(crate) struct CachedClientState {
     worker_id: usize,
     pub(crate) dest_sock_type: Type,
     pub(crate) route: CachedSendRoute,
-    pub(crate) recv_icmp_policy: IcmpIdPolicy,
+    pub(crate) recv_icmp_local_id: Option<u16>,
     pub(crate) session_control_reply_route: Option<CachedSendRoute>,
     log_handles: bool,
 }
 
 impl CachedClientState {
     #[inline]
-    fn resolve_client_recv_icmp_policy(
+    fn resolve_client_recv_icmp_local_id(
         cfg: &RuntimeConfig,
         handles: &SocketHandles,
-    ) -> IcmpIdPolicy {
+    ) -> Option<u16> {
         if cfg.listen_proto != SupportedProtocol::ICMP {
-            IcmpIdPolicy::Exact(0)
+            None
         } else {
             match cfg.listen_mode {
-                ListenMode::Fixed => IcmpIdPolicy::Exact(cfg.listen.id),
+                ListenMode::Fixed => Some(cfg.listen.id),
                 ListenMode::Dynamic => handles
                     .locked_flow
                     .and_then(|flow| flow.icmp_ident())
-                    .map_or(IcmpIdPolicy::Any, IcmpIdPolicy::Exact),
+                    .map(Some)
+                    .unwrap_or(None),
             }
         }
     }
@@ -93,7 +93,7 @@ impl CachedClientState {
                 worker_id,
                 dest_sock_type: handles.upstream_sock_type,
                 route: Self::build_send_route(c2u, handles, handles.upstream),
-                recv_icmp_policy: Self::resolve_client_recv_icmp_policy(cfg, handles),
+                recv_icmp_local_id: Self::resolve_client_recv_icmp_local_id(cfg, handles),
                 session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
@@ -106,7 +106,7 @@ impl CachedClientState {
                 worker_id,
                 dest_sock_type: handles.listen_sock_type,
                 route: Self::build_send_route(c2u, handles, remote),
-                recv_icmp_policy: Self::resolve_client_recv_icmp_policy(cfg, handles),
+                recv_icmp_local_id: Self::resolve_client_recv_icmp_local_id(cfg, handles),
                 session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
@@ -125,7 +125,7 @@ impl CachedClientState {
                 handles.client_peer.unwrap_or(self.route.dest),
             );
         }
-        self.recv_icmp_policy = Self::resolve_client_recv_icmp_policy(cfg, handles);
+        self.recv_icmp_local_id = Self::resolve_client_recv_icmp_local_id(cfg, handles);
         self.session_control_reply_route = Self::maybe_build_session_control_reply_route(handles);
     }
 
@@ -158,7 +158,7 @@ impl CachedClientState {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedClientState, IcmpIdPolicy, ListenMode, SocketHandles};
+    use super::{CachedClientState, ListenMode, SocketHandles};
     use crate::cli::{
         DebugBehavior, DebugLogs, ReresolveMode, RuntimeConfig, SupportedProtocol, TimeoutAction,
         WorkerFlowMode,
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_recv_icmp_policy_tracks_locked_wildcard_flow_id() {
+    fn cached_recv_icmp_local_id_tracks_locked_wildcard_flow_id() {
         let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg.listen_mode = ListenMode::Dynamic;
         let mut handles = test_handles();
@@ -267,8 +267,8 @@ mod tests {
         });
 
         assert_eq!(
-            CachedClientState::resolve_client_recv_icmp_policy(&cfg, &handles),
-            IcmpIdPolicy::Exact(12345)
+            CachedClientState::resolve_client_recv_icmp_local_id(&cfg, &handles),
+            Some(12345)
         );
     }
 

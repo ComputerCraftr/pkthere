@@ -20,6 +20,7 @@ mod tests {
         DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
         TimeoutAction, WorkerFlowMode,
     };
+    use crate::net::icmp_echo_parse::parse_icmp_echo_header;
     use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -61,11 +62,26 @@ mod tests {
         }
     }
 
+    fn udp_bounds(buf: &[u8]) -> (usize, usize) {
+        (0, buf.len())
+    }
+
+    fn admitted_icmp(buf: &[u8]) -> (Option<IcmpAdmissionInfo>, (usize, usize)) {
+        let (ok, ident, seq, is_req, _ip_ver, payload_bounds, _src_ip, _dst_ip) =
+            parse_icmp_echo_header(buf);
+        assert!(ok, "test fixture should contain a valid ICMP echo packet");
+        (
+            Some(IcmpAdmissionInfo { ident, seq, is_req }),
+            payload_bounds,
+        )
+    }
+
     #[test]
     fn explicit_icmp_header_id_is_serialized_verbatim() {
         let hdr = test_icmp_echo_header(4242, 9);
         let packet = super::payload_send::build_test_icmp_echo_packet(&hdr, &[], b"x");
-        let (_, _raw, start, end, ident, seq, _is_req) = parse_icmp_echo_header(&packet);
+        let (_, ident, seq, _is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
+            parse_icmp_echo_header(&packet);
         assert_eq!(ident, 4242);
         assert_eq!(seq, 9);
         assert_eq!(&packet[start..end], b"x");
@@ -99,14 +115,15 @@ mod tests {
         buf[27] = 0x02;
         buf[28..].copy_from_slice(&icmp_payload);
 
-        let (ok, raw, start, end, ident, seq, is_req) = parse_icmp_echo_header(&buf);
+        let (ok, ident, seq, is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
+            parse_icmp_echo_header(&buf);
         assert!(ok);
         assert_eq!(start, 28);
         assert_eq!(end, 28 + icmp_payload.len());
         assert_eq!(ident, 0x1234);
         assert_eq!(seq, 0x0002);
         assert!(is_req);
-        assert_eq!(&raw[start..end], &icmp_payload);
+        assert_eq!(&buf[start..end], &icmp_payload);
     }
 
     #[test]
@@ -122,14 +139,15 @@ mod tests {
         buf[47] = 0x2A;
         buf[48..].copy_from_slice(&icmp_payload);
 
-        let (ok, raw, start, end, ident, seq, is_req) = parse_icmp_echo_header(&buf);
+        let (ok, ident, seq, is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
+            parse_icmp_echo_header(&buf);
         assert!(ok);
         assert_eq!(start, 48);
         assert_eq!(end, 48 + icmp_payload.len());
         assert_eq!(ident, 0xBEEF);
         assert_eq!(seq, 0x002A);
         assert!(!is_req);
-        assert_eq!(&raw[start..end], &icmp_payload);
+        assert_eq!(&buf[start..end], &icmp_payload);
     }
 
     #[test]
@@ -139,20 +157,22 @@ mod tests {
         buf.extend_from_slice(&[8, 0, 0, 0, 0x01, 0x02, 0x03, 0x04]);
         buf.extend_from_slice(&payload);
 
-        let (ok, raw, start, end, ident, seq, is_req) = parse_icmp_echo_header(&buf);
+        let (ok, ident, seq, is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
+            parse_icmp_echo_header(&buf);
         assert!(ok);
         assert_eq!(start, 8);
         assert_eq!(end, 8 + payload.len());
         assert_eq!(ident, 0x0102);
         assert_eq!(seq, 0x0304);
         assert!(is_req);
-        assert_eq!(&raw[start..end], &payload);
+        assert_eq!(&buf[start..end], &payload);
     }
 
     #[test]
     fn parse_icmp_echo_header_rejects_truncated_input() {
         let buf = [0u8; 4];
-        let (ok, _raw, start, end, _ident, _seq, _is_req) = parse_icmp_echo_header(&buf);
+        let (ok, _ident, _seq, _is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
+            parse_icmp_echo_header(&buf);
 
         assert!(!ok);
         assert_eq!(start, 0);
@@ -169,7 +189,9 @@ mod tests {
             &cfg,
             &stats,
             &[],
-            IcmpIdPolicy::Exact(cfg.listen.id),
+            None,
+            (0, 0),
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -182,7 +204,9 @@ mod tests {
             &cfg,
             &stats,
             &[],
-            IcmpIdPolicy::Exact(cfg.listen.id),
+            None,
+            (0, 0),
+            Some(cfg.listen.id),
             PayloadOrigin::SyntheticCadencePacket,
             false,
         )
@@ -197,13 +221,16 @@ mod tests {
         let stats = Stats::new();
         // A single zero shim byte is session-control, not cadence.
         let buf = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09, 0x00];
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(cfg.listen.id),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -230,13 +257,16 @@ mod tests {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(cfg.listen.id),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -250,13 +280,16 @@ mod tests {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abc");
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(cfg.listen.id),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -269,23 +302,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_wildcard_icmp_policy_accepts_any_identifier() {
+    fn validate_payload_preserves_wire_identifier_without_external_policy() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
         buf[4] = 0xAA;
         buf[5] = 0x55;
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Any,
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
-        .expect("wildcard ICMP policy should accept arbitrary identifier");
+        .expect("wire ICMP identifier should decode without external admission policy");
         match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
@@ -297,40 +333,26 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_exact_icmp_policy_rejects_other_identifiers() {
+    fn validate_payload_does_not_enforce_external_icmp_id_policy() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
         buf[4] = 0xAA;
         buf[5] = 0x55;
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
-        // 1. Rejects non-matching ID
-        let res = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &buf,
-            IcmpIdPolicy::Exact(0x1111),
-            PayloadOrigin::Wire,
-            false,
-        );
-        assert!(res.is_err(), "exact policy should reject mismatching ID");
-        assert!(
-            res.unwrap_err().to_string().contains("identity mismatch"),
-            "error message should mention identity mismatch"
-        );
-
-        // 2. Accepts matching ID
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(0xAA55),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
-        .expect("exact policy should accept matching identifier");
+        .expect("payload decoding should not enforce receive-side ICMP ID admission");
         match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
@@ -346,12 +368,15 @@ mod tests {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let empty_icmp = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09];
+        let (icmp_info, payload_bounds) = admitted_icmp(&empty_icmp);
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &empty_icmp,
-            IcmpIdPolicy::Exact(0x04D2),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -381,13 +406,16 @@ mod tests {
             bad_data_missing_payload,
             bad_data_with_unexpected_payload,
         ] {
+            let (icmp_info, payload_bounds) = admitted_icmp(&bad);
             assert!(
                 validate_payload(
                     true,
                     &cfg,
                     &stats,
                     &bad,
-                    IcmpIdPolicy::Exact(cfg.listen.id),
+                    icmp_info,
+                    payload_bounds,
+                    None,
                     PayloadOrigin::Wire,
                     false,
                 )
@@ -411,7 +439,9 @@ mod tests {
                 &cfg,
                 &stats,
                 &[],
-                IcmpIdPolicy::Exact(cfg.listen.id),
+                None,
+                udp_bounds(&[]),
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -423,7 +453,9 @@ mod tests {
                 &cfg,
                 &stats,
                 &[0],
-                IcmpIdPolicy::Exact(cfg.listen.id),
+                None,
+                udp_bounds(&[0]),
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -436,6 +468,8 @@ mod tests {
 
         let ok_icmp = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
         let over_icmp = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), &[0]);
+        let (ok_icmp_info, ok_icmp_bounds) = admitted_icmp(&ok_icmp);
+        let (over_icmp_info, over_icmp_bounds) = admitted_icmp(&over_icmp);
 
         assert!(
             validate_payload(
@@ -443,7 +477,9 @@ mod tests {
                 &cfg_icmp,
                 &stats,
                 &ok_icmp,
-                IcmpIdPolicy::Exact(cfg_icmp.listen.id),
+                ok_icmp_info,
+                ok_icmp_bounds,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -455,7 +491,9 @@ mod tests {
                 &cfg_icmp,
                 &stats,
                 &over_icmp,
-                IcmpIdPolicy::Exact(cfg_icmp.listen.id),
+                over_icmp_info,
+                over_icmp_bounds,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -470,6 +508,8 @@ mod tests {
         let stats = Stats::new();
         let ok = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abc");
         let over = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abcd");
+        let (ok_info, ok_bounds) = admitted_icmp(&ok);
+        let (over_info, over_bounds) = admitted_icmp(&over);
 
         assert!(
             validate_payload(
@@ -477,7 +517,9 @@ mod tests {
                 &cfg,
                 &stats,
                 &ok,
-                IcmpIdPolicy::Exact(cfg.listen.id),
+                ok_info,
+                ok_bounds,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -489,7 +531,9 @@ mod tests {
                 &cfg,
                 &stats,
                 &over,
-                IcmpIdPolicy::Exact(cfg.listen.id),
+                over_info,
+                over_bounds,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -507,12 +551,15 @@ mod tests {
         let id_bytes = 0x2002u16.to_be_bytes();
         buf.insert(9, id_bytes[0]);
         buf.insert(10, id_bytes[1]);
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
         let res = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(0x04D2),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         );
@@ -532,7 +579,9 @@ mod tests {
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(0x04D2),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             true,
         )
@@ -549,20 +598,23 @@ mod tests {
 
         // 3. Reject Echo Reply
         buf[0] = 0; // Type 0 = Echo Reply
+        let (reply_info, reply_bounds) = admitted_icmp(&buf);
         // Need c2u=true but buffer type=0 (Reply) to trigger !src_is_req
         let res = validate_payload(
             true, // Expected Request (type 8), but got Reply (type 0)
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(0x04D2),
+            reply_info,
+            reply_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         );
         assert!(res.is_err(), "should reject Source ID on Echo Reply");
         let err_msg = res.unwrap_err().to_string();
         // validate_payload currently prioritize Echo type mismatch error over shim handshake checks if c2u=true
-        assert!(err_msg.contains("identity mismatch") || err_msg.contains("on Echo Reply"));
+        assert!(err_msg.contains("direction mismatch") || err_msg.contains("on Echo Reply"));
 
         // 4. Reject SessionControl
         // Handshake bit 0x20 is set, but IS_DATA (0x80) is NOT set.
@@ -573,13 +625,16 @@ mod tests {
         let id_bytes = 0x2002u16.to_be_bytes();
         buf_ka_full[9] = id_bytes[0];
         buf_ka_full[10] = id_bytes[1];
+        let (ka_info, ka_bounds) = admitted_icmp(&buf_ka_full);
 
         let res = validate_payload(
             true,
             &cfg,
             &stats,
             &buf_ka_full,
-            IcmpIdPolicy::Exact(0x04D2),
+            ka_info,
+            ka_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         );
@@ -603,13 +658,16 @@ mod tests {
         buf.extend_from_slice(&id_bytes);
         buf.extend_from_slice(b"x");
         buf[0] = 0; // Echo Reply for u2c path
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
             false,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Exact(0x04D2),
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             true,
         )
@@ -619,7 +677,6 @@ mod tests {
                 icmp: Some(icmp), ..
             } => {
                 assert_eq!(icmp.logical_src_ident, 0x04D2);
-                assert_eq!(icmp.transport_src_ident, 0x04D2);
                 assert_eq!(icmp.shim_src_ident, Some(0x2002));
             }
             other => panic!("unexpected event: {other:?}"),
@@ -627,7 +684,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_preserves_transport_icmp_id_separately_from_logical_shim_id() {
+    fn validate_payload_adopts_shim_identifier_on_initial_handshake() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let buf = [
@@ -643,13 +700,16 @@ mod tests {
             0x20,
             0x02,
         ];
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
             true,
             &cfg,
             &stats,
             &buf,
-            IcmpIdPolicy::Any,
+            icmp_info,
+            payload_bounds,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -659,7 +719,6 @@ mod tests {
                 icmp: Some(icmp), ..
             } => {
                 assert_eq!(icmp.logical_src_ident, 0x2002);
-                assert_eq!(icmp.transport_src_ident, 0x04D2);
                 assert_eq!(icmp.shim_src_ident, Some(0x2002));
             }
             other => panic!("unexpected event: {other:?}"),
@@ -677,7 +736,7 @@ mod tests {
     #[test]
     fn source_id_shim_for_c2u_propagates_logical_icmp_source_id() {
         let event =
-            PayloadEvent::user_payload(2002, 2002, 9, SupportedProtocol::ICMP, b"abc", Some(2002));
+            PayloadEvent::user_payload(2002, 9, SupportedProtocol::ICMP, b"abc", Some(2002));
 
         assert_eq!(source_id_shim_for_c2u(&event, false, 9999), Some(2002));
     }
@@ -685,7 +744,7 @@ mod tests {
     #[test]
     fn source_id_shim_for_c2u_never_emits_for_session_control() {
         let event =
-            PayloadEvent::session_control(2002, 2002, 9, SupportedProtocol::ICMP, &[], Some(2002));
+            PayloadEvent::session_control(2002, 9, SupportedProtocol::ICMP, &[], Some(2002));
 
         assert_eq!(source_id_shim_for_c2u(&event, false, 9999), None);
     }

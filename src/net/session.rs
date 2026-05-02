@@ -116,7 +116,7 @@ mod tests {
     fn forwarded_user_data_counts_as_activity_even_when_zero_length() {
         let zero = PayloadEvent::user_payload_plain(SupportedProtocol::UDP, &[]);
         let session_control =
-            PayloadEvent::session_control(0, 0, 1, SupportedProtocol::ICMP, &[], None);
+            PayloadEvent::session_control(0, 1, SupportedProtocol::ICMP, &[], None);
         let cadence = PayloadEvent::cadence_packet(0, 2);
 
         assert!(counts_as_session_activity(&zero, true));

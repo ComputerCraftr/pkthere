@@ -1,10 +1,7 @@
-use crate::cli::SupportedProtocol;
-use crate::net::params::CanonicalAddr;
-use socket2::Socket;
+use socket2::{SockAddr, Socket};
 
 use std::io;
 use std::mem::MaybeUninit;
-use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(windows)]
@@ -15,72 +12,17 @@ use windows_sys::Win32::Networking::WinSock::{
     POLLRDNORM, SOCKET_ERROR, WSAEINTR, WSAGetLastError, WSAPOLLFD, WSAPoll,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SocketPeerRole {
-    Client,
-    Upstream,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SocketPeerFilter {
-    pub(crate) role: SocketPeerRole,
-    pub(crate) proto: SupportedProtocol,
-    pub(crate) expected: CanonicalAddr,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReceivedPacket {
-    Accepted {
-        len: usize,
-        source: Option<SocketAddr>,
-    },
-    Filtered {
-        source: SocketAddr,
-    },
-    UnsupportedSource,
-}
-
 #[inline]
-pub(crate) fn peer_matches_filter(filter: SocketPeerFilter, source: SocketAddr) -> bool {
-    let _role = filter.role;
-    match filter.proto {
-        SupportedProtocol::UDP => source == filter.expected.addr,
-        SupportedProtocol::ICMP => match (source, filter.expected.addr) {
-            (SocketAddr::V4(source), SocketAddr::V4(expected)) => source.ip() == expected.ip(),
-            (SocketAddr::V6(source), SocketAddr::V6(expected)) => {
-                source.ip() == expected.ip() && source.scope_id() == expected.scope_id()
-            }
-            _ => false,
-        },
-    }
-}
-
-#[inline]
-pub(crate) fn recv_with_possible_peer_filter(
+pub(crate) fn recv_packet(
     sock: &Socket,
     connected: bool,
     buf: &mut [MaybeUninit<u8>],
-    filter: Option<SocketPeerFilter>,
-) -> io::Result<ReceivedPacket> {
+) -> io::Result<(usize, Option<SockAddr>)> {
     if connected {
-        return sock
-            .recv(buf)
-            .map(|len| ReceivedPacket::Accepted { len, source: None });
+        return sock.recv(buf).map(|len| (len, None));
     }
 
-    sock.recv_from(buf).map(|(len, src_sa)| {
-        let Some(source) = src_sa.as_socket() else {
-            return ReceivedPacket::UnsupportedSource;
-        };
-        if filter.is_some_and(|filter| !peer_matches_filter(filter, source)) {
-            ReceivedPacket::Filtered { source }
-        } else {
-            ReceivedPacket::Accepted {
-                len,
-                source: Some(source),
-            }
-        }
-    })
+    sock.recv_from(buf).map(|(len, src_sa)| (len, Some(src_sa)))
 }
 
 #[cfg(unix)]
@@ -147,14 +89,10 @@ pub(crate) fn wait_socket_until_readable(_sock: &Socket, _timeout: Duration) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        SocketPeerFilter, SocketPeerRole, peer_matches_filter, recv_with_possible_peer_filter,
-    };
-    use crate::cli::SupportedProtocol;
-    use crate::net::params::CanonicalAddr;
+    use super::recv_packet;
     use crate::recv_buf::RecvBuf;
     use socket2::Socket;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
     #[test]
     fn recv_buf_initialized_exposes_only_requested_length() {
@@ -169,73 +107,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_peer_filter_matches_full_socket_addr_for_both_roles() {
-        let expected =
-            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444));
-        for role in [SocketPeerRole::Client, SocketPeerRole::Upstream] {
-            let filter = SocketPeerFilter {
-                role,
-                proto: SupportedProtocol::UDP,
-                expected,
-            };
-            assert!(peer_matches_filter(filter, expected.addr));
-            assert!(!peer_matches_filter(
-                filter,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4445)
-            ));
-            assert!(!peer_matches_filter(
-                filter,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 4444)
-            ));
-        }
-    }
-
-    #[test]
-    fn icmp_peer_filter_matches_ip_not_port_for_both_roles() {
-        let expected = CanonicalAddr::new(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 9999)),
-            4242,
-        );
-        for role in [SocketPeerRole::Client, SocketPeerRole::Upstream] {
-            let filter = SocketPeerFilter {
-                role,
-                proto: SupportedProtocol::ICMP,
-                expected,
-            };
-            assert!(peer_matches_filter(
-                filter,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1)
-            ));
-            assert!(!peer_matches_filter(
-                filter,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 1)
-            ));
-        }
-    }
-
-    #[test]
-    fn icmp_ipv6_peer_filter_preserves_scope() {
-        let expected = CanonicalAddr::new(
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9999, 0, 7)),
-            4242,
-        );
-        let filter = SocketPeerFilter {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::ICMP,
-            expected,
-        };
-        assert!(peer_matches_filter(
-            filter,
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1, 0, 7))
-        ));
-        assert!(!peer_matches_filter(
-            filter,
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 1, 0, 8))
-        ));
-    }
-
-    #[test]
-    fn unconnected_recv_filters_wrong_udp_peer() {
+    fn unconnected_recv_returns_source_socket_addr() {
         let recv_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44444));
         let recv = UdpSocket::bind(recv_addr).expect("bind recv socket");
         let sender = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
@@ -246,17 +118,10 @@ mod tests {
         sender.send_to(b"x", recv_addr).expect("send packet");
 
         let recv = Socket::from(recv);
-        let filter = SocketPeerFilter {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::UDP,
-            expected: CanonicalAddr::from_socket_addr(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
-                44446,
-            )),
-        };
         let mut buf = RecvBuf::<8>::new();
-        let result = recv_with_possible_peer_filter(&recv, false, buf.recv_buf_mut(), Some(filter))
-            .expect("recv with filter");
-        assert!(matches!(result, super::ReceivedPacket::Filtered { .. }));
+        let (len, source) = recv_packet(&recv, false, buf.recv_buf_mut()).expect("recv packet");
+        assert_eq!(len, 1);
+        let source = source.unwrap().as_socket().expect("source as socket");
+        assert_eq!(source, sender.local_addr().expect("sender local"));
     }
 }

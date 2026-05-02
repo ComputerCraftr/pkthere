@@ -220,21 +220,21 @@ pub(crate) fn make_upstream_socket_for(
         let dest_sa = final_dest.as_sock_addr();
         sock.connect(&dest_sa.into())?;
     } else {
-        // Bind to get a local address/port assigned and prevent WSAEINVAL on Windows
+        // Bind to get a local address/port assigned for unconnected paths.
         let any_addr = match domain {
             Domain::IPV6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_id),
             _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_id),
         };
-        sock.bind(&socket2::SockAddr::from(any_addr))?;
+        sock.bind(&SockAddr::from(any_addr))?;
     }
 
     let actual_local_sa = if is_icmp && sock_type == Type::RAW && !should_connect {
         let learned = learn_concrete_local_addr_via_cadence_probe(&sock, final_dest)?;
         if learned.ip().is_unspecified() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "concrete local address still unspecified after RAW ICMP cadence probe",
-            ));
+            log_warn!(
+                "RAW ICMP cadence probe did not yield a concrete local address; retaining {} for upstream local identity",
+                learned
+            );
         }
         learned
     } else {
@@ -445,10 +445,20 @@ mod tests {
 
     #[test]
     fn upstream_connectedness_matches_platform_policy() {
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            windows
+        )))]
         let protocols = vec![SupportedProtocol::UDP];
 
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            windows
+        ))]
         let protocols = vec![SupportedProtocol::UDP, SupportedProtocol::ICMP];
 
         for proto in protocols {

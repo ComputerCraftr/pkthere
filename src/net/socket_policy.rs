@@ -56,15 +56,6 @@ fn listener_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> Socke
 }
 
 fn upstream_reuse_capability(_proto: SupportedProtocol, sock_type: Type) -> SocketReuseCapability {
-    #[cfg(windows)]
-    if _proto == SupportedProtocol::ICMP && sock_type == Type::RAW {
-        return SocketReuseCapability {
-            can_keep_connected: false,
-            can_reconnect_in_place: false,
-            should_start_connected: false,
-        };
-    }
-
     if sock_type == Type::RAW {
         SocketReuseCapability {
             can_keep_connected: true,
@@ -130,23 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_raw_icmp_upstream_starts_unconnected() {
+    fn raw_icmp_upstream_starts_connected() {
         let policy =
             socket_reuse_capability(SocketRole::Upstream, SupportedProtocol::ICMP, Type::RAW);
 
-        #[cfg(windows)]
-        {
-            assert!(!policy.can_keep_connected);
-            assert!(!policy.can_reconnect_in_place);
-            assert!(!policy.should_start_connected);
-        }
-
-        #[cfg(not(windows))]
-        {
-            assert!(policy.can_keep_connected);
-            assert!(!policy.can_reconnect_in_place);
-            assert!(policy.should_start_connected);
-        }
+        assert!(policy.can_keep_connected);
+        assert!(!policy.can_reconnect_in_place);
+        assert!(policy.should_start_connected);
     }
 
     #[test]

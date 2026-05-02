@@ -6,7 +6,16 @@ mod byte_order;
 #[inline]
 pub(crate) const fn parse_icmp_echo_header(
     payload: &[u8],
-) -> (bool, &[u8], usize, usize, u16, u16, bool) {
+) -> (
+    bool,           // success
+    u16,            // ident
+    u16,            // seq
+    bool,           // is_request
+    u8,             // ip_version
+    (usize, usize), // payload bounds
+    (usize, usize), // src ip bounds
+    (usize, usize), // dst ip bounds
+) {
     const ZERO_ARRAY: [u8; 1] = [0];
     let n = payload.len();
 
@@ -59,13 +68,21 @@ pub(crate) const fn parse_icmp_echo_header(
 
     let is_request = ((icmp_type == 8) as usize | (icmp_type == 128) as usize) != 0;
 
+    let ip_version = (4 * next_v4 | 6 * next_v6) as u8;
+
+    let src_ip_start = 12 * next_v4 | 8 * next_v6;
+    let src_ip_end = 16 * next_v4 | 24 * next_v6;
+    let dst_ip_start = 16 * next_v4 | 24 * next_v6;
+    let dst_ip_end = 20 * next_v4 | 40 * next_v6;
+
     (
         success_bool,
-        buf,
-        (off + 8) * success,
-        n * success,
         ident,
         seq,
         is_request,
+        ip_version,
+        ((off + 8) * success, n * success),
+        (src_ip_start, src_ip_end),
+        (dst_ip_start, dst_ip_end),
     )
 }

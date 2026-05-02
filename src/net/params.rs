@@ -1,6 +1,6 @@
 use socket2::SockAddr;
 use std::fmt;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 // Shared protocol/packet limits
 pub(crate) const MAX_WIRE_PAYLOAD: usize = 65535; // Used for receive buffer sizing
@@ -13,15 +13,38 @@ pub(crate) const MAX_SAFE_ICMP_IPV4_PAYLOAD: usize = 65506;
 pub(crate) const MAX_SAFE_UDP_IPV6_PAYLOAD: usize = 65527;
 pub(crate) const MAX_SAFE_ICMP_IPV6_PAYLOAD: usize = 65526;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct CanonicalAddr {
     pub addr: SocketAddr,
     pub id: u16, // Finalized OS port or ICMP Identifier
 }
 
 impl CanonicalAddr {
+    #[inline]
     pub fn new(addr: SocketAddr, id: u16) -> Self {
+        let addr = match addr {
+            SocketAddr::V4(a) => SocketAddr::V4(SocketAddrV4::new(*a.ip(), id)),
+            SocketAddr::V6(a) => {
+                SocketAddr::V6(SocketAddrV6::new(*a.ip(), id, a.flowinfo(), a.scope_id()))
+            }
+        };
         Self { addr, id }
+    }
+
+    #[inline]
+    pub fn from_v4(ip: Ipv4Addr, id: u16) -> Self {
+        Self {
+            addr: SocketAddr::V4(SocketAddrV4::new(ip, id)),
+            id,
+        }
+    }
+
+    #[inline]
+    pub fn from_v6(ip: Ipv6Addr, id: u16, flowinfo: u32, scope_id: u32) -> Self {
+        Self {
+            addr: SocketAddr::V6(SocketAddrV6::new(ip, id, flowinfo, scope_id)),
+            id,
+        }
     }
 
     #[inline]
@@ -33,17 +56,28 @@ impl CanonicalAddr {
     }
 
     #[inline]
+    pub fn from_sock_addr(sa: &SockAddr) -> Option<Self> {
+        if let Some(v4) = sa.as_socket_ipv4() {
+            Some(Self::from_v4(*v4.ip(), v4.port()))
+        } else {
+            sa.as_socket_ipv6()
+                .map(|v6| Self::from_v6(*v6.ip(), v6.port(), v6.flowinfo(), v6.scope_id()))
+        }
+    }
+
+    #[inline]
+    pub fn from_sock_addr_with_id(sa: &SockAddr, id: u16) -> Option<Self> {
+        if let Some(v4) = sa.as_socket_ipv4() {
+            Some(Self::from_v4(*v4.ip(), id))
+        } else {
+            sa.as_socket_ipv6()
+                .map(|v6| Self::from_v6(*v6.ip(), id, v6.flowinfo(), v6.scope_id()))
+        }
+    }
+
+    #[inline]
     pub fn as_sock_addr(self) -> SockAddr {
-        let canonical = match self.addr {
-            SocketAddr::V4(addr) => SocketAddr::V4(SocketAddrV4::new(*addr.ip(), self.id)),
-            SocketAddr::V6(addr) => SocketAddr::V6(SocketAddrV6::new(
-                *addr.ip(),
-                self.id,
-                addr.flowinfo(),
-                addr.scope_id(),
-            )),
-        };
-        SockAddr::from(canonical)
+        SockAddr::from(self.addr)
     }
 
     #[inline]
@@ -74,6 +108,25 @@ impl CanonicalAddr {
         Self { addr, id: self.id }
     }
 }
+
+impl PartialEq for CanonicalAddr {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.id != other.id {
+            return false;
+        }
+        match (self.addr, other.addr) {
+            (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
+            (SocketAddr::V6(a), SocketAddr::V6(b)) => {
+                a.ip() == b.ip()
+                    && (a.scope_id() == 0 || b.scope_id() == 0 || a.scope_id() == b.scope_id())
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CanonicalAddr {}
 
 impl fmt::Display for CanonicalAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

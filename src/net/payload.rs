@@ -1,6 +1,5 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::net::byte_order::be16_16;
-use crate::net::icmp_echo_parse::parse_icmp_echo_header;
 use crate::net::payload_support::{
     ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_HAS_SOURCE_ID, ICMP_SHIM_IS_DATA,
 };
@@ -20,27 +19,10 @@ pub(crate) enum PayloadOrigin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IcmpIdPolicy {
-    Any,
-    Exact(u16),
-}
-
-impl IcmpIdPolicy {
-    #[inline]
-    const fn accepts(self, ident: u16) -> bool {
-        match self {
-            Self::Any => true,
-            Self::Exact(expected) => ident == expected,
-        }
-    }
-
-    #[inline]
-    const fn synthetic_ident(self) -> u16 {
-        match self {
-            Self::Any => 0,
-            Self::Exact(ident) => ident,
-        }
-    }
+pub(crate) struct IcmpAdmissionInfo {
+    pub(crate) ident: u16,
+    pub(crate) seq: u16,
+    pub(crate) is_req: bool,
 }
 
 #[derive(Debug)]
@@ -85,7 +67,6 @@ impl<'a> PayloadEvent<'a> {
     #[inline]
     pub(crate) const fn user_payload(
         logical_src_ident: u16,
-        transport_src_ident: u16,
         seq: u16,
         dst_proto: SupportedProtocol,
         bytes: &'a [u8],
@@ -95,7 +76,6 @@ impl<'a> PayloadEvent<'a> {
             data: PayloadData { dst_proto, bytes },
             icmp: Some(IcmpPayloadMeta {
                 logical_src_ident,
-                transport_src_ident,
                 seq,
                 shim_src_ident,
             }),
@@ -113,7 +93,6 @@ impl<'a> PayloadEvent<'a> {
     #[inline]
     pub(crate) const fn session_control(
         logical_src_ident: u16,
-        transport_src_ident: u16,
         seq: u16,
         dst_proto: SupportedProtocol,
         bytes: &'a [u8],
@@ -123,7 +102,6 @@ impl<'a> PayloadEvent<'a> {
             data: PayloadData { dst_proto, bytes },
             icmp: IcmpPayloadMeta {
                 logical_src_ident,
-                transport_src_ident,
                 seq,
                 shim_src_ident,
             },
@@ -131,11 +109,10 @@ impl<'a> PayloadEvent<'a> {
     }
 
     #[inline]
-    pub(crate) const fn cadence_packet(transport_src_ident: u16, seq: u16) -> Self {
+    pub(crate) const fn cadence_packet(logical_src_ident: u16, seq: u16) -> Self {
         Self::CadencePacket {
             icmp: IcmpPayloadMeta {
-                logical_src_ident: transport_src_ident,
-                transport_src_ident,
+                logical_src_ident,
                 seq,
                 shim_src_ident: None,
             },
@@ -168,15 +145,18 @@ impl OwnedPayloadData {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IcmpPayloadMeta {
     pub(crate) logical_src_ident: u16,
-    pub(crate) transport_src_ident: u16,
     pub(crate) seq: u16,
     pub(crate) shim_src_ident: Option<u16>,
 }
 
 #[inline]
-fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<'a>> {
+fn decode_icmp_tunnel_payload<'a>(
+    ident: u16,
+    seq: u16,
+    payload: &'a [u8],
+) -> io::Result<PayloadEvent<'a>> {
     if payload.is_empty() {
-        return Ok(PayloadEvent::cadence_packet(0, 0));
+        return Ok(PayloadEvent::cadence_packet(ident, seq));
     }
 
     let shim = payload[0];
@@ -210,25 +190,22 @@ fn decode_icmp_tunnel_payload<'a>(payload: &'a [u8]) -> io::Result<PayloadEvent<
     // Session-control packets have IS_DATA unset.
     match (is_data, has_user_payload, user_payload.is_empty()) {
         (true, true, false) => Ok(PayloadEvent::user_payload(
-            0,
-            0,
-            0,
+            ident,
+            seq,
             SupportedProtocol::UDP,
             user_payload,
             shim_src_ident,
         )),
         (true, false, true) => Ok(PayloadEvent::user_payload(
-            0,
-            0,
-            0,
+            ident,
+            seq,
             SupportedProtocol::UDP,
             &[],
             shim_src_ident,
         )),
         (false, false, true) => Ok(PayloadEvent::session_control(
-            0,
-            0,
-            0,
+            ident,
+            seq,
             SupportedProtocol::ICMP,
             &[],
             shim_src_ident,
@@ -246,22 +223,28 @@ pub(crate) fn validate_payload<'a>(
     cfg: &RuntimeConfig,
     stats: &dyn StatsSink,
     buf: &'a [u8],
-    icmp_id_policy: IcmpIdPolicy,
+    icmp_info: Option<IcmpAdmissionInfo>,
+    payload_bounds: (usize, usize),
+    synthetic_icmp_ident: Option<u16>,
     origin: PayloadOrigin,
     is_locked: bool,
 ) -> io::Result<PayloadEvent<'a>> {
-    let (src_proto, dst_proto) = if c2u {
-        (cfg.listen_proto, cfg.upstream_proto)
+    let dst_proto = if c2u {
+        cfg.upstream_proto
     } else {
-        (cfg.upstream_proto, cfg.listen_proto)
+        cfg.listen_proto
     };
 
     if origin == PayloadOrigin::SyntheticCadencePacket {
         if c2u && dst_proto == SupportedProtocol::ICMP && cfg.icmp_sync_pps > 0 {
-            return Ok(PayloadEvent::cadence_packet(
-                icmp_id_policy.synthetic_ident(),
-                0,
-            ));
+            let Some(ident) = synthetic_icmp_ident else {
+                stats.drop_err(c2u);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "synthetic cadence packet requires explicit ICMP ident",
+                ));
+            };
+            return Ok(PayloadEvent::cadence_packet(ident, 0));
         } else {
             stats.drop_oversize(c2u);
             return Err(io::Error::new(
@@ -271,43 +254,38 @@ pub(crate) fn validate_payload<'a>(
         }
     }
 
-    let (src_is_icmp, icmp_success, payload, src_ident_header, src_seq, src_is_req) =
-        match src_proto {
-            SupportedProtocol::ICMP => {
-                let res = parse_icmp_echo_header(buf);
-                (true, res.0, &res.1[res.2..res.3], res.4, res.5, res.6)
-            }
-            _ => (false, true, buf, 0u16, 0u16, c2u),
-        };
-
-    if !icmp_success {
+    let (start, end) = payload_bounds;
+    if start > end || end > buf.len() {
         stats.drop_err(c2u);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid ICMP Echo header (missing or truncated)",
-        ));
-    }
-
-    if c2u != src_is_req || (src_is_icmp && !icmp_id_policy.accepts(src_ident_header)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
             format!(
-                "ICMP Echo direction or identity mismatch: got (req={}, id={}), expected (req={}, policy={:?})",
-                src_is_req, src_ident_header, c2u, icmp_id_policy
+                "invalid payload bounds ({start}, {end}) for buffer length {}",
+                buf.len()
             ),
         ));
     }
+    let payload = &buf[start..end];
 
-    let decoded_event = if src_is_icmp {
-        let event = decode_icmp_tunnel_payload(payload)?;
+    let decoded_event = if let Some(icmp_info) = icmp_info {
+        if c2u != icmp_info.is_req {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "ICMP Echo direction mismatch: got (req={}, id={}), expected req={}",
+                    icmp_info.is_req, icmp_info.ident, c2u
+                ),
+            ));
+        }
+        let event = decode_icmp_tunnel_payload(icmp_info.ident, icmp_info.seq, payload)?;
         match event {
             PayloadEvent::CadencePacket { .. } => {
-                PayloadEvent::cadence_packet(src_ident_header, src_seq)
+                PayloadEvent::cadence_packet(icmp_info.ident, icmp_info.seq)
             }
             PayloadEvent::UserPayload { data, icmp } => {
                 let shim_src_ident = icmp.and_then(|icmp| icmp.shim_src_ident);
                 if shim_src_ident.is_some() {
-                    if c2u && !src_is_req {
+                    if c2u && !icmp_info.is_req {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "ICMP tunnel handshake attempted on Echo Reply",
@@ -316,15 +294,14 @@ pub(crate) fn validate_payload<'a>(
                 }
 
                 let effective_src_ident = if c2u && !is_locked {
-                    shim_src_ident.unwrap_or(src_ident_header)
+                    shim_src_ident.unwrap_or(icmp_info.ident)
                 } else {
-                    src_ident_header
+                    icmp_info.ident
                 };
 
                 PayloadEvent::user_payload(
                     effective_src_ident,
-                    src_ident_header,
-                    src_seq,
+                    icmp_info.seq,
                     dst_proto,
                     data.bytes,
                     shim_src_ident,
@@ -339,9 +316,8 @@ pub(crate) fn validate_payload<'a>(
                 }
 
                 PayloadEvent::session_control(
-                    src_ident_header,
-                    src_ident_header,
-                    src_seq,
+                    icmp_info.ident,
+                    icmp_info.seq,
                     dst_proto,
                     data.bytes,
                     None,
@@ -349,7 +325,6 @@ pub(crate) fn validate_payload<'a>(
             }
         }
     } else {
-        debug_assert!(!src_is_icmp);
         PayloadEvent::user_payload_plain(dst_proto, payload)
     };
     let len = decoded_event.payload_len();
