@@ -14,7 +14,7 @@ Protocols and behaviors:
 
 - **UDP**: forwards datagrams unchanged and preserves source ports.
 - **ICMP Echo**: adds payload to request/reply, supports both v4 and v6.
-- **Connected/unconnected modes**: `--debug-client-no-connect` leaves the client socket unconnected for diagnostics, while `--debug-upstream-no-connect` leaves the upstream socket unconnected and always sends via `send_to`.
+- **Connected/unconnected modes**: `--debug-client-unconnected` leaves the client socket unconnected for diagnostics, while `--debug-upstream-unconnected` leaves the upstream socket unconnected and always sends via `send_to`.
 - **Targeted debug logging**: repeat `--debug-log WHAT` for categories like `drops`, `handles`, or `packets`.
 - **Payload limits**: enforce MTU-like behavior with `--max-payload`.
 - **Stats**: periodic JSON lines show aggregate per-direction byte/packet counts and latency metrics. The `worker_flows` array provides per-worker details including locked status and client addresses.
@@ -22,8 +22,8 @@ Protocols and behaviors:
 Notable CLI options:
 
 - `--max-payload N` – drop packets larger than `N` bytes.
-- `--debug-client-no-connect` – leave the locked client socket unconnected (useful for relock or diagnostics).
-- `--debug-upstream-no-connect` – leave the upstream socket unconnected and always send via `send_to`.
+- `--debug-client-unconnected` – leave the locked client socket unconnected (useful for relock or diagnostics).
+- `--debug-upstream-unconnected` – leave the upstream socket unconnected and always send via `send_to`.
 - `--debug-fast-stats` – shorten the stats cadence for tests or debugging.
 - `--debug-log WHAT` – enable one debug category per flag; repeat for multiple categories.
 - `--stats-interval-mins N` – periodic JSON stats interval (0 disables stats thread).

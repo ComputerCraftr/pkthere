@@ -64,8 +64,8 @@ fn describe_unconnected_wrong_peer_case(
         UnconnectedWrongPeerRole::UpstreamSide => "upstream",
     };
     format!(
-        "role={role} family={:?} proto={} client_no_connect={} upstream_no_connect={}",
-        case.family, case.proto, case.debug_client_no_connect, case.debug_upstream_no_connect
+        "role={role} family={:?} proto={} client_unconnected={} upstream_unconnected={}",
+        case.family, case.proto, case.debug_client_unconnected, case.debug_upstream_unconnected
     )
 }
 
@@ -134,8 +134,8 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
 
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
@@ -202,8 +202,8 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
 
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
@@ -309,8 +309,8 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
 
     let client_sock = bind_udp_client(IpFamily::V4).expect("IPv4 loopback client bind");
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: default_test_icmp_upstream_arg(localhost_addr(IpFamily::V4, 0).ip()),
         timeout_action: "exit",
@@ -367,8 +367,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 
     let node3_ip = NODE3_IPV4;
     let mut node3 = try_launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
@@ -385,8 +385,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 
     let node2_ip = NODE2_IPV4_STR;
     let mut node2 = try_launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         timeout_action: "exit",
@@ -402,8 +402,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     .expect("could not launch pure ICMP middle node");
 
     let mut node1 = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
@@ -502,8 +502,8 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
 
     let node3_ip = NODE3_IPV4;
     let mut node3 = try_launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         there: format!("UDP:{udp_up_addr}"),
         timeout_action: "exit",
@@ -520,8 +520,8 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
 
     let node2_ip = NODE2_IPV4_STR;
     let mut node2 = try_launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         timeout_action: "exit",
@@ -537,8 +537,8 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     .expect("could not launch pure ICMP middle node");
 
     let mut node1 = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
@@ -594,7 +594,7 @@ fn enforce_max_payload() {
             &[family],
             ALL_SUPPORTED_PROTOCOLS,
             &ALL_CONNECT_MODES,
-            &[false],
+            &ALL_CONNECT_MODES,
             |case| {
                 enforce_max_payload_case(case, max_payload, recv_buf_len);
             },
@@ -613,12 +613,12 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: case.debug_client_no_connect,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: case.debug_client_unconnected,
+        debug_upstream_unconnected: case.debug_upstream_unconnected,
         here: case.family.listen_arg().to_string(),
         there: there_arg,
         timeout_action: "exit",
-        timeout_secs: None,
+        timeout_secs: Some(1),
         max_payload: Some(max_payload),
         fast_stats: false,
         stats_interval_mins: None,
@@ -724,12 +724,12 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: case.debug_client_no_connect,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: case.debug_client_unconnected,
+        debug_upstream_unconnected: case.debug_upstream_unconnected,
         here: case.family.listen_arg().to_string(),
         there: there_arg,
         timeout_action: "exit",
-        timeout_secs: None,
+        timeout_secs: Some(1),
         max_payload: None,
         fast_stats: false,
         stats_interval_mins: None,
@@ -856,8 +856,8 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     let here_port = random_unprivileged_port(IpFamily::V4).expect("ephemeral listen port");
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: case.debug_client_no_connect,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: case.debug_client_unconnected,
+        debug_upstream_unconnected: case.debug_upstream_unconnected,
         here: format!("UDP:{}", localhost_addr(IpFamily::V4, here_port)),
         there: there_arg,
         timeout_action: "drop",
@@ -972,8 +972,8 @@ fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>)
     let here_port = random_unprivileged_port(IpFamily::V4).expect("ephemeral listen port");
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: case.debug_client_no_connect,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: case.debug_client_unconnected,
+        debug_upstream_unconnected: case.debug_upstream_unconnected,
         here: format!("UDP:{}", localhost_addr(IpFamily::V4, here_port)),
         there: format!("UDP:{}", localhost_addr(IpFamily::V4, dead_upstream_port)),
         timeout_action: "drop",
@@ -1079,8 +1079,8 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: case.debug_client_no_connect,
-        debug_upstream_no_connect: case.debug_upstream_no_connect,
+        debug_client_unconnected: case.debug_client_unconnected,
+        debug_upstream_unconnected: case.debug_upstream_unconnected,
         here,
         there: there_arg,
         timeout_action: "exit",
@@ -1240,8 +1240,8 @@ fn test_raw_icmp_independent_ids() {
 
     // Node C: ICMP:1001 -> UDP:Echo (on addr_a)
     let _node_c = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: render_icmp_arg(addr_a.parse().expect("node a ip"), id_a),
         there: format!("UDP:{}", udp_up_addr),
         timeout_action: "exit",
@@ -1258,8 +1258,8 @@ fn test_raw_icmp_independent_ids() {
     // Node B: ICMP:2002 -> ICMP:1001 (to Node C) (on addr_b)
     // We explicitly request local identity id_b (2002) for the upstream side.
     let mut node_b = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b),
         timeout_action: "exit",
@@ -1275,8 +1275,8 @@ fn test_raw_icmp_independent_ids() {
 
     // Node A: UDP -> ICMP:2002 (to Node B)
     let node_a = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         timeout_action: "exit",

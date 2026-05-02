@@ -15,8 +15,8 @@ pub const IPV4_ONLY_FAMILIES: [IpFamily; 1] = [IpFamily::V4];
 pub struct MatrixCase<'a> {
     pub family: IpFamily,
     pub proto: &'a str,
-    pub debug_client_no_connect: bool,
-    pub debug_upstream_no_connect: bool,
+    pub debug_client_unconnected: bool,
+    pub debug_upstream_unconnected: bool,
 }
 
 impl IpFamily {
@@ -43,8 +43,8 @@ impl IpFamily {
 pub fn run_matrix_cases<'a>(
     families: &'a [IpFamily],
     protos: &'a [&'a str],
-    client_no_connect_modes: &'a [bool],
-    upstream_no_connect_modes: &'a [bool],
+    client_unconnected_modes: &'a [bool],
+    upstream_unconnected_modes: &'a [bool],
     mut run: impl FnMut(MatrixCase<'a>),
 ) {
     for &family in families {
@@ -57,13 +57,13 @@ pub fn run_matrix_cases<'a>(
                 continue;
             }
 
-            for &debug_client_no_connect in client_no_connect_modes {
-                for &debug_upstream_no_connect in upstream_no_connect_modes {
+            for &debug_client_unconnected in client_unconnected_modes {
+                for &debug_upstream_unconnected in upstream_unconnected_modes {
                     run(MatrixCase {
                         family,
                         proto,
-                        debug_client_no_connect,
-                        debug_upstream_no_connect,
+                        debug_client_unconnected,
+                        debug_upstream_unconnected,
                     });
                 }
             }

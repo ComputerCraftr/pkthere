@@ -84,7 +84,7 @@ fn upstream_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> Socke
 }
 
 #[inline]
-pub(crate) fn should_force_listener_no_connect_on_timeout(
+pub(crate) fn should_force_listener_unconnected_on_timeout(
     proto: SupportedProtocol,
     sock_type: Type,
 ) -> bool {
@@ -93,7 +93,9 @@ pub(crate) fn should_force_listener_no_connect_on_timeout(
 
 #[cfg(test)]
 mod tests {
-    use super::{SocketRole, should_force_listener_no_connect_on_timeout, socket_reuse_capability};
+    use super::{
+        SocketRole, should_force_listener_unconnected_on_timeout, socket_reuse_capability,
+    };
     use crate::cli::SupportedProtocol;
     use socket2::Type;
 
@@ -151,20 +153,20 @@ mod tests {
     }
 
     #[test]
-    fn timeout_drop_forces_no_connect_only_when_listener_policy_requires_it() {
-        assert!(should_force_listener_no_connect_on_timeout(
+    fn timeout_drop_forces_unconnected_only_when_listener_policy_requires_it() {
+        assert!(should_force_listener_unconnected_on_timeout(
             SupportedProtocol::ICMP,
             Type::RAW
         ));
 
         #[cfg(target_os = "freebsd")]
-        assert!(should_force_listener_no_connect_on_timeout(
+        assert!(should_force_listener_unconnected_on_timeout(
             SupportedProtocol::UDP,
             Type::DGRAM
         ));
 
         #[cfg(not(target_os = "freebsd"))]
-        assert!(!should_force_listener_no_connect_on_timeout(
+        assert!(!should_force_listener_unconnected_on_timeout(
             SupportedProtocol::UDP,
             Type::DGRAM
         ));

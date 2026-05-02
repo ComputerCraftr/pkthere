@@ -33,8 +33,8 @@ fn stress_test_ipv4_case(proto: &str) {
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_no_connect: false,
-        debug_upstream_no_connect: false,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: there_arg,
         timeout_action: "exit",

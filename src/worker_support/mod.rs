@@ -10,7 +10,7 @@ pub(crate) use dispatch::{
 };
 pub(crate) use pacing::GlobalSyncPacer;
 pub(crate) use socket_io::{
-    AlignedBuf, ReceivedPacket, SocketPeerFilter, SocketPeerRole, recv_with_possible_peer_filter,
+    ReceivedPacket, SocketPeerFilter, SocketPeerRole, recv_with_possible_peer_filter,
     wait_socket_until_readable,
 };
 pub(crate) use sync_buffer::{

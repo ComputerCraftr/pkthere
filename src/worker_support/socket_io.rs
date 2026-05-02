@@ -1,6 +1,5 @@
 use crate::cli::SupportedProtocol;
-use crate::net::params::{CanonicalAddr, MAX_WIRE_PAYLOAD};
-use crate::recv_buf::RecvBuf;
+use crate::net::params::CanonicalAddr;
 use socket2::Socket;
 
 use std::io;
@@ -144,29 +143,6 @@ pub(crate) fn wait_socket_until_readable(_sock: &Socket, _timeout: Duration) -> 
         io::ErrorKind::Unsupported,
         "socket readiness waiting is not implemented on this platform",
     ))
-}
-
-#[repr(align(64))]
-pub(crate) struct AlignedBuf {
-    inner: RecvBuf<MAX_WIRE_PAYLOAD>,
-}
-
-impl AlignedBuf {
-    pub(crate) const fn new() -> Self {
-        Self {
-            inner: RecvBuf::new(),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn recv_buf_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        self.inner.recv_buf_mut()
-    }
-
-    #[inline]
-    pub(crate) fn initialized(&self, len: usize) -> &[u8] {
-        self.inner.initialized(len)
-    }
 }
 
 #[cfg(test)]

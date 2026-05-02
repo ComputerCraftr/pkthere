@@ -20,7 +20,7 @@ use flow_state::FlowRuntimeState;
 use net::icmp_support::listener_requires_raw_icmp;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
-use net::socket_policy::should_force_listener_no_connect_on_timeout;
+use net::socket_policy::should_force_listener_unconnected_on_timeout;
 use net::sync_icmp::SharedSyncIcmpState;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
@@ -107,10 +107,10 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
             );
         }
     }
-    let client_mode_reason = if cfg.debug_behavior.client_no_connect {
+    let client_mode_reason = if cfg.debug_behavior.client_unconnected {
         if cfg.on_timeout == TimeoutAction::Drop
             && !snapshot.client_connected
-            && net::socket_policy::should_force_listener_no_connect_on_timeout(
+            && net::socket_policy::should_force_listener_unconnected_on_timeout(
                 cfg.listen_proto,
                 snapshot.listen_sock_type,
             )
@@ -120,7 +120,7 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
             "debug"
         }
     } else if cfg.on_timeout == TimeoutAction::Drop
-        && net::socket_policy::should_force_listener_no_connect_on_timeout(
+        && net::socket_policy::should_force_listener_unconnected_on_timeout(
             cfg.listen_proto,
             snapshot.listen_sock_type,
         )
@@ -131,14 +131,14 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
     };
     log_info!(
         "Client socket mode after lock: {} ({})",
-        if cfg.debug_behavior.client_no_connect {
+        if cfg.debug_behavior.client_unconnected {
             "unconnected"
         } else {
             "connected"
         },
         client_mode_reason
     );
-    let upstream_mode_reason = if cfg.debug_behavior.upstream_no_connect {
+    let upstream_mode_reason = if cfg.debug_behavior.upstream_unconnected {
         if !snapshot.upstream_connected {
             "policy/debug"
         } else {
@@ -182,9 +182,12 @@ fn main() -> io::Result<()> {
     )?;
 
     if requested_cfg.on_timeout == TimeoutAction::Drop
-        && should_force_listener_no_connect_on_timeout(requested_cfg.listen_proto, listen_sock_type)
+        && should_force_listener_unconnected_on_timeout(
+            requested_cfg.listen_proto,
+            listen_sock_type,
+        )
     {
-        requested_cfg.debug_behavior.client_no_connect = true;
+        requested_cfg.debug_behavior.client_unconnected = true;
     }
 
     let cfg = Arc::new(realize_config(requested_cfg, actual_listen)?);
@@ -202,7 +205,7 @@ fn main() -> io::Result<()> {
         cfg.upstream_local_id,
         cfg.upstream_str.clone(),
         cfg.upstream_proto,
-        cfg.debug_behavior.upstream_no_connect,
+        cfg.debug_behavior.upstream_unconnected,
     )?));
 
     for _ in 1..worker_count {
@@ -223,7 +226,7 @@ fn main() -> io::Result<()> {
             cfg.upstream_local_id,
             cfg.upstream_str.clone(),
             cfg.upstream_proto,
-            cfg.debug_behavior.upstream_no_connect,
+            cfg.debug_behavior.upstream_unconnected,
         )?));
     }
 

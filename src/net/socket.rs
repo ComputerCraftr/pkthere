@@ -118,7 +118,7 @@ pub(crate) fn make_upstream_socket_for(
     proto: SupportedProtocol,
     req_local_id: u16,
     reuse_remote_id: bool,
-    debug_no_connect: bool,
+    debug_unconnected: bool,
 ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool)> {
     let (domain, proto_id) = match dest.addr {
         SocketAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
@@ -164,7 +164,7 @@ pub(crate) fn make_upstream_socket_for(
     let mut final_dest = CanonicalAddr::new(dest.addr, remote_id);
     let should_connect = socket_reuse_capability(SocketRole::Upstream, proto, sock_type)
         .should_start_connected
-        && !debug_no_connect;
+        && !debug_unconnected;
 
     // Best-effort bigger buffers
     sock.set_recv_buffer_size(1 << 20)?;
@@ -383,12 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn debug_no_connect_forces_otherwise_connected_upstream_unconnected() {
+    fn debug_unconnected_forces_otherwise_connected_upstream_unconnected() {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
         let (_sock, _local, _remote, _sock_type, connected) =
             make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, true)
-                .expect("debug no-connect upstream socket");
+                .expect("debug unconnected upstream socket");
         assert!(!connected);
     }
 }

@@ -218,7 +218,10 @@ fn rejects_comma_separated_debug_log_values() {
 fn rejects_invalid_single_value_cli_options_against_base_udp_config() {
     let (here, there) = udp_cli_pair(IpFamily::V4, 1, 2);
     for (extra_args, expected) in [
-        (vec!["--debug", "no-connect"], vec!["unknown arg: --debug"]),
+        (
+            vec!["--debug", "invalid-option"],
+            vec!["unknown arg: --debug"],
+        ),
         (
             vec!["--icmp-sync-pps", "10"],
             vec!["--icmp-sync-pps requires --there ICMP"],
@@ -247,8 +250,8 @@ fn runs_with_explicit_debug_flags() {
             &here,
             "--there",
             &there,
-            "--debug-client-no-connect",
-            "--debug-upstream-no-connect",
+            "--debug-client-unconnected",
+            "--debug-upstream-unconnected",
             "--debug-fast-stats",
             "--debug-log",
             "drops",
@@ -340,8 +343,8 @@ fn help_mentions_worker_mode_and_dynamic_port_id_semantics() {
         "fixed remote icmp peer/listener id n (requires raw sockets on linux/android)",
         "--icmp-sync-pps n        global total best-effort icmp sync request target in packets/s",
         "--reresolve-mode what    which sockets to re-resolve: upstream|listen|both|none (default: upstream)",
-        "--debug-client-no-connect leave locked client/listener socket unconnected for debug/relock behavior",
-        "--debug-upstream-no-connect leave upstream socket unconnected and always send via send_to for debugging",
+        "--debug-client-unconnected leave locked client/listener socket unconnected for debug/relock behavior",
+        "--debug-upstream-unconnected leave upstream socket unconnected and always send via send_to for debugging",
         "--debug-fast-stats       shorten stats cadence for tests/debugging",
         "--debug-log what         enable one debug log category what = drops|handles|packets (repeatable)",
     ] {
@@ -355,12 +358,12 @@ fn help_mentions_worker_mode_and_dynamic_port_id_semantics() {
 }
 
 #[test]
-fn rejects_removed_debug_no_connect_flag() {
+fn rejects_unrecognized_debug_flags() {
     let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 0));
     let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 9));
     assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--debug-no-connect"],
-        &["unknown arg: --debug-no-connect"],
+        &["--here", &here, "--there", &there, "--debug-invalid-option"],
+        &["unknown arg: --debug-invalid-option"],
     );
 }
 

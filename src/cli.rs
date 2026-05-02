@@ -110,8 +110,8 @@ impl ReresolveMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DebugBehavior {
-    pub client_no_connect: bool,
-    pub upstream_no_connect: bool,
+    pub client_unconnected: bool,
+    pub upstream_unconnected: bool,
     pub fast_stats: bool,
 }
 
@@ -342,8 +342,8 @@ pub(crate) fn parse_args() -> RequestedConfig {
              \t--reresolve-mode WHAT    Which sockets to re-resolve: upstream|listen|both|none (default: upstream)\n\
              \t--user NAME              Drop privileges to this user (Unix only)\n\
              \t--group NAME             Drop privileges to this group (Unix only)\n\
-             \t--debug-client-no-connect Leave locked client/listener socket unconnected for debug/relock behavior\n\
-             \t--debug-upstream-no-connect Leave upstream socket unconnected and always send via send_to for debugging\n\
+             \t--debug-client-unconnected Leave locked client/listener socket unconnected for debug/relock behavior\n\
+             \t--debug-upstream-unconnected Leave upstream socket unconnected and always send via send_to for debugging\n\
              \t--debug-fast-stats       Shorten stats cadence for tests/debugging\n\
              \t--debug-log WHAT         Enable one debug log category WHAT = drops|handles|packets (repeatable)\n\
              \t-h, --help               Show this help and exit"
@@ -580,11 +580,11 @@ pub(crate) fn parse_args() -> RequestedConfig {
                 let val = get_next_value(&mut args_iter, "--group");
                 set_once(&mut run_as_group, val, "--group");
             }
-            "--debug-client-no-connect" => {
-                debug_behavior.client_no_connect = true;
+            "--debug-client-unconnected" => {
+                debug_behavior.client_unconnected = true;
             }
-            "--debug-upstream-no-connect" => {
-                debug_behavior.upstream_no_connect = true;
+            "--debug-upstream-unconnected" => {
+                debug_behavior.upstream_unconnected = true;
             }
             "--debug-fast-stats" => {
                 debug_behavior.fast_stats = true;

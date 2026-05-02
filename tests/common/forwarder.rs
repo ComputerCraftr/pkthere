@@ -17,8 +17,8 @@ pub enum OutputCapture {
 }
 
 pub struct ForwarderConfig<'a> {
-    pub debug_client_no_connect: bool,
-    pub debug_upstream_no_connect: bool,
+    pub debug_client_unconnected: bool,
+    pub debug_upstream_unconnected: bool,
     pub here: String,
     pub there: String,
     pub timeout_action: &'a str,
@@ -137,11 +137,11 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         cmd.arg("--debug-log").arg(debug_log);
     }
 
-    if cfg.debug_client_no_connect {
-        cmd.arg("--debug-client-no-connect");
+    if cfg.debug_client_unconnected {
+        cmd.arg("--debug-client-unconnected");
     }
-    if cfg.debug_upstream_no_connect {
-        cmd.arg("--debug-upstream-no-connect");
+    if cfg.debug_upstream_unconnected {
+        cmd.arg("--debug-upstream-unconnected");
     }
 
     crate::orchestrator::user_policy::apply_root_user_args(&mut cmd);

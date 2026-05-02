@@ -2,7 +2,7 @@ use crate::cli::{RuntimeConfig, TimeoutAction, WorkerFlowMode};
 use crate::flow_claim::FlowClaimTable;
 use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
-use crate::net::params::CanonicalAddr;
+use crate::net::params::{CanonicalAddr, MAX_WIRE_PAYLOAD};
 use crate::net::payload::{
     IcmpIdPolicy, PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload,
     validate_payload,
@@ -12,12 +12,13 @@ use crate::net::sock_mgr::SocketManager;
 use crate::net::sync_icmp::{
     SharedSyncIcmpState, classify_u2c, prepare_send, reset_session, sync_icmp_enabled,
 };
+use crate::recv_buf::RecvBuf;
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
-    AlignedBuf, BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer,
-    ReceivedPacket, SocketPeerFilter, SocketPeerRole, buffer_sync_event,
-    handle_c2u_session_control, recv_with_possible_peer_filter, refresh_lock_and_sync_state,
-    send_sync_payload_or_cadence, send_user_payload_event, wait_socket_until_readable,
+    BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, ReceivedPacket,
+    SocketPeerFilter, SocketPeerRole, buffer_sync_event, handle_c2u_session_control,
+    recv_with_possible_peer_filter, refresh_lock_and_sync_state, send_sync_payload_or_cadence,
+    send_user_payload_event, wait_socket_until_readable,
 };
 
 use socket2::SockAddr;
@@ -141,7 +142,7 @@ pub(crate) fn run_upstream_to_client_thread(
     _worker_pair_id: usize,
 ) {
     const C2U: bool = false;
-    let mut buf = AlignedBuf::new();
+    let mut buf = RecvBuf::<{ MAX_WIRE_PAYLOAD }>::new();
     let mut handles = sock_mgr.refresh_handles();
     let mut was_locked = false;
     let mut sync_cache = sync_state.cache();
@@ -302,7 +303,7 @@ pub(crate) fn run_client_to_upstream_thread(
     worker_pair_id: usize,
 ) {
     const C2U: bool = true;
-    let mut buf = AlignedBuf::new();
+    let mut buf = RecvBuf::<{ MAX_WIRE_PAYLOAD }>::new();
     let sync_icmp_mode = sync_icmp_enabled(cfg);
     let mut latest_sync_payload: Option<BufferedPayload> = None;
 
@@ -742,7 +743,7 @@ pub(crate) fn run_client_to_upstream_thread(
                         let src_sa = SockAddr::from(src);
 
                         handles.client_connected = false;
-                        if cfg.debug_behavior.client_no_connect {
+                        if cfg.debug_behavior.client_unconnected {
                             log_info!("Locked to single client {} (not connected)", src);
                         } else if let Err(e) = handles.client_sock.connect(&src_sa) {
                             log_warn!("connect client_sock to {} failed: {}", src, e);

@@ -1,5 +1,6 @@
 use std::mem::MaybeUninit;
 
+#[repr(align(64))]
 pub(crate) struct RecvBuf<const N: usize> {
     data: [MaybeUninit<u8>; N],
 }
