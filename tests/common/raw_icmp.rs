@@ -142,11 +142,11 @@ fn linux_binary_has_raw_capability() -> bool {
 mod tests {
     #[test]
     fn platform_dgram_support_check_returns_bool_without_panicking() {
-        let _ = super::platform_supports_dgram_icmp();
+        super::platform_supports_dgram_icmp();
     }
 
     #[test]
     fn platform_raw_requirement_check_returns_bool_without_panicking() {
-        let _ = super::platform_requires_raw_privilege_for_any_icmp();
+        super::platform_requires_raw_privilege_for_any_icmp();
     }
 }

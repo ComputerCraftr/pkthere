@@ -8,33 +8,49 @@ const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
 const BLANKET_ALLOW_ATTR_ALLOWLIST: &[&str] = &["tests/common/orchestrator.rs"];
 const DUPLICATE_FUNCTION_BODY_MIN_LEN: usize = 80;
 const DUPLICATE_TEST_BODY_MIN_LEN: usize = 80;
+const ALL_PROJECT_RUST_DIRS: &[&str] = &["src", "tests", "build_support"];
+const NON_TEST_RUST_DIRS: &[&str] = &["src", "build_support"];
+const TEST_RUST_DIRS: &[&str] = &["tests"];
 
 fn collect_sources_with_exts(root: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
-    let mut entries = fs::read_dir(root)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", root.display()))
-        .map(|entry| entry.unwrap())
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let mut entries = fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()))
+            .map(|entry| entry.unwrap())
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
 
-    for entry in entries {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_sources_with_exts(&path, exts, out);
-        } else if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| exts.iter().any(|want| ext == *want))
-        {
-            out.push(path);
+        for entry in entries.into_iter().rev() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| exts.iter().any(|want| ext == *want))
+            {
+                out.push(path);
+            }
         }
     }
 }
 
+fn collect_sources_from_project_dirs(
+    repo_root: &Path,
+    dir_names: &[&str],
+    exts: &[&str],
+) -> Vec<PathBuf> {
+    let mut sources = Vec::new();
+    for dir_name in dir_names {
+        collect_sources_with_exts(&repo_root.join(dir_name), exts, &mut sources);
+    }
+    sources
+}
+
 pub fn assert_rust_source_files_stay_under_1000_lines() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src_root = repo_root.join("src");
-    let mut sources = Vec::new();
-    collect_sources_with_exts(&src_root, &["rs"], &mut sources);
+    let sources = collect_sources_from_project_dirs(repo_root, ALL_PROJECT_RUST_DIRS, &["rs"]);
 
     let mut offenders = Vec::new();
     for path in sources {
@@ -453,9 +469,7 @@ fn detect_direct_recursion_in_rust_text(text: &str) -> Vec<(usize, String)> {
 
 pub fn assert_no_direct_recursion_in_rust_sources() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src_root = repo_root.join("src");
-    let mut sources = Vec::new();
-    collect_sources_with_exts(&src_root, &["rs"], &mut sources);
+    let sources = collect_sources_from_project_dirs(repo_root, ALL_PROJECT_RUST_DIRS, &["rs"]);
 
     let mut violations = Vec::new();
     for path in sources {
@@ -480,9 +494,7 @@ pub fn assert_no_direct_recursion_in_rust_sources() {
 
 pub fn assert_blanket_dead_code_and_unused_import_allows_are_scoped() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut sources = Vec::new();
-    collect_sources_with_exts(&repo_root.join("src"), &["rs"], &mut sources);
-    collect_sources_with_exts(&repo_root.join("tests"), &["rs"], &mut sources);
+    let sources = collect_sources_from_project_dirs(repo_root, ALL_PROJECT_RUST_DIRS, &["rs"]);
 
     let mut violations = Vec::new();
     for path in sources {
@@ -523,9 +535,7 @@ pub fn assert_blanket_dead_code_and_unused_import_allows_are_scoped() {
 
 pub fn assert_no_duplicate_function_sources_in_scoped_rust_sources() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut sources = Vec::new();
-    collect_sources_with_exts(&repo_root.join("src"), &["rs"], &mut sources);
-    collect_sources_with_exts(&repo_root.join("build_support"), &["rs"], &mut sources);
+    let sources = collect_sources_from_project_dirs(repo_root, NON_TEST_RUST_DIRS, &["rs"]);
 
     let mut body_to_defs =
         std::collections::BTreeMap::<String, Vec<(String, usize, String)>>::new();
@@ -564,8 +574,7 @@ pub fn assert_no_duplicate_function_sources_in_scoped_rust_sources() {
 
 pub fn assert_no_duplicate_test_bodies_in_scoped_rust_sources() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut sources = Vec::new();
-    collect_sources_with_exts(&repo_root.join("tests"), &["rs"], &mut sources);
+    let sources = collect_sources_from_project_dirs(repo_root, TEST_RUST_DIRS, &["rs"]);
 
     let mut body_to_defs =
         std::collections::BTreeMap::<String, Vec<(String, usize, String)>>::new();

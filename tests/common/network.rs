@@ -11,6 +11,8 @@ pub enum IpFamily {
     V6,
 }
 
+pub const ALL_IP_FAMILIES: [IpFamily; 2] = [IpFamily::V4, IpFamily::V6];
+
 pub const NODE1_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 pub const NODE1_IPV4_STR: &str = "127.0.0.1";
 pub const NODE2_IPV4: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);

@@ -7,8 +7,9 @@ mod orchestrator;
 
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    ALL_SUPPORTED_PROTOCOLS, ForwarderConfig, IpFamily, JSON_WAIT_MS, MAX_WAIT_SECS, OutputCapture,
-    bind_udp_client, launch_forwarder, spawn_upstream_echo_or_skip, wait_for_child_exit_success,
+    ALL_IP_FAMILIES, ALL_SUPPORTED_PROTOCOLS, ForwarderConfig, IpFamily, JSON_WAIT_MS,
+    MAX_WAIT_SECS, OutputCapture, bind_udp_client, launch_forwarder, spawn_upstream_echo_or_skip,
+    wait_for_child_exit_success,
 };
 
 use std::io;
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 #[test]
 #[ignore]
 fn stress_test_ipv4() {
-    let _ = IpFamily::V6;
+    assert!(ALL_IP_FAMILIES.contains(&IpFamily::V6));
     for &proto in ALL_SUPPORTED_PROTOCOLS {
         stress_test_ipv4_case(proto);
     }
