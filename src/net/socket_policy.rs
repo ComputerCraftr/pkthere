@@ -55,18 +55,15 @@ fn listener_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> Socke
     }
 }
 
-fn upstream_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> SocketReuseCapability {
+fn upstream_reuse_capability(_proto: SupportedProtocol, sock_type: Type) -> SocketReuseCapability {
     #[cfg(windows)]
-    if proto == SupportedProtocol::ICMP && sock_type == Type::RAW {
+    if _proto == SupportedProtocol::ICMP && sock_type == Type::RAW {
         return SocketReuseCapability {
             can_keep_connected: false,
             can_reconnect_in_place: false,
             should_start_connected: false,
         };
     }
-
-    #[cfg(not(windows))]
-    let _ = proto;
 
     if sock_type == Type::RAW {
         SocketReuseCapability {

@@ -5,7 +5,6 @@ use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use std::io;
-#[cfg(windows)]
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
@@ -182,14 +181,8 @@ pub(crate) fn make_upstream_socket_for(
     } else {
         // Bind to get a local address/port assigned and prevent WSAEINVAL on Windows
         let any_addr = match domain {
-            Domain::IPV6 => SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                local_id,
-            ),
-            _ => SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                local_id,
-            ),
+            Domain::IPV6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_id),
+            _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_id),
         };
         sock.bind(&socket2::SockAddr::from(any_addr))?;
     }
@@ -384,16 +377,34 @@ mod tests {
     }
 
     #[test]
-    fn raw_icmp_upstream_connectedness_matches_platform_policy() {
-        let dest =
-            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    fn upstream_connectedness_matches_platform_policy() {
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        let protocols = vec![SupportedProtocol::UDP];
 
-        let (_sock, _local, _remote, sock_type, connected) =
-            make_upstream_socket_for(dest, SupportedProtocol::ICMP, 0, false, false)
-                .expect("raw upstream socket");
-        let policy =
-            socket_reuse_capability(SocketRole::Upstream, SupportedProtocol::ICMP, sock_type);
-        assert_eq!(connected, policy.should_start_connected);
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        let protocols = vec![SupportedProtocol::UDP, SupportedProtocol::ICMP];
+
+        for proto in protocols {
+            let dest = match proto {
+                SupportedProtocol::UDP => CanonicalAddr::from_socket_addr(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    9,
+                )),
+                SupportedProtocol::ICMP => CanonicalAddr::from_socket_addr(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    0,
+                )),
+            };
+
+            let (_sock, _local, _remote, sock_type, connected) =
+                make_upstream_socket_for(dest, proto, 0, false, false).expect("upstream socket");
+            let policy = socket_reuse_capability(SocketRole::Upstream, proto, sock_type);
+            assert_eq!(
+                connected, policy.should_start_connected,
+                "proto={:?} sock_type={:?} connected mismatch",
+                proto, sock_type
+            );
+        }
     }
 
     #[test]

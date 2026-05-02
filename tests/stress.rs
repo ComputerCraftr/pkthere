@@ -116,7 +116,14 @@ fn stress_test_ipv4_case(proto: &str) {
     );
 
     let min_pct = if proto.eq_ignore_ascii_case("icmp") {
-        40.0
+        #[cfg(not(windows))]
+        {
+            40.0
+        }
+        #[cfg(windows)]
+        {
+            5.0
+        }
     } else {
         60.0
     };

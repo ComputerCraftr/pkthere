@@ -236,11 +236,13 @@ mod tests {
 
     #[test]
     fn unconnected_recv_filters_wrong_udp_peer() {
-        let recv = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
-            .expect("bind recv socket");
-        let recv_addr = recv.local_addr().expect("recv local addr");
-        let sender = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
-            .expect("bind sender");
+        let recv_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 44444));
+        let recv = UdpSocket::bind(recv_addr).expect("bind recv socket");
+        let sender = UdpSocket::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::LOCALHOST,
+            55555,
+        )))
+        .expect("bind sender");
         sender.send_to(b"x", recv_addr).expect("send packet");
 
         let recv = Socket::from(recv);
@@ -249,7 +251,7 @@ mod tests {
             proto: SupportedProtocol::UDP,
             expected: CanonicalAddr::from_socket_addr(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
-                recv_addr.port().saturating_add(1),
+                44446,
             )),
         };
         let mut buf = RecvBuf::<8>::new();
