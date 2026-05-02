@@ -11,19 +11,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SocketMode {
-    Connected,
-    Unconnected,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputCapture {
     Direct,
     Buffered,
 }
 
 pub struct ForwarderConfig<'a> {
-    pub mode: SocketMode,
+    pub debug_client_no_connect: bool,
+    pub debug_upstream_no_connect: bool,
     pub here: String,
     pub there: String,
     pub timeout_action: &'a str,
@@ -99,14 +94,6 @@ pub struct ForwarderSession {
     capture: Option<CaptureHandle>,
 }
 
-impl SocketMode {
-    pub fn apply(self, cmd: &mut Command) {
-        if matches!(self, Self::Unconnected) {
-            cmd.arg("--debug-no-connect");
-        }
-    }
-}
-
 pub fn launch_forwarder(cfg: ForwarderConfig<'_>) -> ForwarderSession {
     try_launch_forwarder(cfg).expect("could not launch forwarder")
 }
@@ -150,7 +137,12 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         cmd.arg("--debug-log").arg(debug_log);
     }
 
-    cfg.mode.apply(&mut cmd);
+    if cfg.debug_client_no_connect {
+        cmd.arg("--debug-client-no-connect");
+    }
+    if cfg.debug_upstream_no_connect {
+        cmd.arg("--debug-upstream-no-connect");
+    }
 
     crate::orchestrator::user_policy::apply_root_user_args(&mut cmd);
 

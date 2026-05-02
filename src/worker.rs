@@ -15,10 +15,12 @@ use crate::net::sync_icmp::{
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
     AlignedBuf, BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer,
-    as_uninit_mut, buffer_sync_event, handle_c2u_session_control, refresh_lock_and_sync_state,
+    ReceivedPacket, SocketPeerFilter, SocketPeerRole, buffer_sync_event,
+    handle_c2u_session_control, recv_with_possible_peer_filter, refresh_lock_and_sync_state,
     send_sync_payload_or_cadence, send_user_payload_event, wait_socket_until_readable,
 };
 
+use socket2::SockAddr;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering as AtomOrdering};
@@ -154,8 +156,17 @@ pub(crate) fn run_upstream_to_client_thread(
             &mut sync_cache,
         );
 
-        match handles.upstream_sock.recv(as_uninit_mut(&mut buf.data)) {
-            Ok(len) => {
+        match recv_with_possible_peer_filter(
+            &handles.upstream_sock,
+            handles.upstream_connected,
+            buf.recv_buf_mut(),
+            Some(SocketPeerFilter {
+                role: SocketPeerRole::Upstream,
+                proto: cfg.upstream_proto,
+                expected: handles.upstream,
+            }),
+        ) {
+            Ok(ReceivedPacket::Accepted { len, .. }) => {
                 let t_recv = Instant::now();
 
                 log_debug!(
@@ -181,7 +192,7 @@ pub(crate) fn run_upstream_to_client_thread(
                             C2U,
                             cfg,
                             stats,
-                            &buf.data[..len],
+                            buf.initialized(len),
                             IcmpIdPolicy::Exact(handles.upstream_local.id),
                             PayloadOrigin::Wire,
                             true, // Already locked
@@ -247,6 +258,23 @@ pub(crate) fn run_upstream_to_client_thread(
                         Some((&mut handles, sock_mgr)),
                     );
                 }
+            }
+            Ok(ReceivedPacket::Filtered { source }) => {
+                log_debug_dir!(
+                    cfg.debug_logs.drops,
+                    worker_id,
+                    C2U,
+                    "dropping packet from unexpected upstream peer {} (expected {})",
+                    source,
+                    handles.upstream
+                );
+            }
+            Ok(ReceivedPacket::UnsupportedSource) => {
+                log_warn_dir!(
+                    worker_id,
+                    C2U,
+                    "recv_from upstream non-IP address family (ignored)"
+                );
             }
             Err(ref e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
@@ -345,13 +373,18 @@ pub(crate) fn run_client_to_upstream_thread(
                     }
                 };
 
-                match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
-                    Ok(len) => {
+                match recv_with_possible_peer_filter(
+                    &handles.client_sock,
+                    handles.client_connected,
+                    buf.recv_buf_mut(),
+                    None,
+                ) {
+                    Ok(ReceivedPacket::Accepted { len, .. }) => {
                         match validate_payload(
                             C2U,
                             cfg,
                             stats,
-                            &buf.data[..len],
+                            buf.initialized(len),
                             cache.recv_icmp_policy,
                             PayloadOrigin::Wire,
                             locked_now,
@@ -385,6 +418,14 @@ pub(crate) fn run_client_to_upstream_thread(
                             }
                         }
                     }
+                    Ok(ReceivedPacket::Filtered { .. }) => {}
+                    Ok(ReceivedPacket::UnsupportedSource) => {
+                        log_warn_dir!(
+                            worker_id,
+                            C2U,
+                            "recv_from client non-IP address family (ignored)"
+                        );
+                    }
                     Err(ref e)
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::TimedOut => {}
@@ -397,8 +438,13 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            match handles.client_sock.recv(as_uninit_mut(&mut buf.data)) {
-                Ok(len) => {
+            match recv_with_possible_peer_filter(
+                &handles.client_sock,
+                handles.client_connected,
+                buf.recv_buf_mut(),
+                None,
+            ) {
+                Ok(ReceivedPacket::Accepted { len, .. }) => {
                     let t_recv = Instant::now();
 
                     log_debug!(
@@ -414,7 +460,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 C2U,
                                 cfg,
                                 stats,
-                                &buf.data[..len],
+                                buf.initialized(len),
                                 cache.recv_icmp_policy,
                                 PayloadOrigin::Wire,
                                 true, // Already locked
@@ -468,6 +514,14 @@ pub(crate) fn run_client_to_upstream_thread(
                             ),
                         }
                     }
+                }
+                Ok(ReceivedPacket::Filtered { .. }) => {}
+                Ok(ReceivedPacket::UnsupportedSource) => {
+                    log_warn_dir!(
+                        worker_id,
+                        C2U,
+                        "recv_from client non-IP address family (ignored)"
+                    );
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock
@@ -527,23 +581,25 @@ pub(crate) fn run_client_to_upstream_thread(
                 if !readable {
                     continue;
                 }
-                match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
-                    Ok((len, src_sa)) => {
-                        let Some(src) = src_sa.as_socket() else {
-                            log_warn_dir!(
-                                worker_id,
-                                C2U,
-                                "recv_from client non-IP address family (ignored): {:?}",
-                                src_sa
-                            );
-                            continue;
-                        };
-
+                match recv_with_possible_peer_filter(
+                    &handles.client_sock,
+                    handles.client_connected,
+                    buf.recv_buf_mut(),
+                    handles.client_peer.map(|expected| SocketPeerFilter {
+                        role: SocketPeerRole::Client,
+                        proto: cfg.listen_proto,
+                        expected,
+                    }),
+                ) {
+                    Ok(ReceivedPacket::Accepted {
+                        len,
+                        source: Some(src),
+                    }) => {
                         let event = match validate_payload(
                             C2U,
                             cfg,
                             stats,
-                            &buf.data[..len],
+                            buf.initialized(len),
                             cache.recv_icmp_policy,
                             PayloadOrigin::Wire,
                             true, // Already locked
@@ -589,6 +645,24 @@ pub(crate) fn run_client_to_upstream_thread(
                             }
                         }
                     }
+                    Ok(ReceivedPacket::Accepted { .. }) => {}
+                    Ok(ReceivedPacket::Filtered { source }) => {
+                        log_debug_dir!(
+                            cfg.debug_logs.drops,
+                            worker_id,
+                            C2U,
+                            "dropping packet from unexpected client peer {} (expected {:?})",
+                            source,
+                            handles.client_peer
+                        );
+                    }
+                    Ok(ReceivedPacket::UnsupportedSource) => {
+                        log_warn_dir!(
+                            worker_id,
+                            C2U,
+                            "recv_from client non-IP address family (ignored)"
+                        );
+                    }
                     Err(ref e)
                         if e.kind() == io::ErrorKind::WouldBlock
                             || e.kind() == io::ErrorKind::TimedOut => {}
@@ -601,18 +675,26 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            match handles.client_sock.recv_from(as_uninit_mut(&mut buf.data)) {
-                Ok((len, src_sa)) => {
+            let peer_filter = if flow_state.is_locked() {
+                handles.client_peer.map(|expected| SocketPeerFilter {
+                    role: SocketPeerRole::Client,
+                    proto: cfg.listen_proto,
+                    expected,
+                })
+            } else {
+                None
+            };
+            match recv_with_possible_peer_filter(
+                &handles.client_sock,
+                handles.client_connected,
+                buf.recv_buf_mut(),
+                peer_filter,
+            ) {
+                Ok(ReceivedPacket::Accepted {
+                    len,
+                    source: Some(src),
+                }) => {
                     let t_recv = Instant::now();
-                    let Some(src) = src_sa.as_socket() else {
-                        log_warn_dir!(
-                            worker_id,
-                            C2U,
-                            "recv_from client non-IP address family (ignored): {:?}",
-                            src_sa
-                        );
-                        continue;
-                    };
 
                     if !flow_state.is_locked() {
                         let event = result_or_log_continue!(
@@ -620,7 +702,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 C2U,
                                 cfg,
                                 stats,
-                                &buf.data[..len],
+                                buf.initialized(len),
                                 cache.recv_icmp_policy,
                                 PayloadOrigin::Wire,
                                 flow_state.is_locked(),
@@ -657,9 +739,10 @@ pub(crate) fn run_client_to_upstream_thread(
                             CanonicalAddr::from_socket_addr(src)
                         };
                         let peer_addr = Some(peer_canonical);
+                        let src_sa = SockAddr::from(src);
 
                         handles.client_connected = false;
-                        if cfg.debug_behavior.no_connect {
+                        if cfg.debug_behavior.client_no_connect {
                             log_info!("Locked to single client {} (not connected)", src);
                         } else if let Err(e) = handles.client_sock.connect(&src_sa) {
                             log_warn!("connect client_sock to {} failed: {}", src, e);
@@ -755,7 +838,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 C2U,
                                 cfg,
                                 stats,
-                                &buf.data[..len],
+                                buf.initialized(len),
                                 cache.recv_icmp_policy,
                                 PayloadOrigin::Wire,
                                 flow_state.is_locked(),
@@ -819,6 +902,24 @@ pub(crate) fn run_client_to_upstream_thread(
                             ),
                         }
                     }
+                }
+                Ok(ReceivedPacket::Accepted { .. }) => {}
+                Ok(ReceivedPacket::Filtered { source }) => {
+                    log_debug_dir!(
+                        cfg.debug_logs.drops,
+                        worker_id,
+                        C2U,
+                        "dropping packet from unexpected client peer {} (expected {:?})",
+                        source,
+                        handles.client_peer
+                    );
+                }
+                Ok(ReceivedPacket::UnsupportedSource) => {
+                    log_warn_dir!(
+                        worker_id,
+                        C2U,
+                        "recv_from client non-IP address family (ignored)"
+                    );
                 }
                 Err(ref e)
                     if e.kind() == io::ErrorKind::WouldBlock

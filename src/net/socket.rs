@@ -118,6 +118,7 @@ pub(crate) fn make_upstream_socket_for(
     proto: SupportedProtocol,
     req_local_id: u16,
     reuse_remote_id: bool,
+    debug_no_connect: bool,
 ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool)> {
     let (domain, proto_id) = match dest.addr {
         SocketAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
@@ -161,8 +162,9 @@ pub(crate) fn make_upstream_socket_for(
     }
 
     let mut final_dest = CanonicalAddr::new(dest.addr, remote_id);
-    let should_connect =
-        socket_reuse_capability(SocketRole::Upstream, proto, sock_type).should_start_connected;
+    let should_connect = socket_reuse_capability(SocketRole::Upstream, proto, sock_type)
+        .should_start_connected
+        && !debug_no_connect;
 
     // Best-effort bigger buffers
     sock.set_recv_buffer_size(1 << 20)?;
@@ -251,13 +253,7 @@ pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
             sa_family: libc::AF_UNSPEC as libc::sa_family_t,
             sa_data: [0; 14],
         };
-        let rc = unsafe {
-            libc::connect(
-                fd,
-                &addr as *const libc::sockaddr,
-                addr.sa_len as libc::socklen_t,
-            )
-        };
+        let rc = connect_with_raw_sockaddr(fd, &addr, addr.sa_len as libc::socklen_t);
         if rc == 0 {
             return Ok(());
         }
@@ -283,18 +279,25 @@ pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
             sa_family: libc::AF_UNSPEC as libc::sa_family_t,
             sa_data: [0; 14],
         };
-        let rc = unsafe {
-            libc::connect(
-                fd,
-                &addr as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
-            )
-        };
+        let rc = connect_with_raw_sockaddr(
+            fd,
+            &addr,
+            std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+        );
         if rc == 0 {
             return Ok(());
         }
         return Err(io::Error::last_os_error());
     }
+}
+
+#[cfg(unix)]
+fn connect_with_raw_sockaddr(
+    fd: std::os::fd::RawFd,
+    addr: &libc::sockaddr,
+    len: libc::socklen_t,
+) -> libc::c_int {
+    unsafe { libc::connect(fd, addr as *const libc::sockaddr, len) }
 }
 
 /// Windows: disconnect a UDP socket by connecting to INADDR_ANY/IN6ADDR_ANY and port 0.
@@ -328,15 +331,16 @@ mod tests {
     #[test]
     fn test_make_upstream_socket_local_id_assigned() {
         // Use a loopback UDP address as destination to avoid privilege issues
-        // while still testing the port/ID assignment logic.
-        // We use port 9 (Discard protocol) or just something that exists.
+        // while still testing the port/ID assignment logic on platforms where
+        // ICMP datagram sockets are not the default connected path.
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let (dest, proto) = (
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)),
             SupportedProtocol::UDP,
         );
 
-        // Use ID 0 for ICMP to trigger the assignment logic.
+        // Use ID 0 for ICMP to trigger dynamic local/remote ID assignment where
+        // ICMP datagram sockets are the normal connected upstream path.
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         let (dest, proto) = (
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
@@ -344,20 +348,18 @@ mod tests {
         );
 
         let (sock, local, remote, sock_type, connected) =
-            make_upstream_socket_for(dest, proto, 0, false)
+            make_upstream_socket_for(dest, proto, 0, false, false)
                 .expect("make_upstream_socket_for failed");
 
-        assert_ne!(remote.id, 0, "Connected remote port ID should be nonzero");
-        assert_ne!(
-            local.id, 0,
-            "Local port ID should be assigned after connect"
-        );
+        assert_ne!(remote.id, 0, "Remote canonical ID should be nonzero");
+        assert_ne!(local.id, 0, "Local canonical ID should be assigned");
         assert_eq!(
             sock_type,
             Type::DGRAM,
             "Upstream socket type should be DGRAM"
         );
-        assert!(connected);
+        let policy = socket_reuse_capability(SocketRole::Upstream, proto, sock_type);
+        assert_eq!(connected, policy.should_start_connected);
         #[cfg(any(target_os = "macos"))]
         assert_eq!(sock.local_addr().unwrap().as_socket().unwrap().port(), 0);
         #[cfg(not(any(target_os = "macos")))]
@@ -373,10 +375,20 @@ mod tests {
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234));
 
         let (_sock, _local, _remote, sock_type, connected) =
-            make_upstream_socket_for(dest, SupportedProtocol::ICMP, 0, false)
+            make_upstream_socket_for(dest, SupportedProtocol::ICMP, 0, false, false)
                 .expect("raw upstream socket");
         let policy =
             socket_reuse_capability(SocketRole::Upstream, SupportedProtocol::ICMP, sock_type);
         assert_eq!(connected, policy.should_start_connected);
+    }
+
+    #[test]
+    fn debug_no_connect_forces_otherwise_connected_upstream_unconnected() {
+        let dest =
+            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
+        let (_sock, _local, _remote, _sock_type, connected) =
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, true)
+                .expect("debug no-connect upstream socket");
+        assert!(!connected);
     }
 }

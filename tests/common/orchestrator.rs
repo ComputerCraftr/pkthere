@@ -14,13 +14,13 @@ mod timing;
 pub mod user_policy;
 
 pub use forwarder::{
-    ForwarderConfig, ForwarderSession, OutputCapture, SocketMode, collect_forwarder_output,
-    launch_forwarder, snapshot_forwarder_output, snapshot_forwarder_output_tail,
-    terminate_forwarder, try_launch_forwarder, wait_for_child_exit_success,
+    ForwarderConfig, ForwarderSession, OutputCapture, collect_forwarder_output, launch_forwarder,
+    snapshot_forwarder_output, snapshot_forwarder_output_tail, terminate_forwarder,
+    try_launch_forwarder, wait_for_child_exit_success,
 };
 pub use matrix::{
-    IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, NODE1_IPV4, NODE1_IPV4_STR, NODE2_IPV4,
-    NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR, SOCKET_MODES, bind_client_or_skip, bind_udp_client,
+    ALL_CONNECT_MODES, IPV4_ONLY_FAMILIES, IpFamily, MatrixCase, NODE1_IPV4, NODE1_IPV4_STR,
+    NODE2_IPV4, NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR, bind_client_or_skip, bind_udp_client,
     default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
     random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
     run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server, spawn_upstream_echo_or_skip,
@@ -34,5 +34,6 @@ pub use runtime_asserts::{
     wait_for_stats_matching,
 };
 pub use timing::{
-    CLIENT_WAIT_MS, DRAIN_WAIT_MS, JSON_WAIT_MS, MAX_WAIT_SECS, SUPPORTED_PROTOCOLS, TIMEOUT_SECS,
+    ALL_SUPPORTED_PROTOCOLS, CLIENT_WAIT_MS, DRAIN_WAIT_MS, JSON_WAIT_MS, MAX_WAIT_SECS,
+    TIMEOUT_SECS,
 };

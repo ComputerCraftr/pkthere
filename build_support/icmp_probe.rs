@@ -1,7 +1,10 @@
 #[path = "../src/net/icmp_echo_parse.rs"]
 mod icmp_echo_parse;
+#[path = "../src/recv_buf.rs"]
+mod recv_buf;
 
 use icmp_echo_parse::parse_icmp_echo_header;
+use recv_buf::RecvBuf;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -42,17 +45,15 @@ pub fn probe_kernel_icmp_echo() -> io::Result<()> {
     sock.connect(&SockAddr::from(dest))?;
     sock.send(&request)?;
 
-    let mut recv_buf = [std::mem::MaybeUninit::uninit(); 2048];
+    let mut recv_buf = RecvBuf::<2048>::new();
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(500) {
-        match sock.recv(&mut recv_buf) {
+        match sock.recv(recv_buf.recv_buf_mut()) {
             Ok(n) => {
                 if n < 8 {
                     continue;
                 }
-                let buf = unsafe {
-                    &*(&recv_buf[..n] as *const [std::mem::MaybeUninit<u8>] as *const [u8])
-                };
+                let buf = recv_buf.initialized(n);
 
                 let (ok, _raw, _start, _end, _ident, _seq, is_req) = parse_icmp_echo_header(buf);
                 if ok && !is_req {

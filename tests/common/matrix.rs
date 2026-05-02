@@ -4,20 +4,19 @@ pub use crate::core::{
     random_unprivileged_port, render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
     spawn_udp_echo_server,
 };
-use crate::orchestrator::forwarder::SocketMode;
-
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 
-pub const SOCKET_MODES: [SocketMode; 2] = [SocketMode::Connected, SocketMode::Unconnected];
+pub const ALL_CONNECT_MODES: [bool; 2] = [false, true];
 pub const IPV4_ONLY_FAMILIES: [IpFamily; 1] = [IpFamily::V4];
 
 #[derive(Clone, Copy, Debug)]
 pub struct MatrixCase<'a> {
     pub family: IpFamily,
     pub proto: &'a str,
-    pub mode: SocketMode,
+    pub debug_client_no_connect: bool,
+    pub debug_upstream_no_connect: bool,
 }
 
 impl IpFamily {
@@ -44,7 +43,8 @@ impl IpFamily {
 pub fn run_matrix_cases<'a>(
     families: &'a [IpFamily],
     protos: &'a [&'a str],
-    modes: &'a [SocketMode],
+    client_no_connect_modes: &'a [bool],
+    upstream_no_connect_modes: &'a [bool],
     mut run: impl FnMut(MatrixCase<'a>),
 ) {
     for &family in families {
@@ -57,12 +57,15 @@ pub fn run_matrix_cases<'a>(
                 continue;
             }
 
-            for &mode in modes {
-                run(MatrixCase {
-                    family,
-                    proto,
-                    mode,
-                });
+            for &debug_client_no_connect in client_no_connect_modes {
+                for &debug_upstream_no_connect in upstream_no_connect_modes {
+                    run(MatrixCase {
+                        family,
+                        proto,
+                        debug_client_no_connect,
+                        debug_upstream_no_connect,
+                    });
+                }
             }
         }
     }

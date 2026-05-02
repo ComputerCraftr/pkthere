@@ -118,6 +118,7 @@ pub(crate) struct SocketManager {
     listen_proto: SupportedProtocol,         // never changes
     upstream_target: String,                 // unresolved --there host:port
     upstream_local_id: u16,
+    upstream_debug_no_connect: bool,
     upstream: Mutex<UpstreamState>,    // cold-path updates only
     upstream_proto: SupportedProtocol, // never changes
     version: AtomicU64,                // increments on any change
@@ -134,6 +135,7 @@ impl SocketManager {
         upstream_local_id: u16,
         upstream_target: String,
         upstream_proto: SupportedProtocol,
+        upstream_debug_no_connect: bool,
     ) -> io::Result<Self> {
         let (sock, upstream_local, upstream_remote, upstream_sock_type, upstream_connected) =
             make_upstream_socket_for(
@@ -141,6 +143,7 @@ impl SocketManager {
                 upstream_proto,
                 upstream_local_id,
                 upstream_local_id == 0,
+                upstream_debug_no_connect,
             )?;
         Ok(Self {
             client_listen: Mutex::new(ClientListenState {
@@ -155,6 +158,7 @@ impl SocketManager {
             listen_proto,
             upstream_target,
             upstream_local_id,
+            upstream_debug_no_connect,
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
@@ -363,6 +367,7 @@ impl SocketManager {
                         self.upstream_proto,
                         self.upstream_local_id,
                         self.upstream_local_id == 0,
+                        self.upstream_debug_no_connect,
                     )?;
                     up_guard.local = local;
                     up_guard.remote = remote;
@@ -394,6 +399,7 @@ impl SocketManager {
                     self.upstream_proto,
                     self.upstream_local_id,
                     self.upstream_local_id == 0,
+                    self.upstream_debug_no_connect,
                 )?;
                 up_guard.local = local;
                 up_guard.remote = remote;
@@ -580,6 +586,7 @@ mod tests {
             0,
             upstream_addr.to_string(),
             SupportedProtocol::UDP,
+            false,
         )
         .expect("create socket manager")
     }

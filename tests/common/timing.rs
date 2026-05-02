@@ -17,4 +17,4 @@ pub const CLIENT_WAIT_MS: Duration = Duration::from_millis(2000);
 /// Small timeout for draining sockets when we expect them to be empty.
 pub const DRAIN_WAIT_MS: Duration = Duration::from_millis(200);
 
-pub const SUPPORTED_PROTOCOLS: &[&str] = &["UDP", "ICMP"];
+pub const ALL_SUPPORTED_PROTOCOLS: &[&str] = &["UDP", "ICMP"];

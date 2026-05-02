@@ -247,7 +247,8 @@ fn runs_with_explicit_debug_flags() {
             &here,
             "--there",
             &there,
-            "--debug-no-connect",
+            "--debug-client-no-connect",
+            "--debug-upstream-no-connect",
             "--debug-fast-stats",
             "--debug-log",
             "drops",
@@ -339,7 +340,8 @@ fn help_mentions_worker_mode_and_dynamic_port_id_semantics() {
         "fixed remote icmp peer/listener id n (requires raw sockets on linux/android)",
         "--icmp-sync-pps n        global total best-effort icmp sync request target in packets/s",
         "--reresolve-mode what    which sockets to re-resolve: upstream|listen|both|none (default: upstream)",
-        "--debug-no-connect       keep sockets unconnected for debug/relock behavior",
+        "--debug-client-no-connect leave locked client/listener socket unconnected for debug/relock behavior",
+        "--debug-upstream-no-connect leave upstream socket unconnected and always send via send_to for debugging",
         "--debug-fast-stats       shorten stats cadence for tests/debugging",
         "--debug-log what         enable one debug log category what = drops|handles|packets (repeatable)",
     ] {
@@ -350,6 +352,16 @@ fn help_mentions_worker_mode_and_dynamic_port_id_semantics() {
             err
         );
     }
+}
+
+#[test]
+fn rejects_removed_debug_no_connect_flag() {
+    let here = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 0));
+    let there = default_test_upstream_arg("UDP", localhost_addr(IpFamily::V4, 9));
+    assert_cli_rejects(
+        &["--here", &here, "--there", &there, "--debug-no-connect"],
+        &["unknown arg: --debug-no-connect"],
+    );
 }
 
 #[test]

@@ -5,6 +5,7 @@ mod flow_claim;
 mod flow_key;
 mod flow_state;
 mod net;
+mod recv_buf;
 mod runtime_support;
 mod stats;
 mod stats_support;
@@ -41,6 +42,7 @@ use std::time::{Duration, Instant};
 fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
     let (_, _, client_proto) = sock_mgr.get_client_dest();
     let (upstream_addr, _, upstream_proto) = sock_mgr.get_upstream_dest();
+    let snapshot = sock_mgr.snapshot_state();
     log_info!(
         "Listening on {}:{}, forwarding to upstream {}:{}; waiting for first client",
         client_proto,
@@ -105,6 +107,57 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
             );
         }
     }
+    let client_mode_reason = if cfg.debug_behavior.client_no_connect {
+        if cfg.on_timeout == TimeoutAction::Drop
+            && !snapshot.client_connected
+            && net::socket_policy::should_force_listener_no_connect_on_timeout(
+                cfg.listen_proto,
+                snapshot.listen_sock_type,
+            )
+        {
+            "policy/debug"
+        } else {
+            "debug"
+        }
+    } else if cfg.on_timeout == TimeoutAction::Drop
+        && net::socket_policy::should_force_listener_no_connect_on_timeout(
+            cfg.listen_proto,
+            snapshot.listen_sock_type,
+        )
+    {
+        "policy"
+    } else {
+        "default"
+    };
+    log_info!(
+        "Client socket mode after lock: {} ({})",
+        if cfg.debug_behavior.client_no_connect {
+            "unconnected"
+        } else {
+            "connected"
+        },
+        client_mode_reason
+    );
+    let upstream_mode_reason = if cfg.debug_behavior.upstream_no_connect {
+        if !snapshot.upstream_connected {
+            "policy/debug"
+        } else {
+            "debug"
+        }
+    } else if !snapshot.upstream_connected {
+        "policy"
+    } else {
+        "default"
+    };
+    log_info!(
+        "Upstream socket mode: {} ({})",
+        if snapshot.upstream_connected {
+            "connected"
+        } else {
+            "unconnected"
+        },
+        upstream_mode_reason
+    );
     if cfg.icmp_sync_pps > 0 {
         log_info!(
             "ICMP sync pace: global total best-effort target {} packet(s)/s shared across all workers and flows",
@@ -131,7 +184,7 @@ fn main() -> io::Result<()> {
     if requested_cfg.on_timeout == TimeoutAction::Drop
         && should_force_listener_no_connect_on_timeout(requested_cfg.listen_proto, listen_sock_type)
     {
-        requested_cfg.debug_behavior.no_connect = true;
+        requested_cfg.debug_behavior.client_no_connect = true;
     }
 
     let cfg = Arc::new(realize_config(requested_cfg, actual_listen)?);
@@ -149,6 +202,7 @@ fn main() -> io::Result<()> {
         cfg.upstream_local_id,
         cfg.upstream_str.clone(),
         cfg.upstream_proto,
+        cfg.debug_behavior.upstream_no_connect,
     )?));
 
     for _ in 1..worker_count {
@@ -169,6 +223,7 @@ fn main() -> io::Result<()> {
             cfg.upstream_local_id,
             cfg.upstream_str.clone(),
             cfg.upstream_proto,
+            cfg.debug_behavior.upstream_no_connect,
         )?));
     }
 

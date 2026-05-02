@@ -14,7 +14,7 @@ Protocols and behaviors:
 
 - **UDP**: forwards datagrams unchanged and preserves source ports.
 - **ICMP Echo**: adds payload to request/reply, supports both v4 and v6.
-- **Connected/unconnected modes**: optional `--debug-no-connect` leaves the client socket unconnected for diagnostics.
+- **Connected/unconnected modes**: `--debug-client-no-connect` leaves the client socket unconnected for diagnostics, while `--debug-upstream-no-connect` leaves the upstream socket unconnected and always sends via `send_to`.
 - **Targeted debug logging**: repeat `--debug-log WHAT` for categories like `drops`, `handles`, or `packets`.
 - **Payload limits**: enforce MTU-like behavior with `--max-payload`.
 - **Stats**: periodic JSON lines show aggregate per-direction byte/packet counts and latency metrics. The `worker_flows` array provides per-worker details including locked status and client addresses.
@@ -22,7 +22,8 @@ Protocols and behaviors:
 Notable CLI options:
 
 - `--max-payload N` – drop packets larger than `N` bytes.
-- `--debug-no-connect` – leave client socket unconnected (useful for multi-hop or diagnostics).
+- `--debug-client-no-connect` – leave the locked client socket unconnected (useful for relock or diagnostics).
+- `--debug-upstream-no-connect` – leave the upstream socket unconnected and always send via `send_to`.
 - `--debug-fast-stats` – shorten the stats cadence for tests or debugging.
 - `--debug-log WHAT` – enable one debug category per flag; repeat for multiple categories.
 - `--stats-interval-mins N` – periodic JSON stats interval (0 disables stats thread).
@@ -43,6 +44,9 @@ Dynamic `:0` semantics:
 - `--here ICMP:host:0` enables wildcard-learn ICMP listening and learns the peer ICMP ID on first lock.
 - `--there ICMP:host:0` means a dynamic local ICMP source ID chosen by the kernel ping socket.
 - Nonzero ICMP IDs remain fixed listener/peer IDs (on Linux/Android, requesting a fixed nonzero ICMP ID forces the use of privileged raw sockets).
+- Policy-driven unconnected modes also exist:
+  - FreeBSD timeout-drop forces the client/listener side unconnected.
+  - Windows raw ICMP upstream forces the upstream side unconnected.
 
 Re-resolve and worker behavior:
 
