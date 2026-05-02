@@ -53,8 +53,8 @@ pub(crate) fn make_socket(
     }
 
     // Best-effort bigger buffers
-    sock.set_recv_buffer_size(1 << 20)?;
-    sock.set_send_buffer_size(1 << 20)?;
+    let _ = sock.set_recv_buffer_size(1 << 20);
+    let _ = sock.set_send_buffer_size(1 << 20);
 
     // Read timeout
     sock.set_read_timeout(if read_timeout_ms == 0 {
@@ -167,8 +167,8 @@ pub(crate) fn make_upstream_socket_for(
         && !debug_unconnected;
 
     // Best-effort bigger buffers
-    sock.set_recv_buffer_size(1 << 20)?;
-    sock.set_send_buffer_size(1 << 20)?;
+    let _ = sock.set_recv_buffer_size(1 << 20);
+    let _ = sock.set_send_buffer_size(1 << 20);
 
     // Read timeout
     let read_timeout = Duration::from_millis(1000);
@@ -176,8 +176,22 @@ pub(crate) fn make_upstream_socket_for(
     sock.set_write_timeout(Some(read_timeout))?;
 
     if should_connect {
+        // Connect
         let dest_sa = final_dest.as_sock_addr();
-        sock.connect(&dest_sa)?;
+        sock.connect(&dest_sa.into())?;
+    } else {
+        // Bind to get a local address/port assigned and prevent WSAEINVAL on Windows
+        let any_addr = match domain {
+            Domain::IPV6 => SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                local_id,
+            ),
+            _ => SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                local_id,
+            ),
+        };
+        sock.bind(&socket2::SockAddr::from(any_addr))?;
     }
 
     let actual_local_sa = sock.local_addr()?.as_socket().ok_or_else(|| {
