@@ -135,12 +135,13 @@ impl SocketManager {
         upstream_target: String,
         upstream_proto: SupportedProtocol,
     ) -> io::Result<Self> {
-        let (sock, upstream_local, upstream_remote, upstream_sock_type) = make_upstream_socket_for(
-            upstream,
-            upstream_proto,
-            upstream_local_id,
-            upstream_local_id == 0,
-        )?;
+        let (sock, upstream_local, upstream_remote, upstream_sock_type, upstream_connected) =
+            make_upstream_socket_for(
+                upstream,
+                upstream_proto,
+                upstream_local_id,
+                upstream_local_id == 0,
+            )?;
         Ok(Self {
             client_listen: Mutex::new(ClientListenState {
                 listen,
@@ -157,7 +158,7 @@ impl SocketManager {
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
-                connected: true,
+                connected: upstream_connected,
                 sock,
                 sock_type: upstream_sock_type,
             }),
@@ -302,7 +303,7 @@ impl SocketManager {
     fn reresolve_upstream(
         &self,
         context: &str,
-    ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool)> {
+    ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool, bool)> {
         let resolved = resolve_first(&self.upstream_target)?;
         let mut up_guard = self.upstream.lock().unwrap();
         let prev_addr = up_guard.remote;
@@ -326,6 +327,7 @@ impl SocketManager {
                 prev_addr,
                 prev_local,
                 prev_sock_type,
+                prev_connected,
                 false,
             )),
             ReresolveAction::UpdateMetadataOnly => {
@@ -339,6 +341,7 @@ impl SocketManager {
                     up_guard.remote,
                     up_guard.local,
                     up_guard.sock_type,
+                    up_guard.connected,
                     true,
                 ))
             }
@@ -355,7 +358,7 @@ impl SocketManager {
                         fresh,
                         reconnect_err
                     );
-                    let (new_sock, local, remote, new_type) = make_upstream_socket_for(
+                    let (new_sock, local, remote, new_type, connected) = make_upstream_socket_for(
                         fresh,
                         self.upstream_proto,
                         self.upstream_local_id,
@@ -363,10 +366,10 @@ impl SocketManager {
                     )?;
                     up_guard.local = local;
                     up_guard.remote = remote;
-                    up_guard.connected = true;
+                    up_guard.connected = connected;
                     up_guard.sock = new_sock.try_clone()?;
                     up_guard.sock_type = new_type;
-                    return Ok((new_sock, remote, local, new_type, true));
+                    return Ok((new_sock, remote, local, new_type, connected, true));
                 }
 
                 up_guard.remote = fresh;
@@ -376,6 +379,7 @@ impl SocketManager {
                     up_guard.remote,
                     up_guard.local,
                     up_guard.sock_type,
+                    up_guard.connected,
                     true,
                 ))
             }
@@ -385,7 +389,7 @@ impl SocketManager {
                     fresh,
                     if fam_flip { "family and " } else { "" }
                 );
-                let (new_sock, local, remote, new_type) = make_upstream_socket_for(
+                let (new_sock, local, remote, new_type, connected) = make_upstream_socket_for(
                     fresh,
                     self.upstream_proto,
                     self.upstream_local_id,
@@ -393,10 +397,10 @@ impl SocketManager {
                 )?;
                 up_guard.local = local;
                 up_guard.remote = remote;
-                up_guard.connected = true;
+                up_guard.connected = connected;
                 up_guard.sock = new_sock.try_clone()?;
                 up_guard.sock_type = new_type;
-                Ok((new_sock, remote, local, new_type, true))
+                Ok((new_sock, remote, local, new_type, connected, true))
             }
         }
     }
@@ -493,7 +497,7 @@ impl SocketManager {
             upstream_changed,
         ) = if allow_upstream {
             let res = self.reresolve_upstream(context)?;
-            (res.0, res.1, res.2, res.3, true, res.4)
+            (res.0, res.1, res.2, res.3, res.4, res.5)
         } else {
             let up = self.upstream.lock().unwrap();
             (

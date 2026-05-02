@@ -11,6 +11,7 @@ pub(crate) enum SocketRole {
 pub(crate) struct SocketReuseCapability {
     pub can_keep_connected: bool,
     pub can_reconnect_in_place: bool,
+    pub should_start_connected: bool,
 }
 
 pub(crate) fn socket_reuse_capability(
@@ -20,7 +21,7 @@ pub(crate) fn socket_reuse_capability(
 ) -> SocketReuseCapability {
     match role {
         SocketRole::Listener => listener_reuse_capability(proto, sock_type),
-        SocketRole::Upstream => upstream_reuse_capability(sock_type),
+        SocketRole::Upstream => upstream_reuse_capability(proto, sock_type),
     }
 }
 
@@ -32,6 +33,7 @@ fn listener_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> Socke
         return SocketReuseCapability {
             can_keep_connected: false,
             can_reconnect_in_place: false,
+            should_start_connected: false,
         };
     }
 
@@ -41,26 +43,42 @@ fn listener_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> Socke
             SocketReuseCapability {
                 can_keep_connected: false,
                 can_reconnect_in_place: false,
+                should_start_connected: false,
             }
         } else {
             SocketReuseCapability {
                 can_keep_connected: true,
                 can_reconnect_in_place: true,
+                should_start_connected: true,
             }
         }
     }
 }
 
-fn upstream_reuse_capability(sock_type: Type) -> SocketReuseCapability {
+fn upstream_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> SocketReuseCapability {
+    #[cfg(windows)]
+    if proto == SupportedProtocol::ICMP && sock_type == Type::RAW {
+        return SocketReuseCapability {
+            can_keep_connected: false,
+            can_reconnect_in_place: false,
+            should_start_connected: false,
+        };
+    }
+
+    #[cfg(not(windows))]
+    let _ = proto;
+
     if sock_type == Type::RAW {
         SocketReuseCapability {
             can_keep_connected: true,
             can_reconnect_in_place: false,
+            should_start_connected: true,
         }
     } else {
         SocketReuseCapability {
             can_keep_connected: true,
             can_reconnect_in_place: true,
+            should_start_connected: true,
         }
     }
 }
@@ -85,6 +103,7 @@ mod tests {
             socket_reuse_capability(SocketRole::Listener, SupportedProtocol::ICMP, Type::RAW);
         assert!(!policy.can_keep_connected);
         assert!(!policy.can_reconnect_in_place);
+        assert!(!policy.should_start_connected);
     }
 
     #[test]
@@ -98,12 +117,36 @@ mod tests {
         {
             assert!(!listener.can_reconnect_in_place);
             assert!(upstream.can_reconnect_in_place);
+            assert!(!listener.should_start_connected);
+            assert!(upstream.should_start_connected);
         }
 
         #[cfg(not(target_os = "freebsd"))]
         {
             assert!(listener.can_reconnect_in_place);
             assert!(upstream.can_reconnect_in_place);
+            assert!(listener.should_start_connected);
+            assert!(upstream.should_start_connected);
+        }
+    }
+
+    #[test]
+    fn windows_raw_icmp_upstream_starts_unconnected() {
+        let policy =
+            socket_reuse_capability(SocketRole::Upstream, SupportedProtocol::ICMP, Type::RAW);
+
+        #[cfg(windows)]
+        {
+            assert!(!policy.can_keep_connected);
+            assert!(!policy.can_reconnect_in_place);
+            assert!(!policy.should_start_connected);
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert!(policy.can_keep_connected);
+            assert!(!policy.can_reconnect_in_place);
+            assert!(policy.should_start_connected);
         }
     }
 
