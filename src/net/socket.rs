@@ -386,7 +386,7 @@ mod tests {
     #[test]
     fn raw_icmp_upstream_connectedness_matches_platform_policy() {
         let dest =
-            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1234));
+            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
 
         let (_sock, _local, _remote, sock_type, connected) =
             make_upstream_socket_for(dest, SupportedProtocol::ICMP, 0, false, false)
