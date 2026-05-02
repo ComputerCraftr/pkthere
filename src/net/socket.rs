@@ -1,4 +1,5 @@
 use crate::cli::SupportedProtocol;
+use crate::net::checksum::checksum16;
 use crate::net::icmp_support::{choose_upstream_icmp_ids, upstream_requires_raw_icmp};
 use crate::net::params::CanonicalAddr;
 use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
@@ -10,6 +11,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::time::Duration;
+
+const CADENCE_PROBE_SEQ: u16 = 0;
 
 /// Create a socket (UDP datagram or ICMP) bound to `bind_addr`.
 /// Returns the socket and the actual local SocketAddr after bind (for ICMP
@@ -111,6 +114,44 @@ fn make_icmp_socket(
     }
 }
 
+fn build_empty_cadence_probe_packet(dest: SocketAddr, remote_id: u16) -> [u8; 8] {
+    let mut hdr = [0u8; 8];
+    let idb = remote_id.to_be_bytes();
+    let sqb = CADENCE_PROBE_SEQ.to_be_bytes();
+    hdr[4] = idb[0];
+    hdr[5] = idb[1];
+    hdr[6] = sqb[0];
+    hdr[7] = sqb[1];
+
+    if dest.is_ipv6() {
+        hdr[0] = 128;
+        hdr[2] = 0;
+        hdr[3] = 0;
+    } else {
+        hdr[0] = 8;
+        let cksum = checksum16(&hdr, &[]).to_be_bytes();
+        hdr[2] = cksum[0];
+        hdr[3] = cksum[1];
+    }
+
+    hdr
+}
+
+fn learn_concrete_local_addr_via_cadence_probe(
+    sock: &Socket,
+    dest: CanonicalAddr,
+) -> io::Result<SocketAddr> {
+    let packet = build_empty_cadence_probe_packet(dest.addr, dest.id);
+    let dest_sa = dest.as_sock_addr();
+    sock.send_to(&packet, &dest_sa)?;
+    sock.local_addr()?.as_socket().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "No socket resolved from getsockname after RAW ICMP cadence probe",
+        )
+    })
+}
+
 /// Create and connect a socket suitable for forwarding data to `dest`.
 pub(crate) fn make_upstream_socket_for(
     dest: CanonicalAddr,
@@ -187,9 +228,20 @@ pub(crate) fn make_upstream_socket_for(
         sock.bind(&socket2::SockAddr::from(any_addr))?;
     }
 
-    let actual_local_sa = sock.local_addr()?.as_socket().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
-    })?;
+    let actual_local_sa = if is_icmp && sock_type == Type::RAW && !should_connect {
+        let learned = learn_concrete_local_addr_via_cadence_probe(&sock, final_dest)?;
+        if learned.ip().is_unspecified() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "concrete local address still unspecified after RAW ICMP cadence probe",
+            ));
+        }
+        learned
+    } else {
+        sock.local_addr()?.as_socket().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
+        })?
+    };
 
     // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
     let final_local_port = actual_local_sa.port();
@@ -377,6 +429,21 @@ mod tests {
     }
 
     #[test]
+    fn connected_udp_upstream_local_identity_is_concrete_immediately() {
+        let dest =
+            CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
+        let (_sock, local, _remote, sock_type, connected) =
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, false)
+                .expect("connected udp upstream socket");
+        assert_eq!(sock_type, Type::DGRAM);
+        assert!(connected);
+        assert!(
+            !local.addr.ip().is_unspecified(),
+            "Connected UDP upstream local identity should be concrete immediately"
+        );
+    }
+
+    #[test]
     fn upstream_connectedness_matches_platform_policy() {
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let protocols = vec![SupportedProtocol::UDP];
@@ -415,5 +482,28 @@ mod tests {
             make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, true)
                 .expect("debug unconnected upstream socket");
         assert!(!connected);
+    }
+
+    #[test]
+    fn empty_cadence_probe_uses_header_only_echo_shape() {
+        let ipv4 = build_empty_cadence_probe_packet(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
+            2002,
+        );
+        let ipv6 = build_empty_cadence_probe_packet(
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 9),
+            3003,
+        );
+
+        assert_eq!(ipv4.len(), 8);
+        assert_eq!(ipv4[0], 8);
+        assert_eq!(u16::from_be_bytes([ipv4[4], ipv4[5]]), 2002);
+        assert_eq!(u16::from_be_bytes([ipv4[6], ipv4[7]]), CADENCE_PROBE_SEQ);
+        assert_ne!(u16::from_be_bytes([ipv4[2], ipv4[3]]), 0);
+
+        assert_eq!(ipv6.len(), 8);
+        assert_eq!(ipv6[0], 128);
+        assert_eq!(u16::from_be_bytes([ipv6[4], ipv6[5]]), 3003);
+        assert_eq!(u16::from_be_bytes([ipv6[6], ipv6[7]]), CADENCE_PROBE_SEQ);
     }
 }

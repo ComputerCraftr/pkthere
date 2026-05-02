@@ -196,10 +196,11 @@ fn send_icmp_echo(
                 checksum16_parts(&hdr, prefix, payload)
             }
         }
-    };
+    }
+    .to_be_bytes();
 
-    hdr[2] = (cksum >> 8) as u8;
-    hdr[3] = (cksum & 0xFF) as u8;
+    hdr[2] = cksum[0];
+    hdr[3] = cksum[1];
     let packet = build_icmp_echo_packet(&hdr, prefix, payload);
     if sock_connected {
         sock.send(&packet)
