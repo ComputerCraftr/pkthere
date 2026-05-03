@@ -86,6 +86,128 @@ pub fn render_canonical_ip_id(ip: IpAddr, id: u16) -> String {
     }
 }
 
+#[cfg(windows)]
+pub fn ensure_loopback_ip(ip: Ipv4Addr) {
+    use std::process::Command;
+
+    if ip == Ipv4Addr::new(127, 0, 0, 1) {
+        return;
+    }
+
+    let ip_s = ip.to_string();
+
+    let address_exists = || -> bool {
+        let check = Command::new("powershell")
+            .args(&[
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-NetIPAddress -AddressFamily IPv4 -IPAddress '{}' -ErrorAction SilentlyContinue",
+                    ip_s
+                ),
+            ])
+            .output()
+            .expect("failed to check loopback IP address");
+
+        check.status.success() && !String::from_utf8_lossy(&check.stdout).trim().is_empty()
+    };
+
+    if address_exists() {
+        return;
+    }
+
+    let loopback = Command::new("powershell")
+        .args(&[
+            "-NoProfile",
+            "-Command",
+            "Get-NetIPInterface -AddressFamily IPv4 | \
+             Where-Object { $_.InterfaceAlias -like '*Loopback*' -or $_.InterfaceDescription -like '*Loopback*' } | \
+             Sort-Object InterfaceMetric | \
+             Select-Object -First 1 -Property InterfaceIndex,InterfaceAlias | \
+             ConvertTo-Json -Compress",
+        ])
+        .output()
+        .expect("failed to find Windows loopback interface");
+
+    if !loopback.status.success() {
+        panic!(
+            "failed to query Windows loopback interface while adding {}: {}",
+            ip_s,
+            String::from_utf8_lossy(&loopback.stderr)
+        );
+    }
+
+    let loopback_json = String::from_utf8_lossy(&loopback.stdout);
+    let loopback_json = loopback_json.trim();
+    if loopback_json.is_empty() {
+        panic!("could not find a Windows IPv4 loopback interface to add {ip_s}");
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(loopback_json)
+        .unwrap_or_else(|e| panic!("failed to parse loopback JSON `{}`: {}", loopback_json, e));
+
+    let interface_index = parsed
+        .get("InterfaceIndex")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(|| panic!("failed to parse InterfaceIndex from `{loopback_json}`"));
+
+    let interface_alias = parsed
+        .get("InterfaceAlias")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("failed to parse InterfaceAlias from `{loopback_json}`"));
+
+    let add = Command::new("powershell")
+        .args(&[
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "New-NetIPAddress -InterfaceIndex {} -IPAddress '{}' -PrefixLength 8 -AddressFamily IPv4 -Type Unicast -PolicyStore ActiveStore -SkipAsSource $true -ErrorAction Stop",
+                interface_index, ip_s
+            ),
+        ])
+        .output()
+        .expect("failed to run New-NetIPAddress for loopback IP address");
+
+    if !add.status.success() {
+        let netsh = Command::new("netsh")
+            .args(&[
+                "interface",
+                "ipv4",
+                "add",
+                "address",
+                &format!("name={interface_alias}"),
+                &format!("address={ip_s}"),
+                "mask=255.0.0.0",
+                "skipassource=true",
+            ])
+            .output()
+            .expect("failed to run netsh fallback for loopback IP address");
+
+        if !netsh.status.success() {
+            panic!(
+                "failed to add Windows loopback IP {} using New-NetIPAddress and netsh. \
+                 New-NetIPAddress stderr: {}\nnetsh stderr: {}",
+                ip_s,
+                String::from_utf8_lossy(&add.stderr),
+                String::from_utf8_lossy(&netsh.stderr)
+            );
+        }
+    }
+
+    if !address_exists() {
+        panic!(
+            "attempted to add Windows loopback IP {}, but Get-NetIPAddress still does not report it",
+            ip_s
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn ensure_loopback_ip(_ip: Ipv4Addr) {
+    // No-op on other platforms
+}
+
 fn spawn_udp_echo_server_impl(
     addr: SocketAddr,
 ) -> io::Result<(SocketAddr, thread::JoinHandle<()>)> {

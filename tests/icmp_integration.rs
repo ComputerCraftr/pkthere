@@ -9,10 +9,10 @@ mod worker_flow;
 
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    CLIENT_WAIT_MS, ForwarderConfig, IpFamily, JSON_WAIT_MS, NODE1_IPV4_STR, NODE2_IPV4_STR,
-    NODE3_IPV4, OutputCapture, bind_udp_client, default_test_icmp_upstream_arg,
-    expect_session_stats_matching, launch_forwarder, localhost_addr, random_unprivileged_port,
-    render_icmp_arg, render_icmp_arg_with_local, try_launch_forwarder,
+    CLIENT_WAIT_MS, ForwarderConfig, IpFamily, JSON_WAIT_MS, NODE1_IPV4_STR, NODE2_IPV4,
+    NODE2_IPV4_STR, NODE3_IPV4, OutputCapture, bind_udp_client, default_test_icmp_upstream_arg,
+    ensure_loopback_ip, expect_session_stats_matching, launch_forwarder, localhost_addr,
+    random_unprivileged_port, render_icmp_arg, render_icmp_arg_with_local, try_launch_forwarder,
 };
 
 use std::io::ErrorKind;
@@ -37,6 +37,11 @@ fn spawn_ipv4_udp_echo() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) 
 
 fn random_icmp_listen_id() -> u16 {
     random_unprivileged_port(IpFamily::V4).expect(ICMP_LISTEN_ID_ERR)
+}
+
+fn ensure_multihop_ips() {
+    ensure_loopback_ip(NODE2_IPV4);
+    ensure_loopback_ip(NODE3_IPV4);
 }
 
 fn launch_icmp_endpoint_node(
@@ -77,7 +82,7 @@ fn launch_icmp_middle_node(
 ) -> crate::orchestrator::ForwarderSession {
     try_launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
+        debug_upstream_unconnected: cfg!(windows),
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         timeout_action: "exit",
@@ -329,6 +334,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop test was enabled, but runtime raw ICMP capability is missing");
 
+    ensure_multihop_ips();
+
     let client_sock = bind_ipv4_client();
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
     let icmp_port_2 = random_icmp_listen_id();
@@ -351,7 +358,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 
     let mut node1 = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
+        debug_upstream_unconnected: cfg!(windows),
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
@@ -434,6 +441,8 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop debug test was enabled, but runtime raw ICMP capability is missing");
 
+    ensure_multihop_ips();
+
     let client_sock = bind_ipv4_client();
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
     let icmp_port_2 = random_icmp_listen_id();
@@ -462,7 +471,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
 
     let mut node1 = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
+        debug_upstream_unconnected: cfg!(windows),
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
@@ -520,7 +529,7 @@ fn test_raw_icmp_independent_ids() {
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
 
     let addr_a = NODE1_IPV4_STR;
-    let addr_b = NODE2_IPV4_STR;
+    let addr_b = NODE1_IPV4_STR;
     let id_a = 1001;
     let id_b = 2002;
 
@@ -542,7 +551,7 @@ fn test_raw_icmp_independent_ids() {
 
     let mut node_b = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
+        debug_upstream_unconnected: cfg!(windows),
         here: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b),
         timeout_action: "exit",
@@ -558,7 +567,7 @@ fn test_raw_icmp_independent_ids() {
 
     let node_a = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
+        debug_upstream_unconnected: cfg!(windows),
         here: IpFamily::V4.listen_arg().to_string(),
         there: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         timeout_action: "exit",

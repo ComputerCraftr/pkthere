@@ -21,7 +21,7 @@ pub(crate) fn socket_reuse_capability(
 ) -> SocketReuseCapability {
     match role {
         SocketRole::Listener => listener_reuse_capability(proto, sock_type),
-        SocketRole::Upstream => upstream_reuse_capability(proto, sock_type),
+        SocketRole::Upstream => upstream_reuse_capability(sock_type),
     }
 }
 
@@ -55,7 +55,7 @@ fn listener_reuse_capability(proto: SupportedProtocol, sock_type: Type) -> Socke
     }
 }
 
-fn upstream_reuse_capability(_proto: SupportedProtocol, sock_type: Type) -> SocketReuseCapability {
+fn upstream_reuse_capability(sock_type: Type) -> SocketReuseCapability {
     if sock_type == Type::RAW {
         SocketReuseCapability {
             can_keep_connected: true,

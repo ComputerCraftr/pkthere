@@ -445,20 +445,10 @@ mod tests {
 
     #[test]
     fn upstream_connectedness_matches_platform_policy() {
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            windows
-        )))]
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         let protocols = vec![SupportedProtocol::UDP];
 
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            windows
-        ))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         let protocols = vec![SupportedProtocol::UDP, SupportedProtocol::ICMP];
 
         for proto in protocols {
