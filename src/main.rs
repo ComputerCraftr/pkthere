@@ -12,15 +12,12 @@ mod stats_support;
 mod worker;
 mod worker_support;
 
-use cli::{
-    RuntimeConfig, SupportedProtocol, TimeoutAction, WorkerFlowMode, parse_args, realize_config,
-};
+use cli::{RuntimeConfig, SupportedProtocol, WorkerFlowMode, parse_args, realize_config};
 use flow_claim::FlowClaimTable;
 use flow_state::FlowRuntimeState;
-use net::icmp_support::listener_requires_raw_icmp;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
-use net::socket_policy::should_force_listener_unconnected_on_timeout;
+use net::socket_policy::{SocketRole, socket_reuse_capability};
 use net::sync_icmp::SharedSyncIcmpState;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
@@ -108,22 +105,27 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
         }
     }
     let client_mode_reason = if cfg.debug_behavior.client_unconnected {
-        if cfg.on_timeout == TimeoutAction::Drop
-            && !snapshot.client_connected
-            && net::socket_policy::should_force_listener_unconnected_on_timeout(
-                cfg.listen_proto,
-                snapshot.listen_sock_type,
-            )
+        if !socket_reuse_capability(
+            SocketRole::Listener,
+            cfg.listen_proto,
+            snapshot.listen_sock_type,
+            cfg.on_timeout,
+            cfg.debug_behavior.client_unconnected,
+        )
+        .can_reconnect_in_place
         {
             "policy/debug"
         } else {
             "debug"
         }
-    } else if cfg.on_timeout == TimeoutAction::Drop
-        && net::socket_policy::should_force_listener_unconnected_on_timeout(
-            cfg.listen_proto,
-            snapshot.listen_sock_type,
-        )
+    } else if !socket_reuse_capability(
+        SocketRole::Listener,
+        cfg.listen_proto,
+        snapshot.listen_sock_type,
+        cfg.on_timeout,
+        cfg.debug_behavior.client_unconnected,
+    )
+    .can_reconnect_in_place
     {
         "policy"
     } else {
@@ -139,12 +141,28 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
         client_mode_reason
     );
     let upstream_mode_reason = if cfg.debug_behavior.upstream_unconnected {
-        if !snapshot.upstream_connected {
+        if !socket_reuse_capability(
+            SocketRole::Upstream,
+            cfg.listen_proto,
+            snapshot.listen_sock_type,
+            cfg.on_timeout,
+            cfg.debug_behavior.upstream_unconnected,
+        )
+        .should_start_connected
+        {
             "policy/debug"
         } else {
             "debug"
         }
-    } else if !snapshot.upstream_connected {
+    } else if !socket_reuse_capability(
+        SocketRole::Upstream,
+        cfg.listen_proto,
+        snapshot.listen_sock_type,
+        cfg.on_timeout,
+        cfg.debug_behavior.upstream_unconnected,
+    )
+    .should_start_connected
+    {
         "policy"
     } else {
         "default"
@@ -173,20 +191,16 @@ fn main() -> io::Result<()> {
     let worker_count = requested_cfg.workers.max(1);
 
     // Listener for the local client (this may require root for low ports)
-    let (client_sock, actual_listen, listen_sock_type) = make_socket(
+    let (client_sock, actual_listen, listen_sock_type, listen_capability) = make_socket(
         requested_cfg.listen_request.addr,
         requested_cfg.listen_proto,
         1000,
         worker_count != 1,
-        requested_cfg.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
+        requested_cfg.on_timeout,
+        requested_cfg.debug_behavior.client_unconnected,
     )?;
 
-    if requested_cfg.on_timeout == TimeoutAction::Drop
-        && should_force_listener_unconnected_on_timeout(
-            requested_cfg.listen_proto,
-            listen_sock_type,
-        )
-    {
+    if !listen_capability.can_reconnect_in_place {
         requested_cfg.debug_behavior.client_unconnected = true;
     }
 
@@ -201,20 +215,24 @@ fn main() -> io::Result<()> {
         listen_sock_type,
         cfg.listen_str.clone(),
         cfg.listen_proto,
+        listen_capability,
+        cfg.debug_behavior.client_unconnected,
         cfg.upstream,
-        cfg.upstream_local_id,
         cfg.upstream_str.clone(),
+        cfg.upstream_local_id,
         cfg.upstream_proto,
         cfg.debug_behavior.upstream_unconnected,
+        cfg.on_timeout,
     )?));
 
     for _ in 1..worker_count {
-        let (extra_sock, _, extra_sock_type) = make_socket(
+        let (extra_sock, _, extra_sock_type, _) = make_socket(
             cfg.listen.addr,
             cfg.listen_proto,
             1000,
             true,
-            cfg.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
+            cfg.on_timeout,
+            cfg.debug_behavior.client_unconnected,
         )?;
         sock_mgrs.push(Arc::new(SocketManager::new(
             extra_sock,
@@ -222,11 +240,14 @@ fn main() -> io::Result<()> {
             extra_sock_type,
             cfg.listen_str.clone(),
             cfg.listen_proto,
+            listen_capability,
+            cfg.debug_behavior.client_unconnected,
             cfg.upstream,
-            cfg.upstream_local_id,
             cfg.upstream_str.clone(),
+            cfg.upstream_local_id,
             cfg.upstream_proto,
             cfg.debug_behavior.upstream_unconnected,
+            cfg.on_timeout,
         )?));
     }
 

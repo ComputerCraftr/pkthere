@@ -82,7 +82,7 @@ fn launch_icmp_middle_node(
 ) -> crate::orchestrator::ForwarderSession {
     try_launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: cfg!(windows),
+        debug_upstream_unconnected: false,
         here: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         there: default_test_icmp_upstream_arg(std::net::IpAddr::V4(node3_ip)),
         timeout_action: "exit",
@@ -358,7 +358,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 
     let mut node1 = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: cfg!(windows),
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
@@ -471,7 +471,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
 
     let mut node1 = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: cfg!(windows),
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: format!("ICMP:{node2_ip}:{icmp_port_2}"),
         timeout_action: "exit",
@@ -551,7 +551,7 @@ fn test_raw_icmp_independent_ids() {
 
     let mut node_b = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: cfg!(windows),
+        debug_upstream_unconnected: false,
         here: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b),
         timeout_action: "exit",
@@ -567,7 +567,7 @@ fn test_raw_icmp_independent_ids() {
 
     let node_a = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
-        debug_upstream_unconnected: cfg!(windows),
+        debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
         there: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
         timeout_action: "exit",

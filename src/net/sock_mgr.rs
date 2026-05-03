@@ -1,11 +1,10 @@
-use crate::cli::SupportedProtocol;
+use crate::cli::{SupportedProtocol, TimeoutAction};
 use crate::flow_key::ClientFlowKey;
-use crate::net::icmp_support::listener_requires_raw_icmp;
 use crate::net::params::CanonicalAddr;
 use crate::net::socket::{
     disconnect_socket, family_changed, make_socket, make_upstream_socket_for, resolve_first,
 };
-use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
+use crate::net::socket_policy::SocketReuseCapability;
 use socket2::{SockAddr, Socket, Type};
 
 use std::io;
@@ -50,6 +49,7 @@ struct ClientListenState {
     connected: bool,
     sock: Socket,
     sock_type: Type,
+    capability: SocketReuseCapability,
 }
 
 struct UpstreamState {
@@ -58,6 +58,7 @@ struct UpstreamState {
     connected: bool,
     sock: Socket,
     sock_type: Type,
+    capability: SocketReuseCapability,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,8 +87,7 @@ fn decide_upstream_reresolve(
     prev: CanonicalAddr,
     resolved: SocketAddr,
     connected: bool,
-    proto: SupportedProtocol,
-    sock_type: Type,
+    capability: SocketReuseCapability,
 ) -> (CanonicalAddr, ReresolveAction) {
     let fresh = prev.with_resolved_ip(resolved);
     if fresh.addr.ip() == prev.addr.ip() {
@@ -97,7 +97,6 @@ fn decide_upstream_reresolve(
         return (fresh, ReresolveAction::ReplaceSocket);
     }
 
-    let capability = socket_reuse_capability(SocketRole::Upstream, proto, sock_type);
     if !connected {
         (fresh, ReresolveAction::UpdateMetadataOnly)
     } else if capability.can_reconnect_in_place {
@@ -116,12 +115,14 @@ pub(crate) struct SocketManager {
     client_listen: Mutex<ClientListenState>, // cold-path updates only
     listen_target: String,                   // unresolved --here host:port
     listen_proto: SupportedProtocol,         // never changes
-    upstream_target: String,                 // unresolved --there host:port
+    listen_debug_unconnected: bool,
+    upstream: Mutex<UpstreamState>, // cold-path updates only
+    upstream_target: String,        // unresolved --there host:port
     upstream_local_id: u16,
-    upstream_debug_unconnected: bool,
-    upstream: Mutex<UpstreamState>,    // cold-path updates only
     upstream_proto: SupportedProtocol, // never changes
-    version: AtomicU64,                // increments on any change
+    upstream_debug_unconnected: bool,
+    timeout_action: TimeoutAction, // never changes
+    version: AtomicU64,            // increments on any change
 }
 
 impl SocketManager {
@@ -131,18 +132,22 @@ impl SocketManager {
         listen_sock_type: Type,
         listen_target: String,
         listen_proto: SupportedProtocol,
+        listen_capability: SocketReuseCapability,
+        listen_debug_unconnected: bool,
         upstream: CanonicalAddr,
-        upstream_local_id: u16,
         upstream_target: String,
+        upstream_local_id: u16,
         upstream_proto: SupportedProtocol,
         upstream_debug_unconnected: bool,
+        timeout_act: TimeoutAction,
     ) -> io::Result<Self> {
-        let (sock, upstream_local, upstream_remote, upstream_sock_type, upstream_connected) =
+        let (sock, upstream_local, upstream_remote, upstream_sock_type, upstream_capability) =
             make_upstream_socket_for(
                 upstream,
                 upstream_proto,
                 upstream_local_id,
                 upstream_local_id == 0,
+                timeout_act,
                 upstream_debug_unconnected,
             )?;
         Ok(Self {
@@ -150,23 +155,27 @@ impl SocketManager {
                 listen,
                 flow: None,
                 peer: None,
-                connected: false,
+                connected: listen_capability.should_start_connected,
                 sock: client_sock,
                 sock_type: listen_sock_type,
+                capability: listen_capability,
             }),
             listen_target,
             listen_proto,
-            upstream_target,
-            upstream_local_id,
-            upstream_debug_unconnected,
+            listen_debug_unconnected,
             upstream: Mutex::new(UpstreamState {
                 remote: upstream_remote,
                 local: upstream_local,
-                connected: upstream_connected,
+                connected: upstream_capability.should_start_connected,
                 sock,
                 sock_type: upstream_sock_type,
+                capability: upstream_capability,
             }),
+            upstream_target,
+            upstream_local_id,
             upstream_proto,
+            upstream_debug_unconnected,
+            timeout_action: timeout_act,
             version: AtomicU64::new(0),
         })
     }
@@ -307,20 +316,23 @@ impl SocketManager {
     fn reresolve_upstream(
         &self,
         context: &str,
-    ) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool, bool)> {
+    ) -> io::Result<(
+        Socket,
+        CanonicalAddr,
+        CanonicalAddr,
+        Type,
+        SocketReuseCapability,
+        bool,
+    )> {
         let resolved = resolve_first(&self.upstream_target)?;
         let mut up_guard = self.upstream.lock().unwrap();
         let prev_addr = up_guard.remote;
         let prev_local = up_guard.local;
         let prev_connected = up_guard.connected;
         let prev_sock_type = up_guard.sock_type;
-        let (fresh, action) = decide_upstream_reresolve(
-            prev_addr,
-            resolved,
-            prev_connected,
-            self.upstream_proto,
-            prev_sock_type,
-        );
+        let prev_capability = up_guard.capability;
+        let (fresh, action) =
+            decide_upstream_reresolve(prev_addr, resolved, prev_connected, prev_capability);
 
         let changed = action != ReresolveAction::NoChange;
         let fam_flip = changed && family_changed(prev_addr.addr, fresh.addr);
@@ -331,7 +343,7 @@ impl SocketManager {
                 prev_addr,
                 prev_local,
                 prev_sock_type,
-                prev_connected,
+                prev_capability,
                 false,
             )),
             ReresolveAction::UpdateMetadataOnly => {
@@ -345,7 +357,7 @@ impl SocketManager {
                     up_guard.remote,
                     up_guard.local,
                     up_guard.sock_type,
-                    up_guard.connected,
+                    up_guard.capability,
                     true,
                 ))
             }
@@ -362,19 +374,21 @@ impl SocketManager {
                         fresh,
                         reconnect_err
                     );
-                    let (new_sock, local, remote, new_type, connected) = make_upstream_socket_for(
-                        fresh,
-                        self.upstream_proto,
-                        self.upstream_local_id,
-                        self.upstream_local_id == 0,
-                        self.upstream_debug_unconnected,
-                    )?;
+                    let (new_sock, local, remote, new_type, new_capability) =
+                        make_upstream_socket_for(
+                            fresh,
+                            self.upstream_proto,
+                            self.upstream_local_id,
+                            self.upstream_local_id == 0,
+                            self.timeout_action,
+                            self.upstream_debug_unconnected,
+                        )?;
                     up_guard.local = local;
                     up_guard.remote = remote;
-                    up_guard.connected = connected;
+                    up_guard.connected = new_capability.should_start_connected;
                     up_guard.sock = new_sock.try_clone()?;
                     up_guard.sock_type = new_type;
-                    return Ok((new_sock, remote, local, new_type, connected, true));
+                    return Ok((new_sock, remote, local, new_type, new_capability, true));
                 }
 
                 up_guard.remote = fresh;
@@ -384,7 +398,7 @@ impl SocketManager {
                     up_guard.remote,
                     up_guard.local,
                     up_guard.sock_type,
-                    up_guard.connected,
+                    up_guard.capability,
                     true,
                 ))
             }
@@ -394,19 +408,20 @@ impl SocketManager {
                     fresh,
                     if fam_flip { "family and " } else { "" }
                 );
-                let (new_sock, local, remote, new_type, connected) = make_upstream_socket_for(
+                let (new_sock, local, remote, new_type, new_capability) = make_upstream_socket_for(
                     fresh,
                     self.upstream_proto,
                     self.upstream_local_id,
                     self.upstream_local_id == 0,
+                    self.timeout_action,
                     self.upstream_debug_unconnected,
                 )?;
                 up_guard.local = local;
                 up_guard.remote = remote;
-                up_guard.connected = connected;
+                up_guard.connected = new_capability.should_start_connected;
                 up_guard.sock = new_sock.try_clone()?;
                 up_guard.sock_type = new_type;
-                Ok((new_sock, remote, local, new_type, connected, true))
+                Ok((new_sock, remote, local, new_type, new_capability, true))
             }
         }
     }
@@ -418,9 +433,9 @@ impl SocketManager {
         Socket,
         Option<ClientFlowKey>,
         Option<CanonicalAddr>,
-        bool,
-        bool,
         Type,
+        SocketReuseCapability,
+        bool,
     )> {
         let resolved = resolve_first(&self.listen_target)?;
 
@@ -433,27 +448,29 @@ impl SocketManager {
                 cl_guard.sock.try_clone()?,
                 cl_guard.flow,
                 cl_guard.peer,
-                cl_guard.connected,
-                false,
                 cl_guard.sock_type,
+                cl_guard.capability,
+                false,
             )),
             ReresolveAction::ReplaceSocket => {
                 log_info!("{context}: listen {} (listener swapped)", fresh);
-                let (new_sock, local_canonical, new_type) = make_socket(
+                let (new_sock, local_canonical, new_type, new_capability) = make_socket(
                     fresh.addr,
                     self.listen_proto,
                     1000,
                     true,
-                    self.listen_proto == SupportedProtocol::ICMP && listener_requires_raw_icmp(),
+                    self.timeout_action,
+                    self.listen_debug_unconnected,
                 )?;
 
                 cl_guard.listen = local_canonical;
                 cl_guard.flow = None;
                 cl_guard.peer = None;
-                cl_guard.connected = false;
+                cl_guard.connected = new_capability.should_start_connected;
                 cl_guard.sock = new_sock.try_clone()?;
                 cl_guard.sock_type = new_type;
-                Ok((new_sock, None, None, false, true, new_type))
+                cl_guard.capability = new_capability;
+                Ok((new_sock, None, None, new_type, new_capability, true))
             }
             _ => unreachable!("listener re-resolve only supports no-op or replacement"),
         }
@@ -476,21 +493,31 @@ impl SocketManager {
             client_sock,
             client_flow,
             client_peer,
-            client_connected,
-            listen_changed,
             listen_sock_type,
+            client_connected,
+            _listen_capability,
+            listen_changed,
         ) = if allow_listen_rebind {
             let res = self.reresolve_listen(context)?;
-            (res.0, res.1, res.2, res.3, res.4, res.5)
+            (
+                res.0,
+                res.1,
+                res.2,
+                res.3,
+                res.4.should_start_connected,
+                res.4,
+                res.5,
+            )
         } else {
             let cl = self.client_listen.lock().unwrap();
             (
                 cl.sock.try_clone()?,
                 cl.flow,
                 cl.peer,
-                cl.connected,
-                false,
                 cl.sock_type,
+                cl.connected,
+                cl.capability,
+                false,
             )
         };
 
@@ -500,10 +527,19 @@ impl SocketManager {
             upstream_local,
             upstream_sock_type,
             upstream_connected,
+            _upstream_capability,
             upstream_changed,
         ) = if allow_upstream {
             let res = self.reresolve_upstream(context)?;
-            (res.0, res.1, res.2, res.3, res.4, res.5)
+            (
+                res.0,
+                res.1,
+                res.2,
+                res.3,
+                res.4.should_start_connected,
+                res.4,
+                res.5,
+            )
         } else {
             let up = self.upstream.lock().unwrap();
             (
@@ -512,6 +548,7 @@ impl SocketManager {
                 up.local,
                 up.sock_type,
                 up.connected,
+                up.capability,
                 false,
             )
         };
@@ -562,15 +599,23 @@ impl SocketManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::TimeoutAction::Drop;
+    use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::sync::Arc;
     use std::thread;
 
     fn make_mgr() -> SocketManager {
         let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let (client_sock, actual_listen, listen_sock_type) =
-            make_socket(listen_addr, SupportedProtocol::UDP, 1000, false, false)
-                .expect("create client sock");
+        let (client_sock, actual_listen, listen_sock_type, listen_capability) = make_socket(
+            listen_addr,
+            SupportedProtocol::UDP,
+            1000,
+            false,
+            Drop,
+            false,
+        )
+        .expect("create client sock");
 
         let upstream_sock = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .expect("bind upstream udp");
@@ -582,11 +627,14 @@ mod tests {
             listen_sock_type,
             actual_listen.addr.to_string(),
             SupportedProtocol::UDP,
+            listen_capability,
+            false,
             CanonicalAddr::from_socket_addr(upstream_addr),
-            0,
             upstream_addr.to_string(),
+            0,
             SupportedProtocol::UDP,
             false,
+            Drop,
         )
         .expect("create socket manager")
     }
@@ -674,8 +722,14 @@ mod tests {
     fn upstream_same_family_connected_prefers_reconnect_when_policy_allows() {
         let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
         let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9999);
-        let (fresh, action) =
-            decide_upstream_reresolve(prev, resolved, true, SupportedProtocol::UDP, Type::DGRAM);
+        let capability = socket_reuse_capability(
+            SocketRole::Upstream,
+            SupportedProtocol::UDP,
+            Type::DGRAM,
+            Drop,
+            false,
+        );
+        let (fresh, action) = decide_upstream_reresolve(prev, resolved, true, capability);
 
         assert_eq!(fresh.id, 5555);
         assert_eq!(fresh.addr.port(), 5555);
@@ -687,8 +741,14 @@ mod tests {
     fn upstream_raw_same_family_change_falls_back_to_replace() {
         let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
         let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9999);
-        let (_, action) =
-            decide_upstream_reresolve(prev, resolved, true, SupportedProtocol::ICMP, Type::RAW);
+        let capability = socket_reuse_capability(
+            SocketRole::Upstream,
+            SupportedProtocol::ICMP,
+            Type::RAW,
+            Drop,
+            false,
+        );
+        let (_, action) = decide_upstream_reresolve(prev, resolved, true, capability);
 
         assert_eq!(action, ReresolveAction::ReplaceSocket);
     }
@@ -697,8 +757,14 @@ mod tests {
     fn upstream_unconnected_same_family_change_only_updates_metadata() {
         let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
         let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 9999);
-        let (_, action) =
-            decide_upstream_reresolve(prev, resolved, false, SupportedProtocol::UDP, Type::DGRAM);
+        let capability = socket_reuse_capability(
+            SocketRole::Upstream,
+            SupportedProtocol::UDP,
+            Type::DGRAM,
+            Drop,
+            false,
+        );
+        let (_, action) = decide_upstream_reresolve(prev, resolved, false, capability);
 
         assert_eq!(action, ReresolveAction::UpdateMetadataOnly);
     }

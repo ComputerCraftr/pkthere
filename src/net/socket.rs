@@ -1,8 +1,10 @@
-use crate::cli::SupportedProtocol;
+use crate::cli::{SupportedProtocol, TimeoutAction};
 use crate::net::checksum::checksum16;
-use crate::net::icmp_support::{choose_upstream_icmp_ids, upstream_requires_raw_icmp};
+use crate::net::icmp_support::{
+    choose_upstream_icmp_ids, listener_requires_raw, upstream_requires_raw,
+};
 use crate::net::params::CanonicalAddr;
-use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
+use crate::net::socket_policy::{SocketReuseCapability, SocketRole, socket_reuse_capability};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 use std::io;
@@ -24,8 +26,9 @@ pub(crate) fn make_socket(
     proto: SupportedProtocol,
     read_timeout_ms: u64,
     reuseport: bool,
-    force_raw_icmp: bool,
-) -> io::Result<(Socket, CanonicalAddr, Type)> {
+    timeout_act: TimeoutAction,
+    debug_unconnected: bool,
+) -> io::Result<(Socket, CanonicalAddr, Type, SocketReuseCapability)> {
     // Raw ICMP: use well-known protocol numbers (see IANA)
     // IPv4 ICMP = 1, IPv6 ICMP = 58; same on Unix and Windows.
     let (domain, icmp_proto) = match bind_addr {
@@ -33,12 +36,15 @@ pub(crate) fn make_socket(
         _ => (Domain::IPV4, Protocol::ICMPV4),
     };
 
+    let is_icmp = proto == SupportedProtocol::ICMP;
+    let force_raw = is_icmp && listener_requires_raw(proto);
+
     // Create socket
     let (sock, sock_type) = match proto {
         SupportedProtocol::ICMP => {
             // Linux kernels expose SOCK_DGRAM ping sockets when ping_group_range
             // permits it; fall back to raw sockets elsewhere.
-            let (s, t) = make_icmp_socket(domain, icmp_proto, force_raw_icmp)?;
+            let (s, t) = make_icmp_socket(domain, icmp_proto, force_raw)?;
             (s, t)
         }
         _ => (
@@ -54,6 +60,15 @@ pub(crate) fn make_socket(
         sock.set_reuse_port(true)?;
     }
 
+    let capability = socket_reuse_capability(
+        SocketRole::Listener,
+        proto,
+        sock_type,
+        timeout_act,
+        debug_unconnected,
+    );
+    let should_bind_wildcard = capability.should_bind_wildcard;
+
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
     let _ = sock.set_send_buffer_size(1 << 20);
@@ -66,7 +81,14 @@ pub(crate) fn make_socket(
     })?;
 
     // Bind
-    let bind_sa = SockAddr::from(bind_addr);
+    let bind_sa = SockAddr::from(if should_bind_wildcard {
+        match domain {
+            Domain::IPV6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), bind_addr.port()),
+            _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_addr.port()),
+        }
+    } else {
+        bind_addr
+    });
     sock.bind(&bind_sa)?;
 
     let actual_local = if bind_addr.port() == 0 {
@@ -77,7 +99,7 @@ pub(crate) fn make_socket(
         CanonicalAddr::from_socket_addr(bind_addr)
     };
 
-    Ok((sock, actual_local, sock_type))
+    Ok((sock, actual_local, sock_type, capability))
 }
 
 fn make_icmp_socket(
@@ -158,15 +180,22 @@ pub(crate) fn make_upstream_socket_for(
     proto: SupportedProtocol,
     req_local_id: u16,
     reuse_remote_id: bool,
+    timeout_act: TimeoutAction,
     debug_unconnected: bool,
-) -> io::Result<(Socket, CanonicalAddr, CanonicalAddr, Type, bool)> {
+) -> io::Result<(
+    Socket,
+    CanonicalAddr,
+    CanonicalAddr,
+    Type,
+    SocketReuseCapability,
+)> {
     let (domain, proto_id) = match dest.addr {
         SocketAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
         _ => (Domain::IPV4, Protocol::ICMPV4),
     };
 
     let is_icmp = proto == SupportedProtocol::ICMP;
-    let force_raw = is_icmp && upstream_requires_raw_icmp(dest.id);
+    let force_raw = is_icmp && upstream_requires_raw(proto, dest.id);
 
     // Create socket
     let (sock, sock_type) = if is_icmp {
@@ -202,9 +231,15 @@ pub(crate) fn make_upstream_socket_for(
     }
 
     let mut final_dest = CanonicalAddr::new(dest.addr, remote_id);
-    let should_connect = socket_reuse_capability(SocketRole::Upstream, proto, sock_type)
-        .should_start_connected
-        && !debug_unconnected;
+    let capability = socket_reuse_capability(
+        SocketRole::Upstream,
+        proto,
+        sock_type,
+        timeout_act,
+        debug_unconnected,
+    );
+    let should_connect = capability.should_start_connected;
+    let should_bind_wildcard = capability.should_bind_wildcard;
 
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
@@ -219,7 +254,7 @@ pub(crate) fn make_upstream_socket_for(
         // Connect
         let dest_sa = final_dest.as_sock_addr();
         sock.connect(&dest_sa.into())?;
-    } else {
+    } else if should_bind_wildcard {
         // Bind to get a local address/port assigned for unconnected paths.
         let any_addr = match domain {
             Domain::IPV6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_id),
@@ -263,7 +298,7 @@ pub(crate) fn make_upstream_socket_for(
 
     let local = CanonicalAddr::new(actual_local_sa, assigned_local_id);
     final_dest.id = assigned_remote_id;
-    Ok((sock, local, final_dest, sock_type, should_connect))
+    Ok((sock, local, final_dest, sock_type, capability))
 }
 
 #[inline]
@@ -384,6 +419,7 @@ pub(crate) fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::TimeoutAction::Drop;
     use crate::net::socket_policy::{SocketRole, socket_reuse_capability};
     use std::net::{IpAddr, Ipv4Addr};
 
@@ -406,8 +442,8 @@ mod tests {
             SupportedProtocol::ICMP,
         );
 
-        let (sock, local, remote, sock_type, connected) =
-            make_upstream_socket_for(dest, proto, 0, false, false)
+        let (sock, local, remote, sock_type, connected_policy) =
+            make_upstream_socket_for(dest, proto, 0, false, Drop, false)
                 .expect("make_upstream_socket_for failed");
 
         assert_ne!(remote.id, 0, "Remote canonical ID should be nonzero");
@@ -417,8 +453,8 @@ mod tests {
             Type::DGRAM,
             "Upstream socket type should be DGRAM"
         );
-        let policy = socket_reuse_capability(SocketRole::Upstream, proto, sock_type);
-        assert_eq!(connected, policy.should_start_connected);
+        let policy = socket_reuse_capability(SocketRole::Upstream, proto, sock_type, Drop, false);
+        assert_eq!(connected_policy, policy);
         #[cfg(any(target_os = "macos"))]
         assert_eq!(sock.local_addr().unwrap().as_socket().unwrap().port(), 0);
         #[cfg(not(any(target_os = "macos")))]
@@ -433,10 +469,10 @@ mod tests {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
         let (_sock, local, _remote, sock_type, connected) =
-            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, false)
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, false)
                 .expect("connected udp upstream socket");
         assert_eq!(sock_type, Type::DGRAM);
-        assert!(connected);
+        assert!(connected.should_start_connected);
         assert!(
             !local.addr.ip().is_unspecified(),
             "Connected UDP upstream local identity should be concrete immediately"
@@ -463,11 +499,13 @@ mod tests {
                 )),
             };
 
-            let (_sock, _local, _remote, sock_type, connected) =
-                make_upstream_socket_for(dest, proto, 0, false, false).expect("upstream socket");
-            let policy = socket_reuse_capability(SocketRole::Upstream, proto, sock_type);
+            let (_sock, _local, _remote, sock_type, connected_policy) =
+                make_upstream_socket_for(dest, proto, 0, false, Drop, false)
+                    .expect("upstream socket");
+            let policy =
+                socket_reuse_capability(SocketRole::Upstream, proto, sock_type, Drop, false);
             assert_eq!(
-                connected, policy.should_start_connected,
+                connected_policy, policy,
                 "proto={:?} sock_type={:?} connected mismatch",
                 proto, sock_type
             );
@@ -479,9 +517,9 @@ mod tests {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
         let (_sock, _local, _remote, _sock_type, connected) =
-            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, true)
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, true)
                 .expect("debug unconnected upstream socket");
-        assert!(!connected);
+        assert!(!connected.should_start_connected);
     }
 
     #[test]

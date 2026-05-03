@@ -1,16 +1,20 @@
 use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::cli::SupportedProtocol;
+
 static EFFECTIVE_ICMP_ID_RNG_STATE: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-pub(crate) const fn listener_requires_raw_icmp() -> bool {
-    true
+pub(crate) fn listener_requires_raw(proto: SupportedProtocol) -> bool {
+    proto == SupportedProtocol::ICMP
 }
 
 #[inline]
-pub(crate) const fn upstream_requires_raw_icmp(requested_id: u16) -> bool {
-    if requested_id == 0 {
+pub(crate) fn upstream_requires_raw(proto: SupportedProtocol, requested_id: u16) -> bool {
+    if proto != SupportedProtocol::ICMP {
+        return false;
+    } else if requested_id == 0 {
         // Dynamic ID: only OSes that completely lack DGRAM ping sockets need RAW.
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
         return true;
@@ -163,7 +167,8 @@ pub(crate) fn choose_upstream_icmp_ids(
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_upstream_icmp_ids, listener_requires_raw_icmp, upstream_requires_raw_icmp};
+    use super::{choose_upstream_icmp_ids, listener_requires_raw, upstream_requires_raw};
+    use crate::cli::SupportedProtocol::ICMP;
 
     #[test]
     fn upstream_effective_icmp_id_never_returns_zero_for_dynamic_assignment() {
@@ -240,18 +245,18 @@ mod tests {
 
     #[test]
     fn icmp_datagram_path_is_reserved_for_upstream_role() {
-        assert!(listener_requires_raw_icmp());
+        assert!(listener_requires_raw(ICMP));
 
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-        assert!(!upstream_requires_raw_icmp(0));
+        assert!(!upstream_requires_raw(ICMP, 0));
 
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-        assert!(upstream_requires_raw_icmp(0));
+        assert!(upstream_requires_raw(ICMP, 0));
 
         #[cfg(target_os = "macos")]
-        assert!(!upstream_requires_raw_icmp(1234));
+        assert!(!upstream_requires_raw(ICMP, 1234));
 
         #[cfg(not(target_os = "macos"))]
-        assert!(upstream_requires_raw_icmp(1234));
+        assert!(upstream_requires_raw(ICMP, 1234));
     }
 }
