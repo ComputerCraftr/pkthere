@@ -121,6 +121,7 @@ pub(crate) struct SocketManager {
     upstream_local_id: u16,
     upstream_proto: SupportedProtocol, // never changes
     upstream_debug_unconnected: bool,
+    debug_handles: bool,
     timeout_action: TimeoutAction, // never changes
     version: AtomicU64,            // increments on any change
 }
@@ -140,6 +141,7 @@ impl SocketManager {
         upstream_proto: SupportedProtocol,
         upstream_debug_unconnected: bool,
         timeout_act: TimeoutAction,
+        debug_handles: bool,
     ) -> io::Result<Self> {
         let (sock, upstream_local, upstream_remote, upstream_sock_type, upstream_capability) =
             make_upstream_socket_for(
@@ -149,6 +151,7 @@ impl SocketManager {
                 upstream_local_id == 0,
                 timeout_act,
                 upstream_debug_unconnected,
+                debug_handles,
             )?;
         Ok(Self {
             client_listen: Mutex::new(ClientListenState {
@@ -175,6 +178,7 @@ impl SocketManager {
             upstream_local_id,
             upstream_proto,
             upstream_debug_unconnected,
+            debug_handles,
             timeout_action: timeout_act,
             version: AtomicU64::new(0),
         })
@@ -382,6 +386,7 @@ impl SocketManager {
                             self.upstream_local_id == 0,
                             self.timeout_action,
                             self.upstream_debug_unconnected,
+                            self.debug_handles,
                         )?;
                     up_guard.local = local;
                     up_guard.remote = remote;
@@ -415,7 +420,9 @@ impl SocketManager {
                     self.upstream_local_id == 0,
                     self.timeout_action,
                     self.upstream_debug_unconnected,
+                    self.debug_handles,
                 )?;
+
                 up_guard.local = local;
                 up_guard.remote = remote;
                 up_guard.connected = new_capability.should_start_connected;
@@ -635,6 +642,7 @@ mod tests {
             SupportedProtocol::UDP,
             false,
             Drop,
+            false,
         )
         .expect("create socket manager")
     }

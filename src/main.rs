@@ -223,6 +223,7 @@ fn main() -> io::Result<()> {
         cfg.upstream_proto,
         cfg.debug_behavior.upstream_unconnected,
         cfg.on_timeout,
+        cfg.debug_logs.handles,
     )?));
 
     for _ in 1..worker_count {
@@ -248,6 +249,7 @@ fn main() -> io::Result<()> {
             cfg.upstream_proto,
             cfg.debug_behavior.upstream_unconnected,
             cfg.on_timeout,
+            cfg.debug_logs.handles,
         )?));
     }
 

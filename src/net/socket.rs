@@ -182,6 +182,7 @@ pub(crate) fn make_upstream_socket_for(
     reuse_remote_id: bool,
     timeout_act: TimeoutAction,
     debug_unconnected: bool,
+    debug_handles: bool,
 ) -> io::Result<(
     Socket,
     CanonicalAddr,
@@ -225,6 +226,7 @@ pub(crate) fn make_upstream_socket_for(
             0, // actual_local_port not known yet
             reuse_remote_id,
             sock_type == Type::RAW,
+            debug_handles,
         );
         local_id = l;
         remote_id = r;
@@ -291,6 +293,7 @@ pub(crate) fn make_upstream_socket_for(
             final_local_port,
             reuse_remote_id,
             sock_type == Type::RAW,
+            debug_handles,
         )
     } else {
         (final_local_port, final_dest.id)
@@ -443,7 +446,7 @@ mod tests {
         );
 
         let (sock, local, remote, sock_type, connected_policy) =
-            make_upstream_socket_for(dest, proto, 0, false, Drop, false)
+            make_upstream_socket_for(dest, proto, 0, false, Drop, false, false)
                 .expect("make_upstream_socket_for failed");
 
         assert_ne!(remote.id, 0, "Remote canonical ID should be nonzero");
@@ -469,7 +472,7 @@ mod tests {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
         let (_sock, local, _remote, sock_type, connected) =
-            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, false)
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, false, false)
                 .expect("connected udp upstream socket");
         assert_eq!(sock_type, Type::DGRAM);
         assert!(connected.should_start_connected);
@@ -500,7 +503,7 @@ mod tests {
             };
 
             let (_sock, _local, _remote, sock_type, connected_policy) =
-                make_upstream_socket_for(dest, proto, 0, false, Drop, false)
+                make_upstream_socket_for(dest, proto, 0, false, Drop, false, false)
                     .expect("upstream socket");
             let policy =
                 socket_reuse_capability(SocketRole::Upstream, proto, sock_type, Drop, false);
@@ -517,7 +520,7 @@ mod tests {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
         let (_sock, _local, _remote, _sock_type, connected) =
-            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, true)
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, true, false)
                 .expect("debug unconnected upstream socket");
         assert!(!connected.should_start_connected);
     }

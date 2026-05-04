@@ -176,10 +176,10 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
     let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(2))
         .expect("did not see expected stats JSON line");
 
-    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), 1);
-    assert_eq!(stats["c2u_bytes"].as_u64().unwrap_or(0), 1);
-    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), 1);
-    assert_eq!(stats["u2c_bytes"].as_u64().unwrap_or(0), 1);
+    assert_eq!(stats["c2u_pkts"].as_u64().expect("missing c2u_pkts"), 1);
+    assert_eq!(stats["c2u_bytes"].as_u64().expect("missing c2u_bytes"), 1);
+    assert_eq!(stats["u2c_pkts"].as_u64().expect("missing u2c_pkts"), 1);
+    assert_eq!(stats["u2c_bytes"].as_u64().expect("missing u2c_bytes"), 1);
 }
 
 #[test]
@@ -261,14 +261,14 @@ fn icmp_sync_keepalive_replies_do_not_prevent_timeout_exit() {
 
     let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(1))
         .expect("did not see stats JSON line after timeout exit");
-    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), 1);
+    assert_eq!(stats["c2u_pkts"].as_u64().expect("missing c2u_pkts"), 1);
     assert_eq!(
-        stats["c2u_bytes"].as_u64().unwrap_or(0),
+        stats["c2u_bytes"].as_u64().expect("missing c2u_bytes"),
         payload.len() as u64
     );
-    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), 1);
+    assert_eq!(stats["u2c_pkts"].as_u64().expect("missing u2c_pkts"), 1);
     assert_eq!(
-        stats["u2c_bytes"].as_u64().unwrap_or(0),
+        stats["u2c_bytes"].as_u64().expect("missing u2c_bytes"),
         payload.len() as u64
     );
 }
@@ -318,11 +318,16 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
 
     let stats = wait_for_stats_json_from(&mut session.out, Duration::from_secs(2))
         .expect("did not see stats JSON line");
-    assert_eq!(stats["c2u_drops_oversize"].as_u64().unwrap_or(0), 0);
-    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), 1);
-    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), 1);
-    assert_eq!(stats["c2u_bytes"].as_u64().unwrap_or(0), 0);
-    assert_eq!(stats["u2c_bytes"].as_u64().unwrap_or(0), 0);
+    assert_eq!(
+        stats["c2u_drops_oversize"]
+            .as_u64()
+            .expect("missing c2u_drops_oversize"),
+        0
+    );
+    assert_eq!(stats["c2u_pkts"].as_u64().expect("missing c2u_pkts"), 1);
+    assert_eq!(stats["u2c_pkts"].as_u64().expect("missing u2c_pkts"), 1);
+    assert_eq!(stats["c2u_bytes"].as_u64().expect("missing c2u_bytes"), 0);
+    assert_eq!(stats["u2c_bytes"].as_u64().expect("missing u2c_bytes"), 0);
 }
 
 #[test]
@@ -426,10 +431,11 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
             Duration::from_secs(5),
             &format!("did not see expected stats JSON line from {name}"),
             |stats| {
-                stats["c2u_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
-                    && stats["u2c_bytes"].as_u64().unwrap_or(0) == payload.len() as u64
-                    && stats["c2u_pkts"].as_u64().unwrap_or(0) == 2
-                    && stats["u2c_pkts"].as_u64().unwrap_or(0) == 2
+                stats["c2u_bytes"].as_u64().expect("missing c2u_bytes") == payload.len() as u64
+                    && stats["u2c_bytes"].as_u64().expect("missing u2c_bytes")
+                        == payload.len() as u64
+                    && stats["c2u_pkts"].as_u64().expect("missing c2u_pkts") == 2
+                    && stats["u2c_pkts"].as_u64().expect("missing u2c_pkts") == 2
             },
         );
     }
@@ -597,7 +603,7 @@ fn test_raw_icmp_independent_ids() {
         &mut node_b,
         Duration::from_secs(5),
         "did not see stats for node B",
-        |s| s["c2u_pkts"].as_u64().unwrap_or(0) >= 1,
+        |s| s["c2u_pkts"].as_u64().expect("missing c2u_pkts") >= 1,
     );
 
     let worker_b = worker_flow::locked_worker_flow(&stats_b);

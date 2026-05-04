@@ -94,6 +94,7 @@ pub(crate) fn choose_upstream_icmp_ids(
     reported_local_port: u16,
     reuse_remote_id: bool,
     is_raw_socket: bool,
+    debug_handles: bool,
 ) -> (u16, u16) {
     // Linux/Android raw sockets for IPPROTO_ICMP often return 1 (the protocol number)
     // from getsockname. We must ignore this as it's not a valid ICMP identity, but
@@ -127,7 +128,7 @@ pub(crate) fn choose_upstream_icmp_ids(
         if (req_local_id != 0 && req_local_id != id) || (req_remote_id != 0 && req_remote_id != id)
         {
             log_debug!(
-                cfg!(test),
+                debug_handles,
                 "ICMP upstream id override (DGRAM): requested local {} and remote {} but using {}, using identical id for both",
                 req_local_id,
                 req_remote_id,
@@ -153,7 +154,7 @@ pub(crate) fn choose_upstream_icmp_ids(
 
     if req_local_id == 0 || req_remote_id == 0 {
         log_debug!(
-            cfg!(test),
+            debug_handles,
             "ICMP upstream id fallback (RAW): requested local={}, requested remote={}, using generated id {} for local, {} for remote",
             req_local_id,
             req_remote_id,
@@ -172,14 +173,14 @@ mod tests {
 
     #[test]
     fn upstream_effective_icmp_id_never_returns_zero_for_dynamic_assignment() {
-        assert_ne!(choose_upstream_icmp_ids(0, 0, 0, false, false).0, 0);
+        assert_ne!(choose_upstream_icmp_ids(0, 0, 0, false, false, false).0, 0);
     }
 
     #[test]
     fn generated_icmp_ids_are_not_structurally_forced_odd() {
         let mut saw_even = false;
         for _ in 0..256 {
-            let (id, _) = choose_upstream_icmp_ids(0, 0, 0, false, false);
+            let (id, _) = choose_upstream_icmp_ids(0, 0, 0, false, false, false);
             assert_ne!(id, 0);
             if id % 2 == 0 {
                 saw_even = true;
@@ -193,32 +194,32 @@ mod tests {
     fn upstream_icmp_id_selection_follows_priority_order() {
         // 1. Kernel assigned (wins even over request) -> forces BOTH local and remote
         assert_eq!(
-            choose_upstream_icmp_ids(11, 22, 5678, false, false),
+            choose_upstream_icmp_ids(11, 22, 5678, false, false, false),
             (5678, 5678)
         );
         assert_eq!(
-            choose_upstream_icmp_ids(0, 0, 5678, false, false),
+            choose_upstream_icmp_ids(0, 0, 5678, false, false, false),
             (5678, 5678)
         );
 
         // 2. User requested (when kernel is 0) -> independent IDs respected only for RAW
         assert_eq!(
-            choose_upstream_icmp_ids(1111, 2222, 0, false, true),
+            choose_upstream_icmp_ids(1111, 2222, 0, false, true, false),
             (1111, 2222)
         );
         assert_eq!(
-            choose_upstream_icmp_ids(1111, 2222, 0, false, false),
+            choose_upstream_icmp_ids(1111, 2222, 0, false, false, false),
             (2222, 2222)
         );
 
         // 3. Generated (when both are 0) -> local and remote are generated
         // For RAW, if reuse_remote_id is true, they should match.
-        let (l, r) = choose_upstream_icmp_ids(0, 0, 0, true, true);
+        let (l, r) = choose_upstream_icmp_ids(0, 0, 0, true, true, false);
         assert_ne!(l, 0);
         assert_eq!(l, r);
 
         // For DGRAM, they always match regardless of reuse_remote_id.
-        let (l, r) = choose_upstream_icmp_ids(0, 0, 0, false, false);
+        let (l, r) = choose_upstream_icmp_ids(0, 0, 0, false, false, false);
         assert_ne!(l, 0);
         assert_eq!(l, r);
     }
@@ -227,18 +228,18 @@ mod tests {
     #[test]
     fn linux_untrusts_raw_socket_getsockname_id_1() {
         // requested 0, kernel reports 1, is_raw_socket true -> should UNTRUST 1 and generate random
-        let (l, r) = choose_upstream_icmp_ids(0, 0, 1, true, true);
+        let (l, r) = choose_upstream_icmp_ids(0, 0, 1, true, true, false);
         assert_ne!(l, 1);
         assert_ne!(l, 0);
         assert_eq!(l, r);
 
         // requested 1, kernel reports 1, is_raw_socket true -> should STILL UNTRUST 1 if it's raw
-        let (l, r) = choose_upstream_icmp_ids(1, 1, 1, true, true);
+        let (l, r) = choose_upstream_icmp_ids(1, 1, 1, true, true, false);
         assert_eq!(l, 1);
         assert_eq!(l, r);
 
         // requested 0, kernel reports 1, is_raw_socket false (DGRAM) -> should TRUST 1
-        let (l, r) = choose_upstream_icmp_ids(0, 0, 1, true, false);
+        let (l, r) = choose_upstream_icmp_ids(0, 0, 1, true, false, false);
         assert_eq!(l, 1);
         assert_eq!(l, r);
     }

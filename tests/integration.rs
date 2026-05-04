@@ -178,7 +178,10 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         JSON_WAIT_MS
     ));
     assert!(
-        stats["c2u_drops_oversize"].as_u64().unwrap_or(0) >= 1,
+        stats["c2u_drops_oversize"]
+            .as_u64()
+            .expect("missing c2u_drops_oversize")
+            >= 1,
         "expected at least one oversize drop, got {}",
         stats["c2u_drops_oversize"]
     );
@@ -255,11 +258,40 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         JSON_WAIT_MS
     ));
     assert!(stats["uptime_s"].is_number());
-    assert!(stats["locked"].as_bool().unwrap_or(false));
-    assert_eq!(stats["c2u_pkts"].as_u64().unwrap_or(0), COUNT as u64);
-    assert_eq!(stats["u2c_pkts"].as_u64().unwrap_or(0), COUNT as u64);
-
+    assert!(stats["locked"].as_bool().expect("missing locked field"));
     let worker = worker_flow::locked_worker_flow(&stats);
+
+    // Verify socket connected status matches matrix case.
+    // Note: ICMP RAW listeners are always unconnected on timeout drop. UDP depends on debug flag.
+    assert_eq!(
+        worker["client_connected"]
+            .as_bool()
+            .expect("missing client_connected"),
+        !case.debug_client_unconnected,
+        "client_connected mismatch for {:?}",
+        case
+    );
+
+    // ICMP RAW upstream might force unconnected on Windows if debug_unconnected is true.
+    // DGRAM upstream respects debug_unconnected.
+    assert_eq!(
+        worker["upstream_connected"]
+            .as_bool()
+            .expect("missing upstream_connected"),
+        !case.debug_upstream_unconnected,
+        "upstream_connected mismatch for {:?}",
+        case
+    );
+
+    assert_eq!(
+        stats["c2u_pkts"].as_u64().expect("missing c2u_pkts"),
+        COUNT as u64
+    );
+    assert_eq!(
+        stats["u2c_pkts"].as_u64().expect("missing u2c_pkts"),
+        COUNT as u64
+    );
+
     let stats_client = json_addr(&worker["client_addr"]).expect("parse stats client_addr");
     assert_eq!(stats_client, client_local, "stats client_addr mismatch");
     let actual_upstream = worker["upstream_canonical"].as_str().unwrap_or_default();
@@ -285,19 +317,23 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
     }
 
     assert_eq!(
-        stats["c2u_bytes"].as_u64().unwrap_or(0),
+        stats["c2u_bytes"].as_u64().expect("missing c2u_bytes"),
         payload.len() as u64 * COUNT as u64
     );
     assert_eq!(
-        stats["u2c_bytes"].as_u64().unwrap_or(0),
+        stats["u2c_bytes"].as_u64().expect("missing u2c_bytes"),
         payload.len() as u64 * COUNT as u64
     );
     assert_eq!(
-        stats["c2u_bytes_max"].as_u64().unwrap_or(0),
+        stats["c2u_bytes_max"]
+            .as_u64()
+            .expect("missing c2u_bytes_max"),
         payload.len() as u64
     );
     assert_eq!(
-        stats["u2c_bytes_max"].as_u64().unwrap_or(0),
+        stats["u2c_bytes_max"]
+            .as_u64()
+            .expect("missing u2c_bytes_max"),
         payload.len() as u64
     );
 
@@ -694,16 +730,32 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
     let stats = wait_for_stats_json_from(&mut session.out, JSON_WAIT_MS)
         .unwrap_or_else(|| panic!("{case_desc}: node1 stats missing"));
     assert_eq!(
-        stats["c2u_pkts"].as_u64().unwrap_or(0),
+        stats["c2u_pkts"].as_u64().expect("missing c2u_pkts"),
         2,
         "{case_desc}: expected exactly 2 c2u packets from legitimate traffic only, got {}",
         stats["c2u_pkts"]
     );
     assert_eq!(
-        stats["u2c_pkts"].as_u64().unwrap_or(0),
+        stats["u2c_pkts"].as_u64().expect("missing u2c_pkts"),
         2,
         "{case_desc}: expected exactly 2 u2c packets from legitimate traffic only, got {}",
         stats["u2c_pkts"]
+    );
+
+    let worker = worker_flow::locked_worker_flow(&stats);
+    assert_eq!(
+        worker["client_connected"]
+            .as_bool()
+            .expect("missing client_connected"),
+        !case.debug_client_unconnected,
+        "{case_desc}: client_connected mismatch"
+    );
+    assert_eq!(
+        worker["upstream_connected"]
+            .as_bool()
+            .expect("missing upstream_connected"),
+        !case.debug_upstream_unconnected,
+        "{case_desc}: upstream_connected mismatch"
     );
 }
 
