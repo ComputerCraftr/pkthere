@@ -17,7 +17,6 @@ use flow_claim::FlowClaimTable;
 use flow_state::FlowRuntimeState;
 use net::sock_mgr::SocketManager;
 use net::socket::make_socket;
-use net::socket_policy::{SocketRole, socket_reuse_capability};
 use net::sync_icmp::SharedSyncIcmpState;
 #[cfg(unix)]
 use nix::unistd::{self, Group, User};
@@ -104,69 +103,27 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
             );
         }
     }
-    let client_mode_reason = if cfg.debug_behavior.client_unconnected {
-        if !socket_reuse_capability(
-            SocketRole::Listener,
-            cfg.listen_proto,
-            snapshot.listen_sock_type,
-            cfg.on_timeout,
-            cfg.debug_behavior.client_unconnected,
-        )
-        .can_reconnect_in_place
-        {
-            "policy/debug"
-        } else {
-            "debug"
-        }
-    } else if !socket_reuse_capability(
-        SocketRole::Listener,
-        cfg.listen_proto,
-        snapshot.listen_sock_type,
-        cfg.on_timeout,
+    let client_after_lock_connected =
+        !cfg.debug_behavior.client_unconnected && snapshot.listen_capability.connects_after_lock();
+    let client_mode_reason = socket_mode_reason(
         cfg.debug_behavior.client_unconnected,
-    )
-    .can_reconnect_in_place
-    {
-        "policy"
-    } else {
-        "default"
-    };
+        client_after_lock_connected,
+        snapshot.listen_capability.connects_after_lock(),
+    );
     log_info!(
         "Client socket mode after lock: {} ({})",
-        if cfg.debug_behavior.client_unconnected {
-            "unconnected"
-        } else {
+        if client_after_lock_connected {
             "connected"
+        } else {
+            "unconnected"
         },
         client_mode_reason
     );
-    let upstream_mode_reason = if cfg.debug_behavior.upstream_unconnected {
-        if !socket_reuse_capability(
-            SocketRole::Upstream,
-            cfg.listen_proto,
-            snapshot.listen_sock_type,
-            cfg.on_timeout,
-            cfg.debug_behavior.upstream_unconnected,
-        )
-        .should_start_connected
-        {
-            "policy/debug"
-        } else {
-            "debug"
-        }
-    } else if !socket_reuse_capability(
-        SocketRole::Upstream,
-        cfg.listen_proto,
-        snapshot.listen_sock_type,
-        cfg.on_timeout,
+    let upstream_mode_reason = socket_mode_reason(
         cfg.debug_behavior.upstream_unconnected,
-    )
-    .should_start_connected
-    {
-        "policy"
-    } else {
-        "default"
-    };
+        snapshot.upstream_connected,
+        snapshot.upstream_capability.starts_connected(),
+    );
     log_info!(
         "Upstream socket mode: {} ({})",
         if snapshot.upstream_connected {
@@ -185,22 +142,50 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
     log_info!("Re-resolve every: {}s (0=disabled)", cfg.reresolve_secs);
 }
 
+fn socket_mode_reason(
+    debug_unconnected_requested: bool,
+    connected: bool,
+    policy_allows_connected: bool,
+) -> &'static str {
+    if debug_unconnected_requested && !connected {
+        "debug"
+    } else if !connected || (debug_unconnected_requested && policy_allows_connected) {
+        "policy"
+    } else {
+        "default"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::socket_mode_reason;
+
+    #[test]
+    fn socket_mode_reason_reports_debug_only_when_debug_causes_unconnected_mode() {
+        assert_eq!(socket_mode_reason(true, false, false), "debug");
+        assert_eq!(socket_mode_reason(true, true, true), "policy");
+        assert_eq!(socket_mode_reason(false, false, false), "policy");
+        assert_eq!(socket_mode_reason(false, true, true), "default");
+    }
+}
+
 fn main() -> io::Result<()> {
     let t_start = Instant::now();
     let mut requested_cfg = parse_args();
     let worker_count = requested_cfg.workers.max(1);
 
     // Listener for the local client (this may require root for low ports)
-    let (client_sock, actual_listen, listen_sock_type, listen_capability) = make_socket(
-        requested_cfg.listen_request.addr,
-        requested_cfg.listen_proto,
-        1000,
-        worker_count != 1,
-        requested_cfg.on_timeout,
-        requested_cfg.debug_behavior.client_unconnected,
-    )?;
+    let (client_sock, actual_listen, listen_local_kernel, listen_sock_type, listen_capability) =
+        make_socket(
+            requested_cfg.listen_request.addr,
+            requested_cfg.listen_proto,
+            1000,
+            worker_count != 1,
+            requested_cfg.on_timeout,
+            requested_cfg.debug_behavior.client_unconnected,
+        )?;
 
-    if !listen_capability.can_reconnect_in_place {
+    if !listen_capability.connects_after_lock() {
         requested_cfg.debug_behavior.client_unconnected = true;
     }
 
@@ -212,6 +197,7 @@ fn main() -> io::Result<()> {
     sock_mgrs.push(Arc::new(SocketManager::new(
         client_sock,
         cfg.listen,
+        listen_local_kernel,
         listen_sock_type,
         cfg.listen_str.clone(),
         cfg.listen_proto,
@@ -227,21 +213,23 @@ fn main() -> io::Result<()> {
     )?));
 
     for _ in 1..worker_count {
-        let (extra_sock, _, extra_sock_type, _) = make_socket(
-            cfg.listen.addr,
-            cfg.listen_proto,
-            1000,
-            true,
-            cfg.on_timeout,
-            cfg.debug_behavior.client_unconnected,
-        )?;
+        let (extra_sock, _, extra_listen_kernel, extra_sock_type, extra_listen_capability) =
+            make_socket(
+                cfg.listen.addr,
+                cfg.listen_proto,
+                1000,
+                true,
+                cfg.on_timeout,
+                cfg.debug_behavior.client_unconnected,
+            )?;
         sock_mgrs.push(Arc::new(SocketManager::new(
             extra_sock,
             cfg.listen,
+            extra_listen_kernel,
             extra_sock_type,
             cfg.listen_str.clone(),
             cfg.listen_proto,
-            listen_capability,
+            extra_listen_capability,
             cfg.debug_behavior.client_unconnected,
             cfg.upstream,
             cfg.upstream_str.clone(),

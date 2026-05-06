@@ -4,6 +4,8 @@ mod app_bin;
 mod core;
 #[path = "common/orchestrator.rs"]
 mod orchestrator;
+#[path = "common/socket_matrix.rs"]
+mod socket_matrix;
 #[path = "common/worker_flow.rs"]
 mod worker_flow;
 use crate::core::wait_for_stats_json_from;
@@ -15,6 +17,7 @@ use crate::orchestrator::{
     run_matrix_cases, send_until_locked, spawn_upstream_echo_or_skip, wait_for_child_exit_success,
     wait_for_locked_client_from,
 };
+use crate::socket_matrix::assert_socket_matrix_state;
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
@@ -32,20 +35,6 @@ enum UnconnectedWrongPeerRole {
     UpstreamSide,
 }
 
-fn loopback_if_unspecified(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V4(addr) if addr.ip().is_unspecified() => SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            addr.port(),
-        ),
-        SocketAddr::V6(addr) if addr.ip().is_unspecified() => SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            addr.port(),
-        ),
-        _ => addr,
-    }
-}
-
 fn panic_with_session_context(context: &str, session: &crate::orchestrator::ForwarderSession) -> ! {
     let (stdout, stderr) = crate::orchestrator::snapshot_forwarder_output_tail(session, 20)
         .unwrap_or_else(|_| (String::new(), String::new()));
@@ -59,6 +48,20 @@ fn panic_with_session_context(context: &str, session: &crate::orchestrator::Forw
         details.push_str(&stderr);
     }
     panic!("{context}{details}");
+}
+
+fn routable_loopback_for_wildcard_bind(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(addr) if addr.ip().is_unspecified() => SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        ),
+        SocketAddr::V6(addr) if addr.ip().is_unspecified() => SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            addr.port(),
+        ),
+        _ => addr,
+    }
 }
 
 fn describe_unconnected_wrong_peer_case(
@@ -185,6 +188,13 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         "expected at least one oversize drop, got {}",
         stats["c2u_drops_oversize"]
     );
+    assert!(
+        stats["locked"].as_bool().expect("missing locked field"),
+        "max-payload case should remain locked after successful in-range payload"
+    );
+    let worker = worker_flow::locked_worker_flow(&stats);
+    let case_desc = format!("{case:?} max_payload={max_payload}");
+    assert_socket_matrix_state(worker, case, "exit", &case_desc);
 }
 
 #[test]
@@ -261,27 +271,8 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
     assert!(stats["locked"].as_bool().expect("missing locked field"));
     let worker = worker_flow::locked_worker_flow(&stats);
 
-    // Verify socket connected status matches matrix case.
-    // Note: ICMP RAW listeners are always unconnected on timeout drop. UDP depends on debug flag.
-    assert_eq!(
-        worker["client_connected"]
-            .as_bool()
-            .expect("missing client_connected"),
-        !case.debug_client_unconnected,
-        "client_connected mismatch for {:?}",
-        case
-    );
-
-    // ICMP RAW upstream might force unconnected on Windows if debug_unconnected is true.
-    // DGRAM upstream respects debug_unconnected.
-    assert_eq!(
-        worker["upstream_connected"]
-            .as_bool()
-            .expect("missing upstream_connected"),
-        !case.debug_upstream_unconnected,
-        "upstream_connected mismatch for {:?}",
-        case
-    );
+    let case_desc = format!("{case:?}");
+    assert_socket_matrix_state(worker, case, "exit", &case_desc);
 
     assert_eq!(
         stats["c2u_pkts"].as_u64().expect("missing c2u_pkts"),
@@ -680,9 +671,9 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
                 },
             );
             let worker = worker_flow::locked_worker_flow(&stats);
-            let upstream_local = loopback_if_unspecified(
-                json_addr(&worker["upstream_local_canonical"])
-                    .expect("parse stats upstream_local_canonical"),
+            let upstream_local = routable_loopback_for_wildcard_bind(
+                json_addr(&worker["upstream_local_kernel_canonical"])
+                    .expect("parse stats upstream_local_kernel_canonical"),
             );
             client_secondary
                 .send_to(WRONG_UPSTREAM_PEER_PAYLOAD, upstream_local)
@@ -743,20 +734,7 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
     );
 
     let worker = worker_flow::locked_worker_flow(&stats);
-    assert_eq!(
-        worker["client_connected"]
-            .as_bool()
-            .expect("missing client_connected"),
-        !case.debug_client_unconnected,
-        "{case_desc}: client_connected mismatch"
-    );
-    assert_eq!(
-        worker["upstream_connected"]
-            .as_bool()
-            .expect("missing upstream_connected"),
-        !case.debug_upstream_unconnected,
-        "{case_desc}: upstream_connected mismatch"
-    );
+    assert_socket_matrix_state(worker, case, "exit", &case_desc);
 }
 
 fn recv_legitimate_echo_with_retry(

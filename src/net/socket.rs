@@ -28,7 +28,13 @@ pub(crate) fn make_socket(
     reuseport: bool,
     timeout_act: TimeoutAction,
     debug_unconnected: bool,
-) -> io::Result<(Socket, CanonicalAddr, Type, SocketReuseCapability)> {
+) -> io::Result<(
+    Socket,
+    CanonicalAddr,
+    CanonicalAddr,
+    Type,
+    SocketReuseCapability,
+)> {
     // Raw ICMP: use well-known protocol numbers (see IANA)
     // IPv4 ICMP = 1, IPv6 ICMP = 58; same on Unix and Windows.
     let (domain, icmp_proto) = match bind_addr {
@@ -67,7 +73,7 @@ pub(crate) fn make_socket(
         timeout_act,
         debug_unconnected,
     );
-    let should_bind_wildcard = capability.should_bind_wildcard;
+    let should_bind_wildcard = capability.binds_wildcard();
 
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
@@ -91,15 +97,17 @@ pub(crate) fn make_socket(
     });
     sock.bind(&bind_sa)?;
 
-    let actual_local = if bind_addr.port() == 0 {
+    let kernel_local =
         CanonicalAddr::from_socket_addr(sock.local_addr()?.as_socket().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
-        })?)
+        })?);
+    let logical_local = if bind_addr.port() == 0 {
+        CanonicalAddr::new(bind_addr, kernel_local.id)
     } else {
         CanonicalAddr::from_socket_addr(bind_addr)
     };
 
-    Ok((sock, actual_local, sock_type, capability))
+    Ok((sock, logical_local, kernel_local, sock_type, capability))
 }
 
 fn make_icmp_socket(
@@ -187,6 +195,7 @@ pub(crate) fn make_upstream_socket_for(
     Socket,
     CanonicalAddr,
     CanonicalAddr,
+    CanonicalAddr,
     Type,
     SocketReuseCapability,
 )> {
@@ -240,8 +249,8 @@ pub(crate) fn make_upstream_socket_for(
         timeout_act,
         debug_unconnected,
     );
-    let should_connect = capability.should_start_connected;
-    let should_bind_wildcard = capability.should_bind_wildcard;
+    let should_connect = capability.starts_connected();
+    let should_bind_wildcard = capability.binds_wildcard();
 
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
@@ -300,8 +309,9 @@ pub(crate) fn make_upstream_socket_for(
     };
 
     let local = CanonicalAddr::new(actual_local_sa, assigned_local_id);
+    let local_kernel = CanonicalAddr::from_socket_addr(actual_local_sa);
     final_dest.id = assigned_remote_id;
-    Ok((sock, local, final_dest, sock_type, capability))
+    Ok((sock, local, final_dest, local_kernel, sock_type, capability))
 }
 
 #[inline]
@@ -445,7 +455,7 @@ mod tests {
             SupportedProtocol::ICMP,
         );
 
-        let (sock, local, remote, sock_type, connected_policy) =
+        let (sock, local, remote, _local_kernel, sock_type, connected_policy) =
             make_upstream_socket_for(dest, proto, 0, false, Drop, false, false)
                 .expect("make_upstream_socket_for failed");
 
@@ -471,15 +481,35 @@ mod tests {
     fn connected_udp_upstream_local_identity_is_concrete_immediately() {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
-        let (_sock, local, _remote, sock_type, connected) =
+        let (_sock, local, _remote, _local_kernel, sock_type, connected) =
             make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, false, false)
                 .expect("connected udp upstream socket");
         assert_eq!(sock_type, Type::DGRAM);
-        assert!(connected.should_start_connected);
+        assert!(connected.starts_connected());
         assert!(
             !local.addr.ip().is_unspecified(),
             "Connected UDP upstream local identity should be concrete immediately"
         );
+    }
+
+    #[test]
+    fn udp_listener_reports_logical_and_kernel_identity() {
+        let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let (_sock, logical, kernel, sock_type, capability) = make_socket(
+            listen_addr,
+            SupportedProtocol::UDP,
+            1000,
+            false,
+            Drop,
+            false,
+        )
+        .expect("udp listener socket");
+
+        assert_eq!(sock_type, Type::DGRAM);
+        assert!(!capability.binds_wildcard());
+        assert_eq!(logical, kernel);
+        assert!(!logical.addr.ip().is_unspecified());
+        assert_ne!(logical.id, 0);
     }
 
     #[test]
@@ -502,7 +532,7 @@ mod tests {
                 )),
             };
 
-            let (_sock, _local, _remote, sock_type, connected_policy) =
+            let (_sock, _local, _remote, _local_kernel, sock_type, connected_policy) =
                 make_upstream_socket_for(dest, proto, 0, false, Drop, false, false)
                     .expect("upstream socket");
             let policy =
@@ -519,10 +549,10 @@ mod tests {
     fn debug_unconnected_forces_otherwise_connected_upstream_unconnected() {
         let dest =
             CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
-        let (_sock, _local, _remote, _sock_type, connected) =
+        let (_sock, _local, _remote, _local_kernel, _sock_type, connected) =
             make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, true, false)
                 .expect("debug unconnected upstream socket");
-        assert!(!connected.should_start_connected);
+        assert!(!connected.starts_connected());
     }
 
     #[test]
