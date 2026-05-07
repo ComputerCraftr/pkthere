@@ -52,8 +52,11 @@ pub(crate) fn send_user_payload_event(
     {
         remember_request_seq(sync_state, sync_cache, icmp);
     }
-    let source_id_for_shim =
-        source_id_shim_for_c2u(event, sync_cache.latest_valid, handles.upstream_local_filter.id);
+    let source_id_for_shim = source_id_shim_for_c2u(
+        event,
+        sync_cache.latest_valid,
+        handles.upstream_local_filter.id,
+    );
     let outbound = outbound_payload_event(
         event,
         cache.route.icmp_header_id,
@@ -130,8 +133,11 @@ pub(crate) fn send_sync_payload_or_cadence(
         synthetic_event
     };
 
-    let source_id_for_shim =
-        source_id_shim_for_c2u(&event, sync_cache.latest_valid, handles.upstream_local_filter.id);
+    let source_id_for_shim = source_id_shim_for_c2u(
+        &event,
+        sync_cache.latest_valid,
+        handles.upstream_local_filter.id,
+    );
     let outbound = outbound_payload_event(
         &event,
         cache.route.icmp_header_id,

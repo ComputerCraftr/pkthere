@@ -44,7 +44,6 @@ impl ClientFlowKey {
             Self::IcmpV4 { ident, .. } | Self::IcmpV6 { ident, .. } => Some(ident),
         }
     }
-
 }
 
 impl fmt::Display for ClientFlowKey {

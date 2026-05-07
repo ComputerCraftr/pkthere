@@ -130,7 +130,7 @@ pub(crate) struct SocketManager {
     listen_proto: SupportedProtocol,         // never changes
     listen_debug_unconnected: bool,
     upstream_state: Mutex<UpstreamState>, // cold-path updates only
-    upstream_target: String,        // unresolved --there host:port
+    upstream_target: String,              // unresolved --there host:port
     upstream_local_id: u16,
     upstream_proto: SupportedProtocol, // never changes
     upstream_debug_unconnected: bool,

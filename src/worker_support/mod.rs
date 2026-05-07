@@ -11,8 +11,8 @@ pub(crate) use dispatch::{
 };
 pub(crate) use pacing::GlobalSyncPacer;
 pub(crate) use packet_admission::{
-    PacketAdmission, PacketAdmissionSpec, RejectionReason, SocketPeerRole, admit_packet,
-    log_rejected_packet,
+    PacketAdmission, RejectionReason, SocketPeerRole, admit_packet, client_admission_spec,
+    log_rejected_packet, upstream_admission_spec,
 };
 pub(crate) use socket_io::{recv_packet, wait_socket_until_readable};
 pub(crate) use sync_buffer::{

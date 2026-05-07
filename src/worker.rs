@@ -15,9 +15,10 @@ use crate::recv_buf::RecvBuf;
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
     BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, PacketAdmission,
-    PacketAdmissionSpec, RejectionReason, SocketPeerRole, admit_packet, buffer_sync_event,
+    RejectionReason, SocketPeerRole, admit_packet, buffer_sync_event, client_admission_spec,
     handle_c2u_session_control, log_rejected_packet, recv_packet, refresh_lock_and_sync_state,
-    send_sync_payload_or_cadence, send_user_payload_event, wait_socket_until_readable,
+    send_sync_payload_or_cadence, send_user_payload_event, upstream_admission_spec,
+    wait_socket_until_readable,
 };
 use std::io;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
 pub(crate) fn run_reresolve_thread(
     sock_mgrs: &[Arc<SocketManager>],
     reresolve_secs: u64,
@@ -148,13 +150,7 @@ pub(crate) fn run_upstream_to_client_thread(
             sync_state,
             &mut sync_cache,
         );
-        let upstream_admission = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: cfg.upstream_proto,
-            sock_type: handles.upstream_sock_type,
-            expected_remote: Some(handles.upstream_remote_filter),
-            expected_local_icmp_id: Some(handles.upstream_local_filter.id),
-        };
+        let upstream_admission = upstream_admission_spec(cfg, &handles);
         match recv_packet(
             &handles.upstream_sock,
             handles.upstream_connected,
@@ -376,17 +372,16 @@ pub(crate) fn run_client_to_upstream_thread(
                         continue;
                     }
                 };
-                let client_admission = PacketAdmissionSpec {
-                    role: SocketPeerRole::Client,
-                    proto: cfg.listen_proto,
-                    sock_type: handles.listen_sock_type,
-                    expected_remote: if locked_now {
+                let client_admission = client_admission_spec(
+                    cfg,
+                    &handles,
+                    if locked_now {
                         handles.client_remote
                     } else {
                         None
                     },
-                    expected_local_icmp_id: cache.recv_icmp_local_id,
-                };
+                    cache.recv_icmp_local_id,
+                );
 
                 match recv_packet(
                     &handles.client_sock,
@@ -476,13 +471,8 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            let client_admission = PacketAdmissionSpec {
-                role: SocketPeerRole::Client,
-                proto: cfg.listen_proto,
-                sock_type: handles.listen_sock_type,
-                expected_remote: None,
-                expected_local_icmp_id: cache.recv_icmp_local_id,
-            };
+            let client_admission =
+                client_admission_spec(cfg, &handles, None, cache.recv_icmp_local_id);
             match recv_packet(
                 &handles.client_sock,
                 handles.listener_connected,
@@ -646,13 +636,12 @@ pub(crate) fn run_client_to_upstream_thread(
                 if !readable {
                     continue;
                 }
-                let client_admission = PacketAdmissionSpec {
-                    role: SocketPeerRole::Client,
-                    proto: cfg.listen_proto,
-                    sock_type: handles.listen_sock_type,
-                    expected_remote: handles.client_remote,
-                    expected_local_icmp_id: cache.recv_icmp_local_id,
-                };
+                let client_admission = client_admission_spec(
+                    cfg,
+                    &handles,
+                    handles.client_remote,
+                    cache.recv_icmp_local_id,
+                );
                 match recv_packet(
                     &handles.client_sock,
                     handles.listener_connected,
@@ -749,17 +738,16 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            let client_admission = PacketAdmissionSpec {
-                role: SocketPeerRole::Client,
-                proto: cfg.listen_proto,
-                sock_type: handles.listen_sock_type,
-                expected_remote: if flow_state.is_locked() {
+            let client_admission = client_admission_spec(
+                cfg,
+                &handles,
+                if flow_state.is_locked() {
                     handles.client_remote
                 } else {
                     None
                 },
-                expected_local_icmp_id: cache.recv_icmp_local_id,
-            };
+                cache.recv_icmp_local_id,
+            );
             match recv_packet(
                 &handles.client_sock,
                 handles.listener_connected,
