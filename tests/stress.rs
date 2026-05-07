@@ -1,3 +1,5 @@
+#![allow(clippy::duplicate_mod, clippy::expect_fun_call)]
+
 #[path = "common/app_bin.rs"]
 mod app_bin;
 #[path = "common/core.rs"]

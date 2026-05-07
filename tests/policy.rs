@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_str_replace,
+    clippy::duplicate_mod,
+    clippy::manual_contains
+)]
+
 #[path = "common/policy.rs"]
 mod policy;
 

@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 pub fn strip_log_prefix(line: &str) -> &str {
     let trimmed = line.trim_start();
-    if let Some(rest) = trimmed.strip_prefix('[') {
-        if let Some(idx) = rest.find("] ") {
-            return &rest[idx + 2..];
-        }
+    if let Some(rest) = trimmed.strip_prefix('[')
+        && let Some(idx) = rest.find("] ")
+    {
+        return &rest[idx + 2..];
     }
     trimmed
 }

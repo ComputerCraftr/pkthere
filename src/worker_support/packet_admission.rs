@@ -208,13 +208,13 @@ fn admit_udp_packet(
     let Some(canonical) = CanonicalAddr::from_sock_addr(source_sa) else {
         return PacketAdmission::UnsupportedSource;
     };
-    if let Some(udp) = parsed.udp {
-        if udp.src_port != canonical.addr.port() {
-            return PacketAdmission::Filtered(RejectedPacket {
-                normalized_source: Some(canonical),
-                reason: RejectionReason::UnexpectedRemotePeer,
-            });
-        }
+    if let Some(udp) = parsed.udp
+        && udp.src_port != canonical.addr.port()
+    {
+        return PacketAdmission::Filtered(RejectedPacket {
+            normalized_source: Some(canonical),
+            reason: RejectionReason::UnexpectedRemotePeer,
+        });
     }
     if parsed_transport_has_ip(parsed)
         && parsed.src_ip.is_some_and(|src| src != canonical.addr.ip())
@@ -252,7 +252,7 @@ fn admit_icmp_packet(
 ) -> PacketAdmission {
     let Some(icmp) = parsed.icmp else {
         return PacketAdmission::Filtered(RejectedPacket {
-            normalized_source: socket_source.and_then(|s| CanonicalAddr::from_sock_addr(s)),
+            normalized_source: socket_source.and_then(CanonicalAddr::from_sock_addr),
             reason: RejectionReason::MalformedIcmpHeader,
         });
     };

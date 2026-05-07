@@ -68,12 +68,12 @@ pub(crate) fn parse_icmp_tunnel_frame(payload: &[u8]) -> io::Result<IcmpTunnelFr
     }
 }
 
-pub(crate) fn encode_icmp_tunnel_prefix<'a>(
+pub(crate) fn encode_icmp_tunnel_prefix(
     kind: IcmpTunnelFrameKind,
     source_id: Option<u16>,
     payload_len: usize,
-    scratch: &'a mut [u8; ICMP_TUNNEL_SHIM_MAX_LEN],
-) -> io::Result<&'a [u8]> {
+    scratch: &mut [u8; ICMP_TUNNEL_SHIM_MAX_LEN],
+) -> io::Result<&[u8]> {
     match kind {
         IcmpTunnelFrameKind::Cadence => {
             if source_id.is_some() || payload_len != 0 {

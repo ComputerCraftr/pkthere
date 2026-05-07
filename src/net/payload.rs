@@ -238,13 +238,11 @@ pub(crate) fn validate_payload<'a>(
             }
             PayloadEvent::UserPayload { data, icmp } => {
                 let shim_src_ident = icmp.and_then(|icmp| icmp.shim_src_ident);
-                if shim_src_ident.is_some() {
-                    if c2u && !icmp_info.is_req {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "ICMP tunnel handshake attempted on Echo Reply",
-                        ));
-                    }
+                if shim_src_ident.is_some() && c2u && !icmp_info.is_req {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "ICMP tunnel handshake attempted on Echo Reply",
+                    ));
                 }
 
                 let effective_src_ident = if c2u && !is_locked {

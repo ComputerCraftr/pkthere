@@ -97,10 +97,11 @@ pub(crate) fn make_socket(
     });
     sock.bind(&bind_sa)?;
 
-    let kernel_local =
-        CanonicalAddr::from_socket_addr(sock.local_addr()?.as_socket().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
-        })?);
+    let kernel_local = CanonicalAddr::from_socket_addr(
+        sock.local_addr()?
+            .as_socket()
+            .ok_or_else(|| io::Error::other("No socket resolved from getsockname"))?,
+    );
     let logical_local = if bind_addr.port() == 0 {
         CanonicalAddr::new(bind_addr, kernel_local.id)
     } else {
@@ -175,10 +176,7 @@ fn learn_concrete_local_addr_via_cadence_probe(
     let dest_sa = dest.as_sock_addr();
     sock.send_to(&packet, &dest_sa)?;
     sock.local_addr()?.as_socket().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "No socket resolved from getsockname after RAW ICMP cadence probe",
-        )
+        io::Error::other("No socket resolved from getsockname after RAW ICMP cadence probe")
     })
 }
 
@@ -264,7 +262,7 @@ pub(crate) fn make_upstream_socket_for(
     if should_connect {
         // Connect
         let dest_sa = final_dest.as_sock_addr();
-        sock.connect(&dest_sa.into())?;
+        sock.connect(&dest_sa)?;
     } else if should_bind_wildcard {
         // Bind to get a local address/port assigned for unconnected paths.
         let any_addr = match domain {
@@ -284,9 +282,9 @@ pub(crate) fn make_upstream_socket_for(
         }
         learned
     } else {
-        sock.local_addr()?.as_socket().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "No socket resolved from getsockname")
-        })?
+        sock.local_addr()?
+            .as_socket()
+            .ok_or_else(|| io::Error::other("No socket resolved from getsockname"))?
     };
 
     // After connect, the kernel definitively assigns the local ICMP ID (on most platforms).
@@ -324,15 +322,15 @@ pub(crate) fn resolve_first(addr: &str) -> io::Result<SocketAddr> {
     // Fallback: resolve host:port or [IPv6]:port via DNS.
     let mut iter = addr.to_socket_addrs()?;
     iter.next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No address resolved"))
+        .ok_or_else(|| io::Error::other("No address resolved"))
 }
 
 #[inline]
 pub(crate) const fn family_changed(a: SocketAddr, b: SocketAddr) -> bool {
-    match (a, b) {
-        (SocketAddr::V4(_), SocketAddr::V4(_)) | (SocketAddr::V6(_), SocketAddr::V6(_)) => false,
-        _ => true,
-    }
+    !matches!(
+        (a, b),
+        (SocketAddr::V4(_), SocketAddr::V4(_)) | (SocketAddr::V6(_), SocketAddr::V6(_))
+    )
 }
 
 /// Disconnect a connected UDP socket so it returns to wildcard receive state.
@@ -367,9 +365,10 @@ pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EAFNOSUPPORT) {
             // macOS/*BSD man page: harmless when disconnecting UDP
-            return Ok(());
+            Ok(())
+        } else {
+            Err(err)
         }
-        return Err(err);
     }
 
     // --- Linux/Android: AF_UNSPEC is the standard way; no sa_len field. ---
@@ -392,9 +391,10 @@ pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
             std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
         );
         if rc == 0 {
-            return Ok(());
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        return Err(io::Error::last_os_error());
     }
 }
 
@@ -468,7 +468,7 @@ mod tests {
         );
         let policy = socket_reuse_capability(SocketRole::Upstream, proto, sock_type, Drop, false);
         assert_eq!(connected_policy, policy);
-        #[cfg(any(target_os = "macos"))]
+        #[cfg(target_os = "macos")]
         assert_eq!(sock.local_addr().unwrap().as_socket().unwrap().port(), 0);
         #[cfg(not(any(target_os = "macos")))]
         assert_eq!(

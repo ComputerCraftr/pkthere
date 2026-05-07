@@ -91,15 +91,7 @@ fn listener_reuse_capability(
     timeout_act: TimeoutAction,
     debug_unconnected: bool,
 ) -> SocketReuseCapability {
-    if debug_unconnected {
-        SocketReuseCapability {
-            bind_mode: wildcard_listener_bind_mode(proto, sock_type),
-            startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::StayUnconnected,
-            reresolve_mode: SocketReresolveMode::ReplaceSocket,
-            timeout_clear_mode: TimeoutClearMode::NoConnectedState,
-        }
-    } else if proto == SupportedProtocol::ICMP || sock_type == Type::RAW {
+    if debug_unconnected || proto == SupportedProtocol::ICMP || sock_type == Type::RAW {
         SocketReuseCapability {
             bind_mode: wildcard_listener_bind_mode(proto, sock_type),
             startup_peer_mode: StartupPeerMode::Unconnected,

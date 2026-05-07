@@ -220,11 +220,11 @@ fn spawn_udp_echo_server_impl(
         let mut connected = false;
         loop {
             if !connected {
-                if let Ok((n, src)) = sock.recv_from(&mut buf) {
-                    if sock.connect(src).is_ok() {
-                        connected = true;
-                        let _ = sock.send(&buf[..n]);
-                    }
+                if let Ok((n, src)) = sock.recv_from(&mut buf)
+                    && sock.connect(src).is_ok()
+                {
+                    connected = true;
+                    let _ = sock.send(&buf[..n]);
                 }
             } else if let Ok(n) = sock.recv(&mut buf) {
                 let _ = sock.send(&buf[..n]);

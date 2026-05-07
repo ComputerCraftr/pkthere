@@ -1,3 +1,5 @@
+#![allow(clippy::duplicate_mod)]
+
 #[path = "../../src/net/byte_order.rs"]
 mod byte_order;
 
@@ -93,8 +95,14 @@ pub(crate) const fn parse_packet_headers(payload: &[u8]) -> ParsedPacketHeaders 
     let udp_src = read_be16(payload, udp_off, udp_ok);
     let udp_dst = read_be16(payload, udp_off + 2, udp_ok);
 
-    let src_ip_bounds = (12 * valid_v4 | 8 * valid_v6, 16 * valid_v4 | 24 * valid_v6);
-    let dst_ip_bounds = (16 * valid_v4 | 24 * valid_v6, 20 * valid_v4 | 40 * valid_v6);
+    let src_ip_bounds = (
+        (12 * valid_v4) | (8 * valid_v6),
+        (16 * valid_v4) | (24 * valid_v6),
+    );
+    let dst_ip_bounds = (
+        (16 * valid_v4) | (24 * valid_v6),
+        (20 * valid_v4) | (40 * valid_v6),
+    );
     let src_ip = parse_ip(payload, valid_v4, valid_v6, src_ip_bounds);
     let dst_ip = parse_ip(payload, valid_v4, valid_v6, dst_ip_bounds);
 
@@ -109,7 +117,7 @@ pub(crate) const fn parse_packet_headers(payload: &[u8]) -> ParsedPacketHeaders 
         | (is_v6 & ((valid_v6 == 0) as usize))
         | (maybe_headerless & icmp_type_ok);
     let malformed = ((known_transport == 0) as usize) & malformed_candidate;
-    let transport_code = ((icmp_ok & headerless_icmp) * 1)
+    let transport_code = (icmp_ok & headerless_icmp)
         | ((icmp_ok & v4_icmp) * 2)
         | ((icmp_ok & v6_icmp) * 3)
         | ((udp_ok & v4_udp) * 4)

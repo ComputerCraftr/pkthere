@@ -22,18 +22,16 @@ fn profile_candidates_from_current_exe(
 ) -> impl Iterator<Item = PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Some(deps_dir) = current_exe.parent() {
-        if deps_dir.file_name() == Some(std::ffi::OsStr::new("deps")) {
-            if let Some(profile_dir) = deps_dir.parent() {
-                candidates.push(profile_dir.join(exe_name));
-                if let Some(profile) = profile_dir.file_name().and_then(|n| n.to_str()) {
-                    if let Some(other) = alternate_profile(profile) {
-                        if let Some(target_dir) = profile_dir.parent() {
-                            candidates.push(target_dir.join(other).join(exe_name));
-                        }
-                    }
-                }
-            }
+    if let Some(deps_dir) = current_exe.parent()
+        && deps_dir.file_name() == Some(std::ffi::OsStr::new("deps"))
+        && let Some(profile_dir) = deps_dir.parent()
+    {
+        candidates.push(profile_dir.join(exe_name));
+        if let Some(profile) = profile_dir.file_name().and_then(|n| n.to_str())
+            && let Some(other) = alternate_profile(profile)
+            && let Some(target_dir) = profile_dir.parent()
+        {
+            candidates.push(target_dir.join(other).join(exe_name));
         }
     }
 

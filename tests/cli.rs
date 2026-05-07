@@ -1,3 +1,9 @@
+#![allow(
+    clippy::duplicate_mod,
+    clippy::expect_fun_call,
+    clippy::manual_contains
+)]
+
 #[path = "common/app_bin.rs"]
 mod app_bin;
 #[path = "common/cli.rs"]

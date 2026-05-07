@@ -171,14 +171,14 @@ fn csum_slice(data: &[u8]) -> u32 {
 /// order (big-endian), with end-around carry, and then bitwise complemented.
 ///
 /// Implementation notes:
-///   * We use `wide::u32x16` to process 64-byte chunks as 16 lanes of `u32` (4 bytes per lane).
-///     For a lane containing bytes `[b0,b1,b2,b3]` in memory, the RFC1071 contribution is:
-///       `(b0<<8)+b1 + (b2<<8)+b3`
-///   * On little-endian, the `u32` value is `v = b0 + (b1<<8) + (b2<<16) + (b3<<24)`.
-///     Swapping bytes within each 16-bit halfword yields `[b1,b0,b3,b2]`, so the low 16 bits
-///     become `(b0<<8)+b1` and the high 16 bits become `(b2<<8)+b3`. The per-lane contribution is:
-///       `(swapped & 0xFFFF) + (swapped >> 16)`
-///   * Big-endian hosts already match wire order, so we can split the 16-bit halves directly.
+/// * We use `wide::u32x16` to process 64-byte chunks as 16 lanes of `u32` (4 bytes per lane).
+///   For a lane containing bytes `[b0,b1,b2,b3]` in memory, the RFC1071 contribution is:
+///   `(b0<<8)+b1 + (b2<<8)+b3`
+/// * On little-endian, the `u32` value is `v = b0 + (b1<<8) + (b2<<16) + (b3<<24)`.
+///   Swapping bytes within each 16-bit halfword yields `[b1,b0,b3,b2]`, so the low 16 bits
+///   become `(b0<<8)+b1` and the high 16 bits become `(b2<<8)+b3`. The per-lane contribution is:
+///   `(swapped & 0xFFFF) + (swapped >> 16)`
+/// * Big-endian hosts already match wire order, so we can split the 16-bit halves directly.
 ///
 /// Uses a scalar fast path for small payloads and a wide SIMD path for medium/large payloads.
 /// All casting is size-preserving and safe.
@@ -192,7 +192,7 @@ pub(crate) fn checksum16(hdr: &[u8; 8], data: &[u8]) -> u16 {
 #[inline]
 pub(crate) fn checksum16_parts(hdr: &[u8; 8], prefix: &[u8], data: &[u8]) -> u16 {
     let mut data_sum = fold32_16(csum_slice(data));
-    if prefix.len() % 2 != 0 {
+    if !prefix.len().is_multiple_of(2) {
         data_sum = data_sum.swap_bytes();
     }
 

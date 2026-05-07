@@ -13,22 +13,18 @@ pub(crate) fn listener_requires_raw(proto: SupportedProtocol) -> bool {
 #[inline]
 pub(crate) fn upstream_requires_raw(proto: SupportedProtocol, requested_id: u16) -> bool {
     if proto != SupportedProtocol::ICMP {
-        return false;
+        false
     } else if requested_id == 0 {
         // Dynamic ID: only OSes that completely lack DGRAM ping sockets need RAW.
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-        return true;
-
-        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-        return false;
+        cfg!(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos"
+        )))
     } else {
         // Specific ID: macOS supports binding fixed IDs to DGRAM ping sockets.
-        #[cfg(target_os = "macos")]
-        return false;
-
-        // Linux/Android ignore requested bind IDs on DGRAM, while others lack DGRAM entirely.
-        #[cfg(not(target_os = "macos"))]
-        return true;
+        // Linux/Android ignore requested bind IDs on DGRAM; most others lack DGRAM entirely.
+        !cfg!(target_os = "macos")
     }
 }
 

@@ -10,10 +10,8 @@ pub fn apply_root_user_args(_cmd: &mut Command) {
     {
         let mut will_run_as_root = unistd::geteuid().is_root();
 
-        if !will_run_as_root {
-            if let Ok(meta) = std::fs::metadata(_cmd.get_program()) {
-                will_run_as_root = meta.uid() == 0 && (meta.mode() & 0o4000) != 0;
-            }
+        if !will_run_as_root && let Ok(meta) = std::fs::metadata(_cmd.get_program()) {
+            will_run_as_root = meta.uid() == 0 && (meta.mode() & 0o4000) != 0;
         }
 
         if will_run_as_root {

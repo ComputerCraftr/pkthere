@@ -1,3 +1,5 @@
+#![allow(clippy::duplicate_mod, clippy::expect_fun_call)]
+
 #[path = "common/app_bin.rs"]
 mod app_bin;
 #[path = "common/core.rs"]
@@ -131,9 +133,8 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
     let ok = vec![255u8; max_payload];
     client_sock.send(&ok).expect("send max payload");
     let mut buf = vec![0u8; recv_buf_len];
-    client_sock
-        .recv(&mut buf)
-        .expect(&format!("recv from {} forwarder (max payload)", case.proto));
+    let case_desc = format!("{case:?} max_payload={max_payload}");
+    recv_legitimate_echo_with_retry(&client_sock, &ok, &mut buf, &case_desc, "max payload echo");
 
     // Drain any delayed packets before testing the drop, especially for empty payloads
     client_sock
@@ -193,7 +194,6 @@ fn enforce_max_payload_case(case: MatrixCase<'_>, max_payload: usize, recv_buf_l
         "max-payload case should remain locked after successful in-range payload"
     );
     let worker = worker_flow::locked_worker_flow(&stats);
-    let case_desc = format!("{case:?} max_payload={max_payload}");
     assert_socket_matrix_state(worker, case, "exit", &case_desc);
 }
 
@@ -254,10 +254,14 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
             .send(payload)
             .expect(&format!("send to {} forwarder (single client)", case.proto));
         let mut buf = [0u8; 2048];
-        let n = client_sock.recv(&mut buf).expect(&format!(
-            "recv from {} forwarder (single client)",
-            case.proto
-        ));
+        let case_desc = format!("{case:?}");
+        let n = recv_legitimate_echo_with_retry(
+            &client_sock,
+            payload,
+            &mut buf,
+            &case_desc,
+            "single-client echo",
+        );
         assert_eq!(&buf[..n], payload, "echo payload mismatch");
     }
 
@@ -628,9 +632,8 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
         .send(payload_1)
         .unwrap_or_else(|e| panic!("{case_desc}: send payload 1: {e}"));
     let mut buf = [0u8; 2048];
-    let n = client_primary
-        .recv(&mut buf)
-        .unwrap_or_else(|e| panic!("{case_desc}: recv echo 1: {e}"));
+    let n =
+        recv_legitimate_echo_with_retry(&client_primary, payload_1, &mut buf, &case_desc, "echo 1");
     assert_eq!(
         &buf[..n],
         payload_1,
@@ -686,7 +689,7 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
     }
 
     client_primary
-        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .set_read_timeout(Some(DRAIN_WAIT_MS))
         .unwrap_or_else(|e| panic!("{case_desc}: set primary client timeout: {e}"));
     match client_primary.recv(&mut buf) {
         Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}

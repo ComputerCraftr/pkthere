@@ -1,3 +1,14 @@
+#![allow(
+    clippy::duplicate_mod,
+    clippy::items_after_test_module,
+    clippy::module_inception,
+    clippy::non_minimal_cfg,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::upper_case_acronyms,
+    clippy::wrong_self_convention
+)]
+
 #[macro_use]
 mod logging;
 mod cli;
@@ -77,13 +88,11 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
                 "ICMP listener mode: wildcard-learn (--here ICMP:host:0 learns the peer ICMP id on first lock)"
             );
         }
-    } else {
-        if cfg.listen_proto == SupportedProtocol::ICMP {
-            log_info!(
-                "ICMP listener mode: fixed-id (effective local id {})",
-                cfg.listen.id
-            );
-        }
+    } else if cfg.listen_proto == SupportedProtocol::ICMP {
+        log_info!(
+            "ICMP listener mode: fixed-id (effective local id {})",
+            cfg.listen.id
+        );
     }
     if cfg.upstream_proto == SupportedProtocol::UDP {
         log_info!(
@@ -273,12 +282,7 @@ fn main() -> io::Result<()> {
             // Signal the main loop to exit with code 130
             exit_code_set_c.store(SIGINT_EXIT, AtomOrdering::Relaxed);
         })
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("ctrlc::set_handler failed: {e}"),
-            )
-        })?;
+        .map_err(|e| io::Error::other(format!("ctrlc::set_handler failed: {e}")))?;
     }
 
     print_startup(&cfg, &sock_mgrs[0]);
@@ -294,7 +298,7 @@ fn main() -> io::Result<()> {
         // Client -> Upstream
         {
             let cfg_a = Arc::clone(&cfg);
-            let sock_mgr_a = Arc::clone(&sock_mgr);
+            let sock_mgr_a = Arc::clone(sock_mgr);
             let sock_mgrs_a = sock_mgrs.clone();
             let worker_id = worker_base;
             let flow_state_a = Arc::clone(&flow_states[idx]);
@@ -323,7 +327,7 @@ fn main() -> io::Result<()> {
         // Upstream -> Client
         {
             let cfg_b = Arc::clone(&cfg);
-            let sock_mgr_b = Arc::clone(&sock_mgr);
+            let sock_mgr_b = Arc::clone(sock_mgr);
             let worker_id = worker_base + 1;
             let flow_state_b = Arc::clone(&flow_states[idx]);
             let stats_b = stats.shard(idx);
@@ -424,39 +428,20 @@ fn drop_privileges(cfg: &RuntimeConfig) -> io::Result<()> {
         return Ok(());
     }
 
-    let user_name = cfg.run_as_user.as_ref().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "must specify --user when running as root",
-        )
-    })?;
+    let user_name = cfg
+        .run_as_user
+        .as_ref()
+        .ok_or_else(|| io::Error::other("must specify --user when running as root"))?;
 
     let user = User::from_name(user_name)
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("user lookup failed for {user_name}: {e}"),
-            )
-        })?
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, format!("user {user_name} not found"))
-        })?;
+        .map_err(|e| io::Error::other(format!("user lookup failed for {user_name}: {e}")))?
+        .ok_or_else(|| io::Error::other(format!("user {user_name} not found")))?;
 
     // Determine primary group: explicit --group overrides user's primary group.
     let primary_gid = if let Some(group_name) = cfg.run_as_group.as_ref() {
         let grp = Group::from_name(group_name)
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("group lookup failed for {group_name}: {e}"),
-                )
-            })?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("group {group_name} not found"),
-                )
-            })?;
+            .map_err(|e| io::Error::other(format!("group lookup failed for {group_name}: {e}")))?
+            .ok_or_else(|| io::Error::other(format!("group {group_name} not found")))?;
         grp.gid
     } else {
         user.gid
@@ -475,10 +460,8 @@ fn drop_privileges(cfg: &RuntimeConfig) -> io::Result<()> {
     }
 
     // Order: primary gid -> uid
-    unistd::setgid(gid)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("setgid failed: {e}")))?;
-    unistd::setuid(uid)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("setuid failed: {e}")))?;
+    unistd::setgid(gid).map_err(|e| io::Error::other(format!("setgid failed: {e}")))?;
+    unistd::setuid(uid).map_err(|e| io::Error::other(format!("setuid failed: {e}")))?;
 
     log_info!(
         "Dropped privileges to user '{}' (uid={}, gid={})",
