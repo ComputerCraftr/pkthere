@@ -74,7 +74,6 @@ pub(crate) fn make_socket(
         debug_unconnected,
     );
     let should_bind_wildcard = capability.binds_wildcard();
-
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
     let _ = sock.set_send_buffer_size(1 << 20);
@@ -248,7 +247,6 @@ pub(crate) fn make_upstream_socket_for(
         debug_unconnected,
     );
     let should_connect = capability.starts_connected();
-    let should_bind_wildcard = capability.binds_wildcard();
 
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
@@ -263,8 +261,11 @@ pub(crate) fn make_upstream_socket_for(
         // Connect
         let dest_sa = final_dest.as_sock_addr();
         sock.connect(&dest_sa)?;
-    } else if should_bind_wildcard {
+    } else {
         // Bind to get a local address/port assigned for unconnected paths.
+        // Without this, send_to/recv_from sockets can retain port 0 until the
+        // first outbound send, which breaks stats identity, admission checks,
+        // and debug tests that inject traffic at the published local address.
         let any_addr = match domain {
             Domain::IPV6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), local_id),
             _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), local_id),
@@ -553,6 +554,24 @@ mod tests {
             make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, true, false)
                 .expect("debug unconnected upstream socket");
         assert!(!connected.starts_connected());
+    }
+
+    #[test]
+    fn debug_unconnected_upstream_binds_a_concrete_local_port() {
+        let probe =
+            match std::net::UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)) {
+                Ok(probe) => probe,
+                Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(err) => panic!("bind UDP probe socket: {err}"),
+            };
+        let dest =
+            CanonicalAddr::from_socket_addr(probe.local_addr().expect("probe UDP local addr"));
+        let (_sock, local, _remote, local_kernel, _sock_type, connected) =
+            make_upstream_socket_for(dest, SupportedProtocol::UDP, 0, false, Drop, true, false)
+                .expect("debug unconnected upstream socket");
+        assert!(!connected.starts_connected());
+        assert_ne!(local.addr.port(), 0);
+        assert_ne!(local_kernel.addr.port(), 0);
     }
 
     #[test]

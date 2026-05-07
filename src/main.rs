@@ -455,8 +455,7 @@ fn drop_privileges(cfg: &RuntimeConfig) -> io::Result<()> {
     {
         // This function is not available on Apple platforms.
         let empty: &[nix::unistd::Gid] = &[];
-        unistd::setgroups(empty)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("setgroups failed: {e}")))?;
+        unistd::setgroups(empty).map_err(|e| io::Error::other(format!("setgroups failed: {e}")))?;
     }
 
     // Order: primary gid -> uid

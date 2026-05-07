@@ -269,13 +269,15 @@ impl Stats {
                 let d_u2c_pkts = snap.u2c_pkts.saturating_sub(prev.u2c_pkts);
                 let d_c2u_lat = snap.c2u_lat_sum_ns.saturating_sub(prev.c2u_lat_sum_ns);
                 let d_u2c_lat = snap.u2c_lat_sum_ns.saturating_sub(prev.u2c_lat_sum_ns);
-                if d_c2u_pkts > 0 {
-                    c2u_ewma_ns =
-                        Self::ewma_compute(c2u_ewma_ns, d_c2u_lat / d_c2u_pkts, d_c2u_pkts);
+                if let Some(avg_c2u_ns) = d_c2u_lat.checked_div(d_c2u_pkts)
+                    && d_c2u_pkts > 0
+                {
+                    c2u_ewma_ns = Self::ewma_compute(c2u_ewma_ns, avg_c2u_ns, d_c2u_pkts);
                 }
-                if d_u2c_pkts > 0 {
-                    u2c_ewma_ns =
-                        Self::ewma_compute(u2c_ewma_ns, d_u2c_lat / d_u2c_pkts, d_u2c_pkts);
+                if let Some(avg_u2c_ns) = d_u2c_lat.checked_div(d_u2c_pkts)
+                    && d_u2c_pkts > 0
+                {
+                    u2c_ewma_ns = Self::ewma_compute(u2c_ewma_ns, avg_u2c_ns, d_u2c_pkts);
                 }
                 prev = snap;
 
