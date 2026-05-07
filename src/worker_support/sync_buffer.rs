@@ -249,6 +249,7 @@ mod tests {
         SocketHandles {
             locked_flow: None,
             client_remote: None,
+            listener_recv_icmp_local_id: None,
             listener_connected: false,
             client_sock: udp_socket_clone(),
             listen_sock_type: Type::DGRAM, // UDP sockets are always DGRAM

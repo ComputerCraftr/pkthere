@@ -820,6 +820,8 @@ pub(crate) fn run_client_to_upstream_thread(
                         reset_session(cfg, sync_state, &mut sync_cache);
                         flow_state.set_locked(true);
                         was_locked = true;
+                        let listener_recv_icmp_local_id =
+                            admitted.icmp_info.map(|icmp| icmp.ident);
                         let peer_addr = Some(src);
                         let src_sa = src.as_sock_addr();
                         handles.listener_connected = false;
@@ -835,9 +837,11 @@ pub(crate) fn run_client_to_upstream_thread(
                         handles.version = sock_mgr.set_listener_remote_connected(
                             Some(flow),
                             peer_addr,
+                            listener_recv_icmp_local_id,
                             handles.listener_connected,
                             handles.version,
                         );
+                        handles.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
                         log_debug_dir!(
                             cfg.debug_logs.handles,
                             worker_id,
@@ -853,6 +857,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                     let _ = mgr.set_client_sock_connected(
                                         Some(flow),
                                         peer_addr,
+                                        listener_recv_icmp_local_id,
                                         handles.listener_connected,
                                         &src_sa,
                                         0,

@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 pub(crate) struct SocketHandles {
     pub locked_flow: Option<ClientFlowKey>,
     pub client_remote: Option<CanonicalAddr>,
+    pub listener_recv_icmp_local_id: Option<u16>,
     pub listener_connected: bool,
     pub client_sock: Socket,
     pub listen_sock_type: Type,
@@ -51,6 +52,7 @@ struct ClientListenState {
     listen_local_kernel: CanonicalAddr,
     flow: Option<ClientFlowKey>,
     client_remote: Option<CanonicalAddr>,
+    listener_recv_icmp_local_id: Option<u16>,
     listener_connected: bool,
     sock: Socket,
     sock_type: Type,
@@ -179,6 +181,7 @@ impl SocketManager {
                 listen_local_kernel,
                 flow: None,
                 client_remote: None,
+                listener_recv_icmp_local_id: None,
                 listener_connected: listen_capability.starts_connected(),
                 sock: client_sock,
                 sock_type: listen_sock_type,
@@ -238,12 +241,14 @@ impl SocketManager {
         &self,
         flow: Option<ClientFlowKey>,
         client_remote: Option<CanonicalAddr>,
+        listener_recv_icmp_local_id: Option<u16>,
         listener_connected: bool,
         prev_ver: u64,
     ) -> u64 {
         let mut cl_guard = self.client_listen.lock().unwrap();
         cl_guard.flow = flow;
         cl_guard.client_remote = client_remote;
+        cl_guard.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
         cl_guard.listener_connected = listener_connected;
         self.publish_version(true);
         prev_ver + 1
@@ -255,6 +260,7 @@ impl SocketManager {
         &self,
         flow: Option<ClientFlowKey>,
         client_remote: Option<CanonicalAddr>,
+        listener_recv_icmp_local_id: Option<u16>,
         listener_connected: bool,
         client_sa: &SockAddr,
         prev_ver: u64,
@@ -262,6 +268,7 @@ impl SocketManager {
         let mut cl_guard = self.client_listen.lock().unwrap();
         cl_guard.flow = flow;
         cl_guard.client_remote = client_remote;
+        cl_guard.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
         cl_guard.listener_connected = listener_connected;
         self.publish_version(true);
         if listener_connected {
@@ -276,12 +283,14 @@ impl SocketManager {
         &self,
         flow: Option<ClientFlowKey>,
         client_remote: Option<CanonicalAddr>,
+        listener_recv_icmp_local_id: Option<u16>,
         listener_connected: bool,
         prev_ver: u64,
     ) -> io::Result<u64> {
         let mut cl_guard = self.client_listen.lock().unwrap();
         cl_guard.flow = flow;
         cl_guard.client_remote = client_remote;
+        cl_guard.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
         cl_guard.listener_connected = listener_connected;
         self.publish_version(true);
         if !listener_connected {
@@ -294,9 +303,9 @@ impl SocketManager {
     #[inline]
     pub fn clear_client_lock(&self, prev_ver: u64) -> io::Result<u64> {
         if self.get_listener_connected() {
-            self.set_client_sock_disconnected(None, None, false, prev_ver)
+            self.set_client_sock_disconnected(None, None, None, false, prev_ver)
         } else {
-            Ok(self.set_listener_remote_connected(None, None, false, prev_ver))
+            Ok(self.set_listener_remote_connected(None, None, None, false, prev_ver))
         }
     }
 
@@ -578,6 +587,7 @@ impl SocketManager {
             client_sock,
             client_flow,
             client_remote,
+            listener_recv_icmp_local_id,
             _listen_local_kernel,
             listen_sock_type,
             listener_connected,
@@ -589,6 +599,7 @@ impl SocketManager {
                 res.0,
                 res.1,
                 res.2,
+                None,
                 res.3,
                 res.4,
                 res.5.starts_connected(),
@@ -601,6 +612,7 @@ impl SocketManager {
                 cl.sock.try_clone()?,
                 cl.flow,
                 cl.client_remote,
+                cl.listener_recv_icmp_local_id,
                 cl.listen_local_kernel,
                 cl.sock_type,
                 cl.listener_connected,
@@ -650,6 +662,7 @@ impl SocketManager {
         Ok(SocketHandles {
             locked_flow: client_flow,
             client_remote,
+            listener_recv_icmp_local_id,
             listener_connected,
             client_sock,
             listen_sock_type,
@@ -674,6 +687,7 @@ impl SocketManager {
         SocketHandles {
             locked_flow: cl.flow,
             client_remote: cl.client_remote,
+            listener_recv_icmp_local_id: cl.listener_recv_icmp_local_id,
             listener_connected: cl.listener_connected,
             client_sock: cl.sock.try_clone().expect("clone client socket"),
             listen_sock_type: cl.sock_type,
@@ -747,6 +761,7 @@ mod tests {
                 mgr.set_listener_remote_connected(
                     Some(ClientFlowKey::Udp(addr_a)),
                     Some(CanonicalAddr::from_socket_addr(addr_a)),
+                    None,
                     true,
                     v0,
                 )
@@ -758,6 +773,7 @@ mod tests {
                 mgr.set_listener_remote_connected(
                     Some(ClientFlowKey::Udp(addr_b)),
                     Some(CanonicalAddr::from_socket_addr(addr_b)),
+                    None,
                     false,
                     v0,
                 )
@@ -783,12 +799,14 @@ mod tests {
         let _ = mgr.set_listener_remote_connected(
             Some(ClientFlowKey::Udp(addr)),
             Some(canonical),
+            None,
             true,
             v0,
         );
         let _ = mgr.set_listener_remote_connected(
             Some(ClientFlowKey::Udp(addr)),
             Some(canonical),
+            None,
             false,
             v0,
         );

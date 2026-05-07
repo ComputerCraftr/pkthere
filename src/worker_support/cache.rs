@@ -32,11 +32,7 @@ impl CachedClientState {
         } else {
             match cfg.listen_mode {
                 ListenMode::Fixed => Some(cfg.listen.id),
-                ListenMode::Dynamic => handles
-                    .locked_flow
-                    .and_then(|flow| flow.icmp_ident())
-                    .map(Some)
-                    .unwrap_or(None),
+                ListenMode::Dynamic => handles.listener_recv_icmp_local_id,
             }
         }
     }
@@ -213,6 +209,7 @@ mod tests {
         SocketHandles {
             locked_flow: None,
             client_remote: None,
+            listener_recv_icmp_local_id: None,
             listener_connected: false,
             client_sock: udp_socket_clone(),
             listen_sock_type: Type::DGRAM,
@@ -257,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_recv_icmp_local_id_tracks_locked_wildcard_flow_id() {
+    fn cached_recv_icmp_local_id_tracks_locked_listener_receive_id_not_flow_id() {
         let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg.listen_mode = ListenMode::Dynamic;
         let mut handles = test_handles();
@@ -265,10 +262,11 @@ mod tests {
             ip: Ipv4Addr::LOCALHOST,
             ident: 12345,
         });
+        handles.listener_recv_icmp_local_id = Some(77);
 
         assert_eq!(
             CachedClientState::resolve_client_recv_icmp_local_id(&cfg, &handles),
-            Some(12345)
+            Some(77)
         );
     }
 
