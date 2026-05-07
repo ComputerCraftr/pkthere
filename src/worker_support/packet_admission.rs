@@ -311,7 +311,6 @@ fn admit_icmp_packet(
         });
     }
 
-    let _ = spec.role;
     PacketAdmission::Accepted(AdmittedPacket {
         normalized_source: Some(canonical),
         payload_bounds: parsed.payload_bounds,

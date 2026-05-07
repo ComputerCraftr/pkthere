@@ -74,6 +74,7 @@ pub(crate) fn make_socket(
         debug_unconnected,
     );
     let should_bind_wildcard = capability.binds_wildcard();
+
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
     let _ = sock.set_send_buffer_size(1 << 20);

@@ -238,15 +238,21 @@ pub(crate) fn validate_payload<'a>(
             }
             PayloadEvent::UserPayload { data, icmp } => {
                 let shim_src_ident = icmp.and_then(|icmp| icmp.shim_src_ident);
-                if shim_src_ident.is_some() && c2u && !icmp_info.is_req {
+                if shim_src_ident.is_some() && c2u && is_locked {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "ICMP tunnel handshake attempted on Echo Reply",
+                        "ICMP tunnel source ID shim is only valid for initial C2U lock establishment",
+                    ));
+                }
+                if c2u && !is_locked && shim_src_ident.is_none() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "initial ICMP lock establishment requires source ID shim",
                     ));
                 }
 
                 let effective_src_ident = if c2u && !is_locked {
-                    shim_src_ident.unwrap_or(icmp_info.ident)
+                    shim_src_ident.expect("validated initial ICMP lock source ID shim")
                 } else {
                     icmp_info.ident
                 };

@@ -1,5 +1,6 @@
 use crate::cli::SupportedProtocol;
 use crate::net::params::CanonicalAddr;
+use crate::net::payload::PayloadEvent;
 use std::fmt;
 use std::net::SocketAddr;
 
@@ -19,20 +20,45 @@ pub(crate) enum ClientFlowKey {
 }
 
 impl ClientFlowKey {
-    pub fn from_wire(src: CanonicalAddr, listen_proto: SupportedProtocol) -> Self {
+    pub fn from_validated_client_payload(
+        c2u: bool,
+        src: CanonicalAddr,
+        listen_proto: SupportedProtocol,
+        event: &PayloadEvent<'_>,
+    ) -> Option<Self> {
+        if !c2u {
+            return None;
+        }
         match listen_proto {
-            SupportedProtocol::UDP => Self::Udp(src.addr),
-            SupportedProtocol::ICMP => match src.addr {
-                SocketAddr::V4(addr) => Self::IcmpV4 {
-                    ip: *addr.ip(),
-                    ident: src.id,
-                },
-                SocketAddr::V6(addr) => Self::IcmpV6 {
-                    ip: *addr.ip(),
-                    ident: src.id,
-                    flowinfo: addr.flowinfo(),
-                    scope_id: addr.scope_id(),
-                },
+            SupportedProtocol::UDP => Some(Self::Udp(src.addr)),
+            SupportedProtocol::ICMP => match event {
+                PayloadEvent::UserPayload {
+                    icmp: Some(icmp), ..
+                } => Some(Self::from_icmp_source(src, icmp.logical_src_ident)),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn from_validated_c2u(
+        src: CanonicalAddr,
+        listen_proto: SupportedProtocol,
+        event: &PayloadEvent<'_>,
+    ) -> Option<Self> {
+        Self::from_validated_client_payload(true, src, listen_proto, event)
+    }
+
+    fn from_icmp_source(src: CanonicalAddr, ident: u16) -> Self {
+        match src.addr {
+            SocketAddr::V4(addr) => Self::IcmpV4 {
+                ip: *addr.ip(),
+                ident,
+            },
+            SocketAddr::V6(addr) => Self::IcmpV6 {
+                ip: *addr.ip(),
+                ident,
+                flowinfo: addr.flowinfo(),
+                scope_id: addr.scope_id(),
             },
         }
     }
@@ -64,7 +90,10 @@ impl fmt::Display for ClientFlowKey {
 #[cfg(test)]
 mod tests {
     use super::ClientFlowKey;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+    use crate::cli::SupportedProtocol;
+    use crate::net::params::CanonicalAddr;
+    use crate::net::payload::PayloadEvent;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 
     #[test]
     fn udp_flow_key_uses_full_socket_addr() {
@@ -106,5 +135,65 @@ mod tests {
             scope_id: 3,
         };
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn validated_icmp_flow_key_uses_payload_logical_source_id() {
+        let src = CanonicalAddr::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0),
+            100,
+        );
+        let event = PayloadEvent::user_payload(200, 1, SupportedProtocol::UDP, b"x", Some(200));
+
+        assert_eq!(
+            ClientFlowKey::from_validated_client_payload(
+                true,
+                src,
+                SupportedProtocol::ICMP,
+                &event
+            ),
+            Some(ClientFlowKey::IcmpV4 {
+                ip: Ipv4Addr::new(127, 0, 0, 2),
+                ident: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn validated_flow_key_does_not_lock_from_non_user_icmp_events() {
+        let src = CanonicalAddr::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0),
+            100,
+        );
+        let event = PayloadEvent::cadence_packet(100, 1);
+
+        assert_eq!(
+            ClientFlowKey::from_validated_client_payload(
+                true,
+                src,
+                SupportedProtocol::ICMP,
+                &event
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn validated_flow_key_does_not_lock_from_u2c_reflections() {
+        let src = CanonicalAddr::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0),
+            100,
+        );
+        let event = PayloadEvent::user_payload(100, 1, SupportedProtocol::UDP, b"x", Some(200));
+
+        assert_eq!(
+            ClientFlowKey::from_validated_client_payload(
+                false,
+                src,
+                SupportedProtocol::ICMP,
+                &event
+            ),
+            None
+        );
     }
 }

@@ -1,6 +1,6 @@
 use crate::cli::{RuntimeConfig, TimeoutAction, WorkerFlowMode};
 use crate::flow_claim::FlowClaimTable;
-use crate::flow_key::ClientFlowKey;
+use crate::flow_key::ClientFlowKey as FlowKey;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::params::MAX_WIRE_PAYLOAD;
 use crate::net::payload::{
@@ -704,8 +704,8 @@ pub(crate) fn run_client_to_upstream_thread(
                                 continue;
                             }
                         };
-                        let flow_key = ClientFlowKey::from_wire(src, cfg.listen_proto);
-                        if Some(flow_key) == handles.locked_flow {
+                        let flow_key = FlowKey::from_validated_c2u(src, cfg.listen_proto, &event);
+                        if flow_key == handles.locked_flow {
                             match buffer_sync_event(
                                 worker_id,
                                 t_start,
@@ -805,7 +805,10 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let flow = ClientFlowKey::from_wire(src, cfg.listen_proto);
+                        let Some(flow) = FlowKey::from_validated_c2u(src, cfg.listen_proto, &event)
+                        else {
+                            continue;
+                        };
 
                         if cfg.worker_flow_mode == WorkerFlowMode::SingleFlow
                             && flow_claims.is_some_and(|flow_claims| {
@@ -925,8 +928,10 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let flow = ClientFlowKey::from_wire(src, cfg.listen_proto);
-                        if Some(flow) != handles.locked_flow {
+                        if let Some(flow) =
+                            FlowKey::from_validated_c2u(src, cfg.listen_proto, &event)
+                            && Some(flow) != handles.locked_flow
+                        {
                             continue;
                         }
                         match event {
