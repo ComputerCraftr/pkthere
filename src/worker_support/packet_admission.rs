@@ -1,11 +1,11 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::net::icmp_echo_parse::parse_icmp_echo_header;
+use crate::net::packet_headers::{ParsedPacketHeaders, ParsedTransport, parse_packet_headers};
 use crate::net::params::CanonicalAddr;
 use crate::net::payload::IcmpAdmissionInfo;
 use crate::net::sock_mgr::SocketHandles;
 use socket2::{SockAddr, Type};
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SocketPeerRole {
@@ -177,9 +177,10 @@ pub(crate) fn admit_packet(
     payload: &[u8],
     socket_source: Option<&SockAddr>,
 ) -> PacketAdmission {
+    let parsed = parse_packet_headers(payload);
     match spec.proto {
-        SupportedProtocol::UDP => admit_udp_packet(spec, payload, socket_source),
-        SupportedProtocol::ICMP => admit_icmp_packet(spec, payload, socket_source),
+        SupportedProtocol::UDP => admit_udp_packet(spec, payload, &parsed, socket_source),
+        SupportedProtocol::ICMP => admit_icmp_packet(spec, &parsed, socket_source),
     }
 }
 
@@ -187,6 +188,7 @@ pub(crate) fn admit_packet(
 fn admit_udp_packet(
     spec: PacketAdmissionSpec,
     payload: &[u8],
+    parsed: &ParsedPacketHeaders,
     socket_source: Option<&SockAddr>,
 ) -> PacketAdmission {
     let Some(source_sa) = socket_source else {
@@ -206,6 +208,22 @@ fn admit_udp_packet(
     let Some(canonical) = CanonicalAddr::from_sock_addr(source_sa) else {
         return PacketAdmission::UnsupportedSource;
     };
+    if let Some(udp) = parsed.udp {
+        if udp.src_port != canonical.addr.port() {
+            return PacketAdmission::Filtered(RejectedPacket {
+                normalized_source: Some(canonical),
+                reason: RejectionReason::UnexpectedRemotePeer,
+            });
+        }
+    }
+    if parsed_transport_has_ip(parsed)
+        && parsed.src_ip.is_some_and(|src| src != canonical.addr.ip())
+    {
+        return PacketAdmission::Filtered(RejectedPacket {
+            normalized_source: Some(canonical),
+            reason: RejectionReason::UnexpectedRemotePeer,
+        });
+    }
     if spec
         .expected_remote
         .is_some_and(|expected| canonical != expected)
@@ -217,7 +235,10 @@ fn admit_udp_packet(
     } else {
         PacketAdmission::Accepted(AdmittedPacket {
             normalized_source: Some(canonical),
-            payload_bounds: (0, payload.len()),
+            payload_bounds: parsed
+                .udp
+                .map(|_| parsed.payload_bounds)
+                .unwrap_or((0, payload.len())),
             icmp_info: None,
         })
     }
@@ -226,38 +247,34 @@ fn admit_udp_packet(
 #[inline]
 fn admit_icmp_packet(
     spec: PacketAdmissionSpec,
-    payload: &[u8],
+    parsed: &ParsedPacketHeaders,
     socket_source: Option<&SockAddr>,
 ) -> PacketAdmission {
-    let (icmp_ok, ident, seq, is_req, ip_ver, p_bounds, src_ip, _dst_ip) =
-        parse_icmp_echo_header(payload);
-    if !icmp_ok {
+    let Some(icmp) = parsed.icmp else {
         return PacketAdmission::Filtered(RejectedPacket {
             normalized_source: socket_source.and_then(|s| CanonicalAddr::from_sock_addr(s)),
             reason: RejectionReason::MalformedIcmpHeader,
         });
-    }
+    };
 
     if spec
         .expected_local_icmp_id
-        .is_some_and(|expected| ident != expected)
+        .is_some_and(|expected| icmp.ident != expected)
     {
         return PacketAdmission::Filtered(RejectedPacket {
             normalized_source: socket_source
-                .and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, ident)),
+                .and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, icmp.ident)),
             reason: RejectionReason::UnexpectedLocalReceiveId,
         });
     }
 
     let canonical = match spec.source_evidence {
-        SourceEvidenceMode::RawPacketSourceRequired => {
-            parse_raw_ip_source(payload, ip_ver, src_ip, socket_source, ident)
-        }
+        SourceEvidenceMode::RawPacketSourceRequired => parse_raw_ip_source(parsed, socket_source),
         SourceEvidenceMode::SocketSourceRequired => {
-            socket_source.and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, ident))
+            socket_source.and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, icmp.ident))
         }
         SourceEvidenceMode::ConnectedKernelFiltered => {
-            socket_source.and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, ident))
+            socket_source.and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, icmp.ident))
         }
     };
 
@@ -265,8 +282,12 @@ fn admit_icmp_packet(
         return if spec.source_evidence == SourceEvidenceMode::ConnectedKernelFiltered {
             PacketAdmission::Accepted(AdmittedPacket {
                 normalized_source: None,
-                payload_bounds: p_bounds,
-                icmp_info: Some(IcmpAdmissionInfo { ident, seq, is_req }),
+                payload_bounds: parsed.payload_bounds,
+                icmp_info: Some(IcmpAdmissionInfo {
+                    ident: icmp.ident,
+                    seq: icmp.seq,
+                    is_req: icmp.is_req,
+                }),
             })
         } else if socket_source.is_some()
             && spec.source_evidence == SourceEvidenceMode::SocketSourceRequired
@@ -293,8 +314,12 @@ fn admit_icmp_packet(
     let _ = spec.role;
     PacketAdmission::Accepted(AdmittedPacket {
         normalized_source: Some(canonical),
-        payload_bounds: p_bounds,
-        icmp_info: Some(IcmpAdmissionInfo { ident, seq, is_req }),
+        payload_bounds: parsed.payload_bounds,
+        icmp_info: Some(IcmpAdmissionInfo {
+            ident: icmp.ident,
+            seq: icmp.seq,
+            is_req: icmp.is_req,
+        }),
     })
 }
 
@@ -314,26 +339,28 @@ fn icmp_remote_ip_matches(actual: CanonicalAddr, expected: CanonicalAddr) -> boo
 
 #[inline]
 fn parse_raw_ip_source(
-    payload: &[u8],
-    ip_ver: u8,
-    src_ip_bounds: (usize, usize),
+    parsed: &ParsedPacketHeaders,
     socket_source: Option<&SockAddr>,
-    ident: u16,
 ) -> Option<CanonicalAddr> {
-    let (start, end) = src_ip_bounds;
-    if ip_ver == 4 && end - start == 4 {
-        let octets: [u8; 4] = payload[start..end].try_into().unwrap();
-        Some(CanonicalAddr::from_v4(Ipv4Addr::from(octets), ident))
-    } else if ip_ver == 6 && end - start == 16 {
-        let octets: [u8; 16] = payload[start..end].try_into().unwrap();
-        let ip = Ipv6Addr::from(octets);
-        Some(match socket_source.and_then(|s| s.as_socket_ipv6()) {
+    let ident = parsed.icmp?.ident;
+    match parsed.src_ip? {
+        IpAddr::V4(ip) => Some(CanonicalAddr::from_v4(ip, ident)),
+        IpAddr::V6(ip) => Some(match socket_source.and_then(|s| s.as_socket_ipv6()) {
             Some(meta) => CanonicalAddr::from_v6(ip, ident, meta.flowinfo(), meta.scope_id()),
             _ => CanonicalAddr::from_v6(ip, ident, 0, 0),
-        })
-    } else {
-        None
+        }),
     }
+}
+
+#[inline]
+fn parsed_transport_has_ip(parsed: &ParsedPacketHeaders) -> bool {
+    matches!(
+        parsed.transport,
+        ParsedTransport::Ipv4Icmp
+            | ParsedTransport::Ipv6Icmp
+            | ParsedTransport::Ipv4Udp
+            | ParsedTransport::Ipv6Udp
+    )
 }
 
 #[cfg(test)]

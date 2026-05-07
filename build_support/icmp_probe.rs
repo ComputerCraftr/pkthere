@@ -1,9 +1,9 @@
-#[path = "../src/net/icmp_echo_parse.rs"]
-mod icmp_echo_parse;
+#[path = "../src/net/packet_headers.rs"]
+mod packet_headers;
 #[path = "../src/recv_buf.rs"]
 mod recv_buf;
 
-use icmp_echo_parse::parse_icmp_echo_header;
+use packet_headers::parse_packet_headers;
 use recv_buf::RecvBuf;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
@@ -55,9 +55,8 @@ pub fn probe_kernel_icmp_echo() -> io::Result<()> {
                 }
                 let buf = recv_buf.initialized(n);
 
-                let (ok, _ident, _seq, is_req, _ip_ver, _payload, _src_ip, _dst_ip) =
-                    parse_icmp_echo_header(buf);
-                if ok && !is_req {
+                let parsed = parse_packet_headers(buf);
+                if parsed.icmp.is_some_and(|icmp| !icmp.is_req) {
                     return Ok(());
                 }
             }

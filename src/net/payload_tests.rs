@@ -20,7 +20,7 @@ mod tests {
         DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
         TimeoutAction, WorkerFlowMode,
     };
-    use crate::net::icmp_echo_parse::parse_icmp_echo_header;
+    use crate::net::packet_headers::parse_packet_headers;
     use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -67,12 +67,17 @@ mod tests {
     }
 
     fn admitted_icmp(buf: &[u8]) -> (Option<IcmpAdmissionInfo>, (usize, usize)) {
-        let (ok, ident, seq, is_req, _ip_ver, payload_bounds, _src_ip, _dst_ip) =
-            parse_icmp_echo_header(buf);
-        assert!(ok, "test fixture should contain a valid ICMP echo packet");
+        let parsed = parse_packet_headers(buf);
+        let icmp = parsed
+            .icmp
+            .expect("test fixture should contain a valid ICMP echo packet");
         (
-            Some(IcmpAdmissionInfo { ident, seq, is_req }),
-            payload_bounds,
+            Some(IcmpAdmissionInfo {
+                ident: icmp.ident,
+                seq: icmp.seq,
+                is_req: icmp.is_req,
+            }),
+            parsed.payload_bounds,
         )
     }
 
@@ -80,10 +85,11 @@ mod tests {
     fn explicit_icmp_header_id_is_serialized_verbatim() {
         let hdr = test_icmp_echo_header(4242, 9);
         let packet = super::payload_send::build_test_icmp_echo_packet(&hdr, &[], b"x");
-        let (_, ident, seq, _is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
-            parse_icmp_echo_header(&packet);
-        assert_eq!(ident, 4242);
-        assert_eq!(seq, 9);
+        let parsed = parse_packet_headers(&packet);
+        let icmp = parsed.icmp.expect("icmp");
+        assert_eq!(icmp.ident, 4242);
+        assert_eq!(icmp.seq, 9);
+        let (start, end) = parsed.payload_bounds;
         assert_eq!(&packet[start..end], b"x");
     }
 
@@ -97,86 +103,6 @@ mod tests {
         assert_eq!(zero_len_user.len(), cadence.len() + 1);
         assert_eq!(zero_len_user[8], ICMP_SHIM_IS_DATA);
         assert_eq!(cadence.len(), 8);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_accepts_ipv4_with_ip_header() {
-        let icmp_payload = [0xDEu8, 0xAD, 0xBE];
-        let mut buf = vec![0u8; 20 + 8 + icmp_payload.len()];
-        buf[0] = 0x45;
-        buf[8] = 64;
-        buf[9] = 1;
-        buf[20] = 8;
-        buf[22] = 0;
-        buf[23] = 0;
-        buf[24] = 0x12;
-        buf[25] = 0x34;
-        buf[26] = 0x00;
-        buf[27] = 0x02;
-        buf[28..].copy_from_slice(&icmp_payload);
-
-        let (ok, ident, seq, is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
-            parse_icmp_echo_header(&buf);
-        assert!(ok);
-        assert_eq!(start, 28);
-        assert_eq!(end, 28 + icmp_payload.len());
-        assert_eq!(ident, 0x1234);
-        assert_eq!(seq, 0x0002);
-        assert!(is_req);
-        assert_eq!(&buf[start..end], &icmp_payload);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_accepts_ipv6_with_ip_header() {
-        let icmp_payload = [0xCAu8, 0xFE, 0xBA, 0xBE];
-        let mut buf = vec![0u8; 40 + 8 + icmp_payload.len()];
-        buf[0] = 0x60;
-        buf[6] = 58;
-        buf[40] = 129;
-        buf[44] = 0xBE;
-        buf[45] = 0xEF;
-        buf[46] = 0x00;
-        buf[47] = 0x2A;
-        buf[48..].copy_from_slice(&icmp_payload);
-
-        let (ok, ident, seq, is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
-            parse_icmp_echo_header(&buf);
-        assert!(ok);
-        assert_eq!(start, 48);
-        assert_eq!(end, 48 + icmp_payload.len());
-        assert_eq!(ident, 0xBEEF);
-        assert_eq!(seq, 0x002A);
-        assert!(!is_req);
-        assert_eq!(&buf[start..end], &icmp_payload);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_accepts_headerless_icmp() {
-        let payload = [0xABu8, 0xCD];
-        let mut buf = Vec::with_capacity(8 + payload.len());
-        buf.extend_from_slice(&[8, 0, 0, 0, 0x01, 0x02, 0x03, 0x04]);
-        buf.extend_from_slice(&payload);
-
-        let (ok, ident, seq, is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
-            parse_icmp_echo_header(&buf);
-        assert!(ok);
-        assert_eq!(start, 8);
-        assert_eq!(end, 8 + payload.len());
-        assert_eq!(ident, 0x0102);
-        assert_eq!(seq, 0x0304);
-        assert!(is_req);
-        assert_eq!(&buf[start..end], &payload);
-    }
-
-    #[test]
-    fn parse_icmp_echo_header_rejects_truncated_input() {
-        let buf = [0u8; 4];
-        let (ok, _ident, _seq, _is_req, _ip_ver, (start, end), _src_ip, _dst_ip) =
-            parse_icmp_echo_header(&buf);
-
-        assert!(!ok);
-        assert_eq!(start, 0);
-        assert_eq!(end, 0);
     }
 
     #[test]
