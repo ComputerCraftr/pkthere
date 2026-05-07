@@ -283,15 +283,18 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         COUNT as u64
     );
 
-    let stats_client = json_addr(&worker["client_addr"]).expect("parse stats client_addr");
-    assert_eq!(stats_client, client_local, "stats client_addr mismatch");
-    let actual_upstream = worker["upstream_canonical"].as_str().unwrap_or_default();
+    let stats_client =
+        json_addr(&worker["client_remote_canonical"]).expect("parse stats client_remote_canonical");
+    assert_eq!(stats_client, client_local, "stats client_remote mismatch");
+    let actual_upstream = worker["upstream_remote_filter_canonical"]
+        .as_str()
+        .unwrap_or_default();
     if case.proto.eq_ignore_ascii_case("icmp") {
         // Accept either the requested :0 or the realized ID (now that we discover it)
         assert!(
             actual_upstream == render_canonical_ip_id(up_addr.ip(), 0)
                 || !actual_upstream.ends_with(":0"),
-            "stats upstream_canonical mismatch for ICMP: expected IP:0 or IP:real_id, got {}",
+            "stats upstream_remote_filter_canonical mismatch for ICMP: expected IP:0 or IP:real_id, got {}",
             actual_upstream
         );
         let expected_prefix = match up_addr.ip() {
@@ -303,7 +306,7 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         assert_eq!(
             actual_upstream,
             render_canonical_ip_id(up_addr.ip(), up_addr.port()),
-            "stats upstream_canonical mismatch"
+            "stats upstream_remote_filter_canonical mismatch"
         );
     }
 
@@ -460,8 +463,9 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     ));
     drop(session.child.kill());
 
-    let stats_client = json_addr(&worker_flow::locked_worker_flow(&stats)["client_addr"])
-        .expect("parse stats client_addr");
+    let stats_client =
+        json_addr(&worker_flow::locked_worker_flow(&stats)["client_remote_canonical"])
+            .expect("parse stats client_remote_canonical");
     assert_eq!(
         stats_client, client_b_local,
         "forwarder did not relock to client B"
@@ -536,8 +540,8 @@ fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>)
         },
     );
     assert_eq!(
-        json_addr(&worker_flow::locked_worker_flow(&stats)["client_addr"])
-            .expect("stats client addr"),
+        json_addr(&worker_flow::locked_worker_flow(&stats)["client_remote_canonical"])
+            .expect("stats client remote"),
         client_a.local_addr().expect("client A local addr")
     );
 

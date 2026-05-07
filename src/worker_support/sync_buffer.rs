@@ -99,7 +99,7 @@ fn send_local_session_control_reply(
         };
     let send_res = send_payload(
         &handles.client_sock,
-        handles.client_connected,
+        handles.listener_connected,
         handles.listen_sock_type,
         &route.dest_sa,
         &outbound,
@@ -115,7 +115,7 @@ fn send_local_session_control_reply(
         &reply_event,
         false,
         &send_res,
-        handles.client_connected,
+        handles.listener_connected,
         &route.dest_sa,
         None,
     );
@@ -139,7 +139,7 @@ pub(crate) fn handle_c2u_session_control(
         Ok(C2uSessionControlDecision::Consume) => {}
         Ok(C2uSessionControlDecision::ReplyLocally) => {
             let reply_route = default_reply_route.cloned().or_else(|| {
-                let dest = handles.client_peer.map(|peer| {
+                let dest = handles.client_remote.map(|peer| {
                     CanonicalAddr::new(
                         peer.addr,
                         handles
@@ -248,15 +248,15 @@ mod tests {
     fn test_handles() -> SocketHandles {
         SocketHandles {
             locked_flow: None,
-            client_peer: None,
-            client_connected: false,
+            client_remote: None,
+            listener_connected: false,
             client_sock: udp_socket_clone(),
             listen_sock_type: Type::DGRAM, // UDP sockets are always DGRAM
-            upstream: CanonicalAddr::new(
+            upstream_remote_filter: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4444)),
                 4444,
             ),
-            upstream_local: CanonicalAddr::new(
+            upstream_local_filter: CanonicalAddr::new(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555)),
                 5555,
             ),

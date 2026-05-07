@@ -15,12 +15,12 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 /// Snapshot of sockets and destination used by worker threads.
 pub(crate) struct SocketHandles {
     pub locked_flow: Option<ClientFlowKey>,
-    pub client_peer: Option<CanonicalAddr>,
-    pub client_connected: bool,
+    pub client_remote: Option<CanonicalAddr>,
+    pub listener_connected: bool,
     pub client_sock: Socket,
     pub listen_sock_type: Type,
-    pub upstream: CanonicalAddr,
-    pub upstream_local: CanonicalAddr,
+    pub upstream_remote_filter: CanonicalAddr,
+    pub upstream_local_filter: CanonicalAddr,
     pub upstream_sock_type: Type,
     pub upstream_connected: bool,
     pub upstream_sock: Socket,
@@ -129,7 +129,7 @@ pub(crate) struct SocketManager {
     listen_target: String,                   // unresolved --here host:port
     listen_proto: SupportedProtocol,         // never changes
     listen_debug_unconnected: bool,
-    upstream: Mutex<UpstreamState>, // cold-path updates only
+    upstream_state: Mutex<UpstreamState>, // cold-path updates only
     upstream_target: String,        // unresolved --there host:port
     upstream_local_id: u16,
     upstream_proto: SupportedProtocol, // never changes
@@ -149,7 +149,7 @@ impl SocketManager {
         listen_proto: SupportedProtocol,
         listen_capability: SocketReuseCapability,
         listen_debug_unconnected: bool,
-        upstream: CanonicalAddr,
+        upstream_remote_filter: CanonicalAddr,
         upstream_target: String,
         upstream_local_id: u16,
         upstream_proto: SupportedProtocol,
@@ -165,7 +165,7 @@ impl SocketManager {
             upstream_sock_type,
             upstream_capability,
         ) = make_upstream_socket_for(
-            upstream,
+            upstream_remote_filter,
             upstream_proto,
             upstream_local_id,
             upstream_local_id == 0,
@@ -187,7 +187,7 @@ impl SocketManager {
             listen_target,
             listen_proto,
             listen_debug_unconnected,
-            upstream: Mutex::new(UpstreamState {
+            upstream_state: Mutex::new(UpstreamState {
                 upstream_remote_filter: upstream_remote,
                 upstream_local_filter: upstream_local,
                 upstream_local_kernel,
@@ -224,7 +224,7 @@ impl SocketManager {
 
     /// Whether the listener socket is currently connected to a client.
     #[inline]
-    pub fn get_client_connected(&self) -> bool {
+    pub fn get_listener_connected(&self) -> bool {
         self.client_listen.lock().unwrap().listener_connected
     }
 
@@ -234,7 +234,7 @@ impl SocketManager {
     /// and will refresh on the next hot-path check, even if other updates raced
     /// and advanced the global version further.
     #[inline]
-    pub fn set_client_addr_connected(
+    pub fn set_listener_remote_connected(
         &self,
         flow: Option<ClientFlowKey>,
         client_remote: Option<CanonicalAddr>,
@@ -293,10 +293,10 @@ impl SocketManager {
 
     #[inline]
     pub fn clear_client_lock(&self, prev_ver: u64) -> io::Result<u64> {
-        if self.get_client_connected() {
+        if self.get_listener_connected() {
             self.set_client_sock_disconnected(None, None, false, prev_ver)
         } else {
-            Ok(self.set_client_addr_connected(None, None, false, prev_ver))
+            Ok(self.set_listener_remote_connected(None, None, false, prev_ver))
         }
     }
 
@@ -316,7 +316,7 @@ impl SocketManager {
     /// Snapshot the current upstream destination and protocol.
     #[inline]
     pub fn get_upstream_dest(&self) -> (CanonicalAddr, bool, SupportedProtocol) {
-        let up = self.upstream.lock().unwrap();
+        let up = self.upstream_state.lock().unwrap();
         (
             up.upstream_remote_filter,
             up.upstream_connected,
@@ -327,7 +327,7 @@ impl SocketManager {
     #[inline]
     pub fn snapshot_state(&self) -> SocketStateSnapshot {
         let cl = self.client_listen.lock().unwrap();
-        let up = self.upstream.lock().unwrap();
+        let up = self.upstream_state.lock().unwrap();
         SocketStateSnapshot {
             locked_flow: cl.flow,
             client_remote: cl.client_remote,
@@ -360,7 +360,7 @@ impl SocketManager {
         bool,
     )> {
         let resolved = resolve_first(&self.upstream_target)?;
-        let mut up_guard = self.upstream.lock().unwrap();
+        let mut up_guard = self.upstream_state.lock().unwrap();
         let prev_addr = up_guard.upstream_remote_filter;
         let prev_local = up_guard.upstream_local_filter;
         let prev_local_kernel = up_guard.upstream_local_kernel;
@@ -577,10 +577,10 @@ impl SocketManager {
         let (
             client_sock,
             client_flow,
-            client_peer,
+            client_remote,
             _listen_local_kernel,
             listen_sock_type,
-            client_connected,
+            listener_connected,
             _listen_capability,
             listen_changed,
         ) = if allow_listen_rebind {
@@ -611,8 +611,8 @@ impl SocketManager {
 
         let (
             upstream_sock,
-            upstream_remote,
-            upstream_local,
+            upstream_remote_filter,
+            upstream_local_filter,
             _upstream_local_kernel,
             upstream_sock_type,
             upstream_connected,
@@ -631,7 +631,7 @@ impl SocketManager {
                 res.6,
             )
         } else {
-            let up = self.upstream.lock().unwrap();
+            let up = self.upstream_state.lock().unwrap();
             (
                 up.sock.try_clone()?,
                 up.upstream_remote_filter,
@@ -649,12 +649,12 @@ impl SocketManager {
 
         Ok(SocketHandles {
             locked_flow: client_flow,
-            client_peer,
-            client_connected,
+            client_remote,
+            listener_connected,
             client_sock,
             listen_sock_type,
-            upstream: upstream_remote,
-            upstream_local,
+            upstream_remote_filter,
+            upstream_local_filter,
             upstream_sock_type,
             upstream_connected,
             upstream_sock,
@@ -669,16 +669,16 @@ impl SocketManager {
         // Snapshot all mutable state while holding the relevant locks so the
         // returned version matches the handles we hand back.
         let cl = self.client_listen.lock().unwrap();
-        let up = self.upstream.lock().unwrap();
+        let up = self.upstream_state.lock().unwrap();
 
         SocketHandles {
             locked_flow: cl.flow,
-            client_peer: cl.client_remote,
-            client_connected: cl.listener_connected,
+            client_remote: cl.client_remote,
+            listener_connected: cl.listener_connected,
             client_sock: cl.sock.try_clone().expect("clone client socket"),
             listen_sock_type: cl.sock_type,
-            upstream: up.upstream_remote_filter,
-            upstream_local: up.upstream_local_filter,
+            upstream_remote_filter: up.upstream_remote_filter,
+            upstream_local_filter: up.upstream_local_filter,
             upstream_sock_type: up.sock_type,
             upstream_connected: up.upstream_connected,
             upstream_sock: up.sock.try_clone().expect("clone upstream socket"),
@@ -744,7 +744,7 @@ mod tests {
         let a = {
             let mgr = Arc::clone(&mgr);
             thread::spawn(move || {
-                mgr.set_client_addr_connected(
+                mgr.set_listener_remote_connected(
                     Some(ClientFlowKey::Udp(addr_a)),
                     Some(CanonicalAddr::from_socket_addr(addr_a)),
                     true,
@@ -755,7 +755,7 @@ mod tests {
         let b = {
             let mgr = Arc::clone(&mgr);
             thread::spawn(move || {
-                mgr.set_client_addr_connected(
+                mgr.set_listener_remote_connected(
                     Some(ClientFlowKey::Udp(addr_b)),
                     Some(CanonicalAddr::from_socket_addr(addr_b)),
                     false,
@@ -780,13 +780,13 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33333);
         let canonical = CanonicalAddr::from_socket_addr(addr);
-        let _ = mgr.set_client_addr_connected(
+        let _ = mgr.set_listener_remote_connected(
             Some(ClientFlowKey::Udp(addr)),
             Some(canonical),
             true,
             v0,
         );
-        let _ = mgr.set_client_addr_connected(
+        let _ = mgr.set_listener_remote_connected(
             Some(ClientFlowKey::Udp(addr)),
             Some(canonical),
             false,
@@ -797,7 +797,7 @@ mod tests {
         cached = mgr.refresh_handles();
         assert_eq!(cached.version, mgr.get_version());
         assert_eq!(cached.locked_flow, Some(ClientFlowKey::Udp(addr)));
-        assert!(!cached.client_connected);
+        assert!(!cached.listener_connected);
     }
 
     #[test]

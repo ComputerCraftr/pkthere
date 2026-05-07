@@ -1,7 +1,7 @@
 use crate::cli::SupportedProtocol;
 use crate::net::params::CanonicalAddr;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr, SocketAddrV6};
+use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ClientFlowKey {
@@ -45,19 +45,6 @@ impl ClientFlowKey {
         }
     }
 
-    #[inline]
-    pub fn display_addr(self) -> SocketAddr {
-        match self {
-            Self::Udp(addr) => addr,
-            Self::IcmpV4 { ip, ident } => SocketAddr::new(IpAddr::V4(ip), ident),
-            Self::IcmpV6 {
-                ip,
-                ident,
-                flowinfo,
-                scope_id,
-            } => SocketAddr::V6(SocketAddrV6::new(ip, ident, flowinfo, scope_id)),
-        }
-    }
 }
 
 impl fmt::Display for ClientFlowKey {
@@ -78,7 +65,7 @@ impl fmt::Display for ClientFlowKey {
 #[cfg(test)]
 mod tests {
     use super::ClientFlowKey;
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 
     #[test]
     fn udp_flow_key_uses_full_socket_addr() {
@@ -120,9 +107,5 @@ mod tests {
             scope_id: 3,
         };
         assert_ne!(a, b);
-        assert_eq!(
-            a.display_addr(),
-            SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 10, 1, 2))
-        );
     }
 }

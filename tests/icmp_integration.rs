@@ -607,15 +607,17 @@ fn test_raw_icmp_independent_ids() {
     );
 
     let worker_b = worker_flow::locked_worker_flow(&stats_b);
-    let client_addr_b = worker_b["client_addr"].as_str().expect("client_addr");
-    let upstream_canonical_b = worker_b["upstream_canonical"]
+    let client_remote_b = worker_b["client_remote_canonical"]
         .as_str()
-        .expect("upstream_canonical");
-    let upstream_local_canonical_b = worker_b["upstream_local_canonical"]
+        .expect("client_remote_canonical");
+    let upstream_remote_b = worker_b["upstream_remote_filter_canonical"]
         .as_str()
-        .expect("upstream_local_canonical");
+        .expect("upstream_remote_filter_canonical");
+    let upstream_local_b = worker_b["upstream_local_filter_canonical"]
+        .as_str()
+        .expect("upstream_local_filter_canonical");
 
-    assert!(client_addr_b.contains(&id_b.to_string()));
-    assert!(upstream_canonical_b.contains(&id_a.to_string()));
-    assert!(upstream_local_canonical_b.contains(&id_b.to_string()));
+    assert!(client_remote_b.contains(&id_b.to_string()));
+    assert!(upstream_remote_b.contains(&id_a.to_string()));
+    assert!(upstream_local_b.contains(&id_b.to_string()));
 }

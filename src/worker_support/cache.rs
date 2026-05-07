@@ -68,7 +68,7 @@ impl CachedClientState {
 
     #[inline]
     fn maybe_build_session_control_reply_route(handles: &SocketHandles) -> Option<CachedSendRoute> {
-        let dest = handles.client_peer.map(|peer| {
+        let dest = handles.client_remote.map(|peer| {
             CanonicalAddr::new(
                 peer.addr,
                 handles
@@ -92,13 +92,13 @@ impl CachedClientState {
                 c2u,
                 worker_id,
                 dest_sock_type: handles.upstream_sock_type,
-                route: Self::build_send_route(c2u, handles, handles.upstream),
+                route: Self::build_send_route(c2u, handles, handles.upstream_remote_filter),
                 recv_icmp_local_id: Self::resolve_client_recv_icmp_local_id(cfg, handles),
                 session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
         } else {
-            let remote = handles.client_peer.unwrap_or_else(|| {
+            let remote = handles.client_remote.unwrap_or_else(|| {
                 CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), 0)
             });
             Self {
@@ -116,13 +116,13 @@ impl CachedClientState {
     pub(crate) fn refresh_from_handles(&mut self, cfg: &RuntimeConfig, handles: &SocketHandles) {
         if self.c2u {
             self.dest_sock_type = handles.upstream_sock_type;
-            self.route = Self::build_send_route(self.c2u, handles, handles.upstream);
+            self.route = Self::build_send_route(self.c2u, handles, handles.upstream_remote_filter);
         } else {
             self.dest_sock_type = handles.listen_sock_type;
             self.route = Self::build_send_route(
                 self.c2u,
                 handles,
-                handles.client_peer.unwrap_or(self.route.dest),
+                handles.client_remote.unwrap_or(self.route.dest),
             );
         }
         self.recv_icmp_local_id = Self::resolve_client_recv_icmp_local_id(cfg, handles);
@@ -144,12 +144,12 @@ impl CachedClientState {
                 self.log_handles,
                 self.worker_id,
                 self.c2u,
-                "refresh_handles_and_cache: stale={}, new_ver={}, client_addr={:?}, client_connected={}, upstream_addr={}, upstream_connected={}",
+                "refresh_handles_and_cache: stale={}, new_ver={}, client_remote={:?}, listener_connected={}, upstream_remote_filter={}, upstream_connected={}",
                 prev_ver,
                 handles.version,
-                handles.client_peer,
-                handles.client_connected,
-                handles.upstream,
+                handles.client_remote,
+                handles.listener_connected,
+                handles.upstream_remote_filter,
                 handles.upstream_connected
             );
         }
@@ -212,15 +212,15 @@ mod tests {
     fn test_handles() -> SocketHandles {
         SocketHandles {
             locked_flow: None,
-            client_peer: None,
-            client_connected: false,
+            client_remote: None,
+            listener_connected: false,
             client_sock: udp_socket_clone(),
             listen_sock_type: Type::DGRAM,
-            upstream: CanonicalAddr::new(
+            upstream_remote_filter: CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
                 9999,
             ),
-            upstream_local: CanonicalAddr::new(
+            upstream_local_filter: CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
                 7777,
             ),
@@ -273,10 +273,10 @@ mod tests {
     }
 
     #[test]
-    fn cached_session_control_reply_route_is_built_from_locked_client_peer() {
+    fn cached_session_control_reply_route_is_built_from_locked_client_remote() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
         let mut handles = test_handles();
-        handles.client_peer = Some(CanonicalAddr::new(
+        handles.client_remote = Some(CanonicalAddr::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555),
             5555,
         ));
@@ -313,7 +313,7 @@ mod tests {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let mut handles = test_handles();
         handles.listen_sock_type = Type::RAW;
-        handles.client_peer = Some(CanonicalAddr::new(
+        handles.client_remote = Some(CanonicalAddr::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
             12345,
         ));
@@ -335,10 +335,10 @@ mod tests {
         let mut handles = test_handles();
         handles.upstream_sock_type = Type::RAW;
         // Our "Source Port" (local ID) is 7777
-        handles.upstream_local =
+        handles.upstream_local_filter =
             CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), 7777);
         // Our "Destination Port" (remote ID) is 9999
-        handles.upstream =
+        handles.upstream_remote_filter =
             CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), 9999);
 
         let cache = CachedClientState::new(true, 0, &cfg, &handles, false);

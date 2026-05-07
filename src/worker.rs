@@ -152,8 +152,8 @@ pub(crate) fn run_upstream_to_client_thread(
             role: SocketPeerRole::Upstream,
             proto: cfg.upstream_proto,
             sock_type: handles.upstream_sock_type,
-            expected_remote: Some(handles.upstream),
-            expected_local_icmp_id: Some(handles.upstream_local.id),
+            expected_remote: Some(handles.upstream_remote_filter),
+            expected_local_icmp_id: Some(handles.upstream_local_filter.id),
         };
         match recv_packet(
             &handles.upstream_sock,
@@ -195,7 +195,7 @@ pub(crate) fn run_upstream_to_client_thread(
                     "[worker {}] received {} bytes from upstream socket {:?}",
                     worker_id,
                     len,
-                    handles.upstream
+                    handles.upstream_remote_filter
                 );
                 cache.refresh_handles_and_cache(cfg, sock_mgr, &mut handles);
                 let locked_now = refresh_lock_and_sync_state(
@@ -255,7 +255,7 @@ pub(crate) fn run_upstream_to_client_thread(
                         );
                         send_payload(
                             &handles.client_sock,
-                            handles.client_connected,
+                            handles.listener_connected,
                             cache.dest_sock_type,
                             &cache.route.dest_sa,
                             &outbound,
@@ -274,7 +274,7 @@ pub(crate) fn run_upstream_to_client_thread(
                         &event,
                         counts_as_session_activity(&event, decision.counts_as_session_activity()),
                         &send_res,
-                        handles.client_connected,
+                        handles.listener_connected,
                         &cache.route.dest_sa,
                         Some((&mut handles, sock_mgr)),
                     );
@@ -323,7 +323,7 @@ pub(crate) fn run_client_to_upstream_thread(
             sync_state,
             &mut sync_cache,
         );
-        if handles.client_connected {
+        if handles.listener_connected {
             if sync_icmp_mode {
                 if !locked_now {
                     thread::sleep(Duration::from_millis(1));
@@ -381,7 +381,7 @@ pub(crate) fn run_client_to_upstream_thread(
                     proto: cfg.listen_proto,
                     sock_type: handles.listen_sock_type,
                     expected_remote: if locked_now {
-                        handles.client_peer
+                        handles.client_remote
                     } else {
                         None
                     },
@@ -390,7 +390,7 @@ pub(crate) fn run_client_to_upstream_thread(
 
                 match recv_packet(
                     &handles.client_sock,
-                    handles.client_connected,
+                    handles.listener_connected,
                     buf.recv_buf_mut(),
                 ) {
                     Ok((len, source)) => {
@@ -485,7 +485,7 @@ pub(crate) fn run_client_to_upstream_thread(
             };
             match recv_packet(
                 &handles.client_sock,
-                handles.client_connected,
+                handles.listener_connected,
                 buf.recv_buf_mut(),
             ) {
                 Ok((len, source)) => {
@@ -650,12 +650,12 @@ pub(crate) fn run_client_to_upstream_thread(
                     role: SocketPeerRole::Client,
                     proto: cfg.listen_proto,
                     sock_type: handles.listen_sock_type,
-                    expected_remote: handles.client_peer,
+                    expected_remote: handles.client_remote,
                     expected_local_icmp_id: cache.recv_icmp_local_id,
                 };
                 match recv_packet(
                     &handles.client_sock,
-                    handles.client_connected,
+                    handles.listener_connected,
                     buf.recv_buf_mut(),
                 ) {
                     Ok((len, source)) => {
@@ -754,7 +754,7 @@ pub(crate) fn run_client_to_upstream_thread(
                 proto: cfg.listen_proto,
                 sock_type: handles.listen_sock_type,
                 expected_remote: if flow_state.is_locked() {
-                    handles.client_peer
+                    handles.client_remote
                 } else {
                     None
                 },
@@ -762,7 +762,7 @@ pub(crate) fn run_client_to_upstream_thread(
             };
             match recv_packet(
                 &handles.client_sock,
-                handles.client_connected,
+                handles.listener_connected,
                 buf.recv_buf_mut(),
             ) {
                 Ok((len, source)) => {
@@ -831,20 +831,20 @@ pub(crate) fn run_client_to_upstream_thread(
                         was_locked = true;
                         let peer_addr = Some(src);
                         let src_sa = src.as_sock_addr();
-                        handles.client_connected = false;
+                        handles.listener_connected = false;
                         if cfg.debug_behavior.client_unconnected {
                             log_info!("Locked to single client {} (not connected)", src);
                         } else if let Err(e) = handles.client_sock.connect(&src_sa) {
                             log_warn!("connect client_sock to {} failed: {}", src, e);
                             log_info!("Locked to single client {} (not connected)", src);
                         } else {
-                            handles.client_connected = true;
+                            handles.listener_connected = true;
                             log_info!("Locked to single client {} (connected)", src);
                         }
-                        handles.version = sock_mgr.set_client_addr_connected(
+                        handles.version = sock_mgr.set_listener_remote_connected(
                             Some(flow),
                             peer_addr,
-                            handles.client_connected,
+                            handles.listener_connected,
                             handles.version,
                         );
                         log_debug_dir!(
@@ -853,7 +853,7 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "publish lock: flow={:?} connected={} ver={}",
                             flow,
-                            handles.client_connected,
+                            handles.listener_connected,
                             handles.version
                         );
                         if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
@@ -862,7 +862,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                     let _ = mgr.set_client_sock_connected(
                                         Some(flow),
                                         peer_addr,
-                                        handles.client_connected,
+                                        handles.listener_connected,
                                         &src_sa,
                                         0,
                                     );

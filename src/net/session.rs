@@ -54,17 +54,17 @@ pub(crate) fn handle_send_result(
 
             if !*res {
                 if let Some((handles, sock_mgr)) = disconnect_ctx {
-                    if handles.client_connected {
+                    if handles.listener_connected {
                         let prev_ver = handles.version;
                         log_warn_dir!(
                             worker_id,
                             c2u,
                             "send_payload error (EDESTADDRREQ); disconnecting client socket"
                         );
-                        handles.client_connected = false;
+                        handles.listener_connected = false;
                         handles.version = match sock_mgr.set_client_sock_disconnected(
                             handles.locked_flow,
-                            handles.client_peer,
+                            handles.client_remote,
                             false,
                             prev_ver,
                         ) {

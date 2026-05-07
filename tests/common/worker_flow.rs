@@ -4,7 +4,7 @@ pub fn locked_worker_flow(stats: &serde_json::Value) -> &serde_json::Value {
         .and_then(|flows| {
             flows.iter().find(|flow| {
                 flow["locked"].as_bool().unwrap_or(false)
-                    || !flow["client_addr"].is_null()
+                    || !flow["client_remote_canonical"].is_null()
                     || !flow["flow_key"].is_null()
             })
         })
