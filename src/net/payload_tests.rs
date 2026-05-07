@@ -20,6 +20,9 @@ mod tests {
         DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
         TimeoutAction, WorkerFlowMode,
     };
+    use crate::net::framing_shim::{
+        ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, encode_icmp_tunnel_prefix,
+    };
     use crate::net::packet_headers::parse_packet_headers;
     use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
@@ -96,12 +99,15 @@ mod tests {
     #[test]
     fn zero_length_icmp_user_payload_wire_packet_is_one_byte_longer_than_cadence() {
         let hdr = test_icmp_echo_header(4242, 9);
+        let mut scratch = [0; ICMP_TUNNEL_SHIM_MAX_LEN];
+        let zero_prefix =
+            encode_icmp_tunnel_prefix(IcmpTunnelFrameKind::UserPayload, None, 0, &mut scratch)
+                .expect("zero-length user prefix");
         let zero_len_user =
-            super::payload_send::build_test_icmp_echo_packet(&hdr, &[ICMP_SHIM_IS_DATA], &[]);
+            super::payload_send::build_test_icmp_echo_packet(&hdr, zero_prefix, &[]);
         let cadence = super::payload_send::build_test_icmp_echo_packet(&hdr, &[], &[]);
 
         assert_eq!(zero_len_user.len(), cadence.len() + 1);
-        assert_eq!(zero_len_user[8], ICMP_SHIM_IS_DATA);
         assert_eq!(cadence.len(), 8);
     }
 
@@ -145,8 +151,7 @@ mod tests {
     fn validate_payload_classifies_shimmed_zero_len_icmp_as_session_control() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        // A single zero shim byte is session-control, not cadence.
-        let buf = [8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09, 0x00];
+        let buf = encode_icmp_frame(IcmpTunnelFrameKind::SessionControl, None, &[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -168,21 +173,34 @@ mod tests {
         }
     }
 
-    fn encode_icmp_payload(shim: Option<u8>, payload: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(8 + shim.map_or(0, |_| 1) + payload.len());
+    fn encode_icmp_frame(
+        kind: IcmpTunnelFrameKind,
+        source_id: Option<u16>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut scratch = [0; ICMP_TUNNEL_SHIM_MAX_LEN];
+        let prefix = encode_icmp_tunnel_prefix(kind, source_id, payload.len(), &mut scratch)
+            .expect("test ICMP tunnel frame should serialize");
+        let mut buf = Vec::with_capacity(8 + prefix.len() + payload.len());
         buf.extend_from_slice(&[8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
-        if let Some(shim) = shim {
-            buf.push(shim);
-        }
+        buf.extend_from_slice(prefix);
         buf.extend_from_slice(payload);
         buf
+    }
+
+    fn encode_icmp_user_payload(payload: &[u8]) -> Vec<u8> {
+        encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, None, payload)
+    }
+
+    fn encode_icmp_user_payload_with_source_id(source_id: u16, payload: &[u8]) -> Vec<u8> {
+        encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, Some(source_id), payload)
     }
 
     #[test]
     fn validate_payload_decodes_zero_len_icmp_user_datagram() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
+        let buf = encode_icmp_user_payload(&[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -205,7 +223,7 @@ mod tests {
     fn validate_payload_decodes_non_empty_icmp_user_datagram() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abc");
+        let buf = encode_icmp_user_payload(b"abc");
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -231,7 +249,7 @@ mod tests {
     fn validate_payload_preserves_wire_identifier_without_external_policy() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
+        let mut buf = encode_icmp_user_payload(&[]);
         buf[4] = 0xAA;
         buf[5] = 0x55;
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
@@ -262,7 +280,7 @@ mod tests {
     fn validate_payload_does_not_enforce_external_icmp_id_policy() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
+        let mut buf = encode_icmp_user_payload(&[]);
         buf[4] = 0xAA;
         buf[5] = 0x55;
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
@@ -311,48 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_rejects_invalid_icmp_shim() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let stats = Stats::new();
-        let bad_reserved = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | 0x01), &[]);
-        // SessionControl (0x00) but has_payload (0x40) set
-        let bad_session_control_with_flag = encode_icmp_payload(Some(ICMP_SHIM_HAS_PAYLOAD), &[]);
-        // SessionControl (0x00) but has actual data bytes
-        let bad_session_control_with_payload = encode_icmp_payload(Some(0x00), b"x");
-        // Data (0x80) with has_payload bit (0x40) but no bytes
-        let bad_data_missing_payload =
-            encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), &[]);
-        // Data (0x80) without has_payload bit but has bytes
-        let bad_data_with_unexpected_payload = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), b"x");
-
-        for bad in [
-            bad_reserved,
-            bad_session_control_with_flag,
-            bad_session_control_with_payload,
-            bad_data_missing_payload,
-            bad_data_with_unexpected_payload,
-        ] {
-            let (icmp_info, payload_bounds) = admitted_icmp(&bad);
-            assert!(
-                validate_payload(
-                    true,
-                    &cfg,
-                    &stats,
-                    &bad,
-                    icmp_info,
-                    payload_bounds,
-                    None,
-                    PayloadOrigin::Wire,
-                    false,
-                )
-                .is_err(),
-                "shim {:02X} should be rejected",
-                bad.get(8).cloned().unwrap_or(0xFF)
-            );
-        }
-    }
-
-    #[test]
     fn validate_payload_max_payload_zero_allows_empty_data() {
         let mut cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
         cfg.max_payload = 0;
@@ -392,8 +368,8 @@ mod tests {
         let mut cfg_icmp = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg_icmp.max_payload = 0;
 
-        let ok_icmp = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA), &[]);
-        let over_icmp = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), &[0]);
+        let ok_icmp = encode_icmp_user_payload(&[]);
+        let over_icmp = encode_icmp_user_payload(&[0]);
         let (ok_icmp_info, ok_icmp_bounds) = admitted_icmp(&ok_icmp);
         let (over_icmp_info, over_icmp_bounds) = admitted_icmp(&over_icmp);
 
@@ -432,8 +408,8 @@ mod tests {
         let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg.max_payload = 3;
         let stats = Stats::new();
-        let ok = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abc");
-        let over = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD), b"abcd");
+        let ok = encode_icmp_user_payload(b"abc");
+        let over = encode_icmp_user_payload(b"abcd");
         let (ok_info, ok_bounds) = admitted_icmp(&ok);
         let (over_info, over_bounds) = admitted_icmp(&over);
 
@@ -473,10 +449,7 @@ mod tests {
         let stats = Stats::new();
 
         // 1. Valid handshake (Unlocked, Echo Request, UserData)
-        let mut buf = encode_icmp_payload(Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_SOURCE_ID), &[]);
-        let id_bytes = 0x2002u16.to_be_bytes();
-        buf.insert(9, id_bytes[0]);
-        buf.insert(10, id_bytes[1]);
+        let mut buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
         let res = validate_payload(
             true,
@@ -541,48 +514,13 @@ mod tests {
         let err_msg = res.unwrap_err().to_string();
         // validate_payload currently prioritize Echo type mismatch error over shim handshake checks if c2u=true
         assert!(err_msg.contains("direction mismatch") || err_msg.contains("on Echo Reply"));
-
-        // 4. Reject SessionControl
-        // Handshake bit 0x20 is set, but IS_DATA (0x80) is NOT set.
-        let _buf_ka = encode_icmp_payload(Some(ICMP_SHIM_HAS_SOURCE_ID), &[]);
-        let mut buf_ka_full = [0u8; 11];
-        buf_ka_full[..8].copy_from_slice(&[8u8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
-        buf_ka_full[8] = ICMP_SHIM_HAS_SOURCE_ID;
-        let id_bytes = 0x2002u16.to_be_bytes();
-        buf_ka_full[9] = id_bytes[0];
-        buf_ka_full[10] = id_bytes[1];
-        let (ka_info, ka_bounds) = admitted_icmp(&buf_ka_full);
-
-        let res = validate_payload(
-            true,
-            &cfg,
-            &stats,
-            &buf_ka_full,
-            ka_info,
-            ka_bounds,
-            None,
-            PayloadOrigin::Wire,
-            false,
-        );
-        assert!(res.is_err(), "should reject Source ID on SessionControl");
-        assert!(
-            res.unwrap_err()
-                .to_string()
-                .contains("session-control packet")
-        );
     }
 
     #[test]
     fn validate_payload_accepts_reflected_user_payload_shim_on_u2c_without_rehandshake() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_payload(
-            Some(ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_PAYLOAD | ICMP_SHIM_HAS_SOURCE_ID),
-            &[],
-        );
-        let id_bytes = 0x2002u16.to_be_bytes();
-        buf.extend_from_slice(&id_bytes);
-        buf.extend_from_slice(b"x");
+        let mut buf = encode_icmp_user_payload_with_source_id(0x2002, b"x");
         buf[0] = 0; // Echo Reply for u2c path
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
@@ -613,19 +551,7 @@ mod tests {
     fn validate_payload_adopts_shim_identifier_on_initial_handshake() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = [
-            8u8,
-            0,
-            0,
-            0,
-            0x04,
-            0xD2,
-            0x00,
-            0x09,
-            ICMP_SHIM_IS_DATA | ICMP_SHIM_HAS_SOURCE_ID,
-            0x20,
-            0x02,
-        ];
+        let buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(

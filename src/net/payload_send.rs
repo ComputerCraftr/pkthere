@@ -1,9 +1,10 @@
 use super::PayloadEvent;
 use crate::cli::SupportedProtocol;
 use crate::net::checksum::{checksum16, checksum16_parts};
-use crate::net::payload_support::{
-    DEST_ADDR_REQUIRED, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_HAS_SOURCE_ID, ICMP_SHIM_IS_DATA,
+use crate::net::framing_shim::{
+    ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, encode_icmp_tunnel_prefix,
 };
+use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 use socket2::{SockAddr, Socket, Type};
 use std::io;
 
@@ -143,29 +144,30 @@ fn send_icmp_echo(
     hdr[6] = sqb[0];
     hdr[7] = sqb[1];
 
-    let mut shim_storage = [0u8; 3];
+    let mut shim_storage = [0u8; ICMP_TUNNEL_SHIM_MAX_LEN];
     let (prefix, payload): (&[u8], &[u8]) = match event {
         PayloadEvent::UserPayload { data, .. } => {
-            let shim_len = if let Some(src_id) = meta.source_id_shim {
-                let idb = src_id.to_be_bytes();
-                shim_storage[0] = ICMP_SHIM_IS_DATA
-                    | (((!data.bytes.is_empty()) as u8) * ICMP_SHIM_HAS_PAYLOAD)
-                    | ICMP_SHIM_HAS_SOURCE_ID;
-                shim_storage[1] = idb[0];
-                shim_storage[2] = idb[1];
-                3
-            } else {
-                shim_storage[0] =
-                    ICMP_SHIM_IS_DATA | (((!data.bytes.is_empty()) as u8) * ICMP_SHIM_HAS_PAYLOAD);
-                1
-            };
-            (&shim_storage[..shim_len], data.bytes)
+            let prefix = encode_icmp_tunnel_prefix(
+                IcmpTunnelFrameKind::UserPayload,
+                meta.source_id_shim,
+                data.bytes.len(),
+                &mut shim_storage,
+            )?;
+            (prefix, data.bytes)
         }
-        PayloadEvent::SessionControl { .. } => {
-            shim_storage[0] = 0;
-            (&shim_storage[..1], &[])
-        }
-        PayloadEvent::CadencePacket { .. } => (&[], &[]),
+        PayloadEvent::SessionControl { .. } => (
+            encode_icmp_tunnel_prefix(
+                IcmpTunnelFrameKind::SessionControl,
+                None,
+                0,
+                &mut shim_storage,
+            )?,
+            &[],
+        ),
+        PayloadEvent::CadencePacket { .. } => (
+            encode_icmp_tunnel_prefix(IcmpTunnelFrameKind::Cadence, None, 0, &mut shim_storage)?,
+            &[],
+        ),
     };
 
     let cksum = match (dest_sa, sock_type) {

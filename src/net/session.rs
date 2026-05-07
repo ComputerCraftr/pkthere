@@ -1,8 +1,8 @@
 use crate::cli::RuntimeConfig;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::PayloadEvent;
-use crate::net::payload_support::DEST_ADDR_REQUIRED;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
+use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 use crate::stats::StatsSink;
 use socket2::SockAddr;
 

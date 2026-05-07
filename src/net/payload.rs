@@ -1,8 +1,5 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::net::byte_order::be16_16;
-use crate::net::payload_support::{
-    ICMP_SHIM_ALLOWED_BITS, ICMP_SHIM_HAS_PAYLOAD, ICMP_SHIM_HAS_SOURCE_ID, ICMP_SHIM_IS_DATA,
-};
+use crate::net::framing_shim::{IcmpTunnelFrame, parse_icmp_tunnel_frame};
 use crate::stats::StatsSink;
 
 use std::io;
@@ -155,64 +152,21 @@ fn decode_icmp_tunnel_payload<'a>(
     seq: u16,
     payload: &'a [u8],
 ) -> io::Result<PayloadEvent<'a>> {
-    if payload.is_empty() {
-        return Ok(PayloadEvent::cadence_packet(ident, seq));
-    }
-
-    let shim = payload[0];
-    if (shim & !ICMP_SHIM_ALLOWED_BITS) != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid ICMP tunnel shim header",
-        ));
-    }
-
-    let has_source_id = (shim & ICMP_SHIM_HAS_SOURCE_ID) != 0;
-    if has_source_id && payload.len() < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMP tunnel shim has source ID flag but payload is too short",
-        ));
-    }
-
-    let (shim_src_ident, user_payload) = if has_source_id {
-        let id = be16_16(payload[1], payload[2]);
-        (Some(id), &payload[3..])
-    } else {
-        (None, &payload[1..])
-    };
-
-    let is_data = (shim & ICMP_SHIM_IS_DATA) != 0;
-    let has_user_payload = (shim & ICMP_SHIM_HAS_PAYLOAD) != 0;
-
-    // Normal tunnel packets MUST have a valid shim.
-    // Zero-length user data has IS_DATA set but HAS_PAYLOAD unset.
-    // Session-control packets have IS_DATA unset.
-    match (is_data, has_user_payload, user_payload.is_empty()) {
-        (true, true, false) => Ok(PayloadEvent::user_payload(
+    match parse_icmp_tunnel_frame(payload)? {
+        IcmpTunnelFrame::Cadence => Ok(PayloadEvent::cadence_packet(ident, seq)),
+        IcmpTunnelFrame::UserPayload { bytes, source_id } => Ok(PayloadEvent::user_payload(
             ident,
             seq,
             SupportedProtocol::UDP,
-            user_payload,
-            shim_src_ident,
+            bytes,
+            source_id,
         )),
-        (true, false, true) => Ok(PayloadEvent::user_payload(
-            ident,
-            seq,
-            SupportedProtocol::UDP,
-            &[],
-            shim_src_ident,
-        )),
-        (false, false, true) => Ok(PayloadEvent::session_control(
+        IcmpTunnelFrame::SessionControl => Ok(PayloadEvent::session_control(
             ident,
             seq,
             SupportedProtocol::ICMP,
             &[],
-            shim_src_ident,
-        )),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ICMP tunnel shim payload flags mismatch",
+            None,
         )),
     }
 }
