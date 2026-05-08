@@ -1,4 +1,4 @@
-use crate::cli::{ListenMode, RuntimeConfig, SupportedProtocol};
+use crate::cli::RuntimeConfig;
 use crate::net::params::CanonicalAddr;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use socket2::{SockAddr, Type};
@@ -16,27 +16,11 @@ pub(crate) struct CachedClientState {
     worker_id: usize,
     pub(crate) dest_sock_type: Type,
     pub(crate) route: CachedSendRoute,
-    pub(crate) recv_icmp_local_id: Option<u16>,
     pub(crate) session_control_reply_route: Option<CachedSendRoute>,
     log_handles: bool,
 }
 
 impl CachedClientState {
-    #[inline]
-    fn resolve_client_recv_icmp_local_id(
-        cfg: &RuntimeConfig,
-        handles: &SocketHandles,
-    ) -> Option<u16> {
-        if cfg.listen_proto != SupportedProtocol::ICMP {
-            None
-        } else {
-            match cfg.listen_mode {
-                ListenMode::Fixed => Some(cfg.listen.id),
-                ListenMode::Dynamic => handles.listener_recv_icmp_local_id,
-            }
-        }
-    }
-
     #[inline]
     fn build_send_route(
         _c2u: bool,
@@ -64,22 +48,14 @@ impl CachedClientState {
 
     #[inline]
     fn maybe_build_session_control_reply_route(handles: &SocketHandles) -> Option<CachedSendRoute> {
-        let dest = handles.client_remote.map(|peer| {
-            CanonicalAddr::new(
-                peer.addr,
-                handles
-                    .locked_flow
-                    .and_then(|flow| flow.icmp_ident())
-                    .unwrap_or(peer.id),
-            )
-        })?;
+        let dest = handles.listener_flow.outbound_destination()?;
         Some(Self::build_local_session_control_reply_route(handles, dest))
     }
 
     pub(crate) fn new(
         c2u: bool,
         worker_id: usize,
-        cfg: &RuntimeConfig,
+        _cfg: &RuntimeConfig,
         handles: &SocketHandles,
         log_handles: bool,
     ) -> Self {
@@ -88,40 +64,57 @@ impl CachedClientState {
                 c2u,
                 worker_id,
                 dest_sock_type: handles.upstream_sock_type,
-                route: Self::build_send_route(c2u, handles, handles.upstream_remote_filter),
-                recv_icmp_local_id: Self::resolve_client_recv_icmp_local_id(cfg, handles),
+                route: Self::build_send_route(
+                    c2u,
+                    handles,
+                    handles
+                        .upstream_flow
+                        .outbound_destination()
+                        .unwrap_or(handles.upstream_remote_filter),
+                ),
                 session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
         } else {
-            let remote = handles.client_remote.unwrap_or_else(|| {
-                CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), 0)
-            });
+            let remote = handles
+                .listener_flow
+                .outbound_destination()
+                .unwrap_or_else(|| {
+                    CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), 0)
+                });
             Self {
                 c2u,
                 worker_id,
                 dest_sock_type: handles.listen_sock_type,
                 route: Self::build_send_route(c2u, handles, remote),
-                recv_icmp_local_id: Self::resolve_client_recv_icmp_local_id(cfg, handles),
                 session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
                 log_handles,
             }
         }
     }
 
-    pub(crate) fn refresh_from_handles(&mut self, cfg: &RuntimeConfig, handles: &SocketHandles) {
+    pub(crate) fn refresh_from_handles(&mut self, _cfg: &RuntimeConfig, handles: &SocketHandles) {
         if self.c2u {
             self.dest_sock_type = handles.upstream_sock_type;
-            self.route = Self::build_send_route(self.c2u, handles, handles.upstream_remote_filter);
+            self.route = Self::build_send_route(
+                self.c2u,
+                handles,
+                handles
+                    .upstream_flow
+                    .outbound_destination()
+                    .unwrap_or(handles.upstream_remote_filter),
+            );
         } else {
             self.dest_sock_type = handles.listen_sock_type;
             self.route = Self::build_send_route(
                 self.c2u,
                 handles,
-                handles.client_remote.unwrap_or(self.route.dest),
+                handles
+                    .listener_flow
+                    .outbound_destination()
+                    .unwrap_or(self.route.dest),
             );
         }
-        self.recv_icmp_local_id = Self::resolve_client_recv_icmp_local_id(cfg, handles);
         self.session_control_reply_route = Self::maybe_build_session_control_reply_route(handles);
     }
 
@@ -140,10 +133,11 @@ impl CachedClientState {
                 self.log_handles,
                 self.worker_id,
                 self.c2u,
-                "refresh_handles_and_cache: stale={}, new_ver={}, client_remote={:?}, listener_connected={}, upstream_remote_filter={}, upstream_connected={}",
+                "refresh_handles_and_cache: stale={}, new_ver={}, listener_flow={:?}, listen_kernel={}, listener_connected={}, upstream_remote_filter={}, upstream_connected={}",
                 prev_ver,
                 handles.version,
-                handles.client_remote,
+                handles.listener_flow,
+                handles.listen_local_kernel,
                 handles.listener_connected,
                 handles.upstream_remote_filter,
                 handles.upstream_connected
@@ -154,12 +148,12 @@ impl CachedClientState {
 
 #[cfg(test)]
 mod tests {
-    use super::{CachedClientState, ListenMode, SocketHandles};
+    use super::{CachedClientState, SocketHandles};
     use crate::cli::{
-        DebugBehavior, DebugLogs, ReresolveMode, RuntimeConfig, SupportedProtocol, TimeoutAction,
-        WorkerFlowMode,
+        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
+        TimeoutAction, WorkerFlowMode,
     };
-    use crate::flow_key::ClientFlowKey;
+    use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
     use crate::net::params::CanonicalAddr;
     use socket2::{Socket, Type};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -206,21 +200,37 @@ mod tests {
     }
 
     fn test_handles() -> SocketHandles {
+        let upstream_local =
+            CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777), 7777);
+        let upstream_remote =
+            CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999), 9999);
+        let upstream_flow = SocketLegFlow::new(
+            Some(FlowTuple::new(
+                FlowEndpoint::from_canonical(upstream_remote),
+                FlowEndpoint::from_canonical(upstream_local),
+            )),
+            Some(FlowTuple::new(
+                FlowEndpoint::from_canonical(upstream_local),
+                FlowEndpoint::from_canonical(upstream_remote),
+            )),
+        );
         SocketHandles {
             locked_flow: None,
-            client_remote: None,
-            listener_recv_icmp_local_id: None,
+            listener_flow: SocketLegFlow::empty(),
+            listen_local_filter: CanonicalAddr::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
+                8888,
+            ),
+            listen_local_kernel: CanonicalAddr::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
+                8888,
+            ),
             listener_connected: false,
             client_sock: udp_socket_clone(),
             listen_sock_type: Type::DGRAM,
-            upstream_remote_filter: CanonicalAddr::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
-                9999,
-            ),
-            upstream_local_filter: CanonicalAddr::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
-                7777,
-            ),
+            upstream_remote_filter: upstream_remote,
+            upstream_local_filter: upstream_local,
+            upstream_flow,
             upstream_sock_type: Type::DGRAM,
             upstream_connected: true,
             upstream_sock: udp_socket_clone(),
@@ -254,30 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn cached_recv_icmp_local_id_tracks_locked_listener_receive_id_not_flow_id() {
-        let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        cfg.listen_mode = ListenMode::Dynamic;
-        let mut handles = test_handles();
-        handles.locked_flow = Some(ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::LOCALHOST,
-            ident: 12345,
-        });
-        handles.listener_recv_icmp_local_id = Some(77);
-
-        assert_eq!(
-            CachedClientState::resolve_client_recv_icmp_local_id(&cfg, &handles),
-            Some(77)
-        );
-    }
-
-    #[test]
-    fn cached_session_control_reply_route_is_built_from_locked_client_remote() {
+    fn cached_session_control_reply_route_is_built_from_listener_outbound_tuple() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
         let mut handles = test_handles();
-        handles.client_remote = Some(CanonicalAddr::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555),
-            5555,
-        ));
+        let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
+        let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
+        handles.listener_flow = SocketLegFlow::new(
+            Some(FlowTuple::new(remote, local)),
+            Some(FlowTuple::new(local, remote)),
+        );
         handles.locked_flow = Some(ClientFlowKey::Udp(SocketAddr::V4(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
             5555,
@@ -311,10 +306,12 @@ mod tests {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let mut handles = test_handles();
         handles.listen_sock_type = Type::RAW;
-        handles.client_remote = Some(CanonicalAddr::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
-            12345,
-        ));
+        let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
+        let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        handles.listener_flow = SocketLegFlow::new(
+            Some(FlowTuple::new(remote, local)),
+            Some(FlowTuple::new(local, remote)),
+        );
         let cache = CachedClientState::new(false, 0, &cfg, &handles, false);
         assert_eq!(cache.route.icmp_header_id, 12345);
     }

@@ -609,9 +609,7 @@ fn test_raw_icmp_independent_ids() {
     );
 
     let worker_b = worker_flow::locked_worker_flow(&stats_b);
-    let client_remote_b = worker_b["client_remote_canonical"]
-        .as_str()
-        .expect("client_remote_canonical");
+    let client_remote_b = worker_flow::listener_outbound_remote(worker_b);
     let upstream_remote_b = worker_b["upstream_remote_filter_canonical"]
         .as_str()
         .expect("upstream_remote_filter_canonical");

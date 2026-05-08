@@ -287,8 +287,9 @@ fn single_client_forwarding_case(case: MatrixCase<'_>, payload: &[u8]) {
         COUNT as u64
     );
 
-    let stats_client =
-        json_addr(&worker["client_remote_canonical"]).expect("parse stats client_remote_canonical");
+    let stats_client = worker_flow::listener_outbound_remote(worker)
+        .parse::<SocketAddr>()
+        .expect("parse stats listener_flow_outbound remote");
     assert_eq!(stats_client, client_local, "stats client_remote mismatch");
     let actual_upstream = worker["upstream_remote_filter_canonical"]
         .as_str()
@@ -468,8 +469,9 @@ fn relock_after_timeout_drop_ipv4_case(case: MatrixCase<'_>) {
     drop(session.child.kill());
 
     let stats_client =
-        json_addr(&worker_flow::locked_worker_flow(&stats)["client_remote_canonical"])
-            .expect("parse stats client_remote_canonical");
+        worker_flow::listener_outbound_remote(worker_flow::locked_worker_flow(&stats))
+            .parse::<SocketAddr>()
+            .expect("parse stats listener_flow_outbound remote");
     assert_eq!(
         stats_client, client_b_local,
         "forwarder did not relock to client B"
@@ -544,8 +546,9 @@ fn timeout_drop_relocks_after_forward_errors_udp_ipv4_case(case: MatrixCase<'_>)
         },
     );
     assert_eq!(
-        json_addr(&worker_flow::locked_worker_flow(&stats)["client_remote_canonical"])
-            .expect("stats client remote"),
+        worker_flow::listener_outbound_remote(worker_flow::locked_worker_flow(&stats))
+            .parse::<SocketAddr>()
+            .expect("stats listener outbound remote"),
         client_a.local_addr().expect("client A local addr")
     );
 

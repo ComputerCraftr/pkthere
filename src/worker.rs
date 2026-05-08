@@ -170,8 +170,7 @@ pub(crate) fn run_upstream_to_client_thread(
                                 cfg,
                                 SocketPeerRole::Upstream,
                                 rejected,
-                                upstream_admission.expected_remote,
-                                upstream_admission.expected_local_icmp_id,
+                                upstream_admission,
                             );
                             continue;
                         }
@@ -376,11 +375,10 @@ pub(crate) fn run_client_to_upstream_thread(
                     cfg,
                     &handles,
                     if locked_now {
-                        handles.client_remote
+                        handles.listener_flow.inbound
                     } else {
                         None
                     },
-                    cache.recv_icmp_local_id,
                 );
 
                 match recv_packet(
@@ -405,8 +403,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                     cfg,
                                     SocketPeerRole::Client,
                                     rejected,
-                                    client_admission.expected_remote,
-                                    client_admission.expected_local_icmp_id,
+                                    client_admission,
                                 );
                                 continue;
                             }
@@ -471,8 +468,7 @@ pub(crate) fn run_client_to_upstream_thread(
                 continue;
             }
 
-            let client_admission =
-                client_admission_spec(cfg, &handles, None, cache.recv_icmp_local_id);
+            let client_admission = client_admission_spec(cfg, &handles, None);
             match recv_packet(
                 &handles.client_sock,
                 handles.listener_connected,
@@ -493,8 +489,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                     cfg,
                                     SocketPeerRole::Client,
                                     rejected,
-                                    client_admission.expected_remote,
-                                    client_admission.expected_local_icmp_id,
+                                    client_admission,
                                 );
                                 continue;
                             }
@@ -636,12 +631,8 @@ pub(crate) fn run_client_to_upstream_thread(
                 if !readable {
                     continue;
                 }
-                let client_admission = client_admission_spec(
-                    cfg,
-                    &handles,
-                    handles.client_remote,
-                    cache.recv_icmp_local_id,
-                );
+                let client_admission =
+                    client_admission_spec(cfg, &handles, handles.listener_flow.inbound);
                 match recv_packet(
                     &handles.client_sock,
                     handles.listener_connected,
@@ -664,8 +655,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                     cfg,
                                     SocketPeerRole::Client,
                                     rejected,
-                                    client_admission.expected_remote,
-                                    client_admission.expected_local_icmp_id,
+                                    client_admission,
                                 );
                                 continue;
                             }
@@ -742,11 +732,10 @@ pub(crate) fn run_client_to_upstream_thread(
                 cfg,
                 &handles,
                 if flow_state.is_locked() {
-                    handles.client_remote
+                    handles.listener_flow.inbound
                 } else {
                     None
                 },
-                cache.recv_icmp_local_id,
             );
             match recv_packet(
                 &handles.client_sock,
@@ -768,8 +757,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                     cfg,
                                     SocketPeerRole::Client,
                                     rejected,
-                                    client_admission.expected_remote,
-                                    client_admission.expected_local_icmp_id,
+                                    client_admission,
                                 );
                                 continue;
                             }
@@ -805,7 +793,13 @@ pub(crate) fn run_client_to_upstream_thread(
                             C2U,
                             "validate_payload error: {}"
                         );
-                        let Some(flow) = FlowKey::from_validated_c2u(src, cfg.listen_proto, &event)
+                        let Some((flow, listener_flow)) =
+                            FlowKey::locked_listener_flow_from_validated_c2u(
+                                src,
+                                handles.listen_local_filter,
+                                cfg.listen_proto,
+                                &event,
+                            )
                         else {
                             continue;
                         };
@@ -820,10 +814,10 @@ pub(crate) fn run_client_to_upstream_thread(
                         reset_session(cfg, sync_state, &mut sync_cache);
                         flow_state.set_locked(true);
                         was_locked = true;
-                        let listener_recv_icmp_local_id =
-                            admitted.icmp_info.map(|icmp| icmp.ident);
-                        let peer_addr = Some(src);
-                        let src_sa = src.as_sock_addr();
+                        let src_sa = listener_flow
+                            .inbound
+                            .map(|flow| flow.src.canonical().as_sock_addr())
+                            .unwrap_or_else(|| src.as_sock_addr());
                         handles.listener_connected = false;
                         if cfg.debug_behavior.client_unconnected {
                             log_info!("Locked to single client {} (not connected)", src);
@@ -836,12 +830,11 @@ pub(crate) fn run_client_to_upstream_thread(
                         }
                         handles.version = sock_mgr.set_listener_remote_connected(
                             Some(flow),
-                            peer_addr,
-                            listener_recv_icmp_local_id,
+                            listener_flow,
                             handles.listener_connected,
                             handles.version,
                         );
-                        handles.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
+                        handles.listener_flow = listener_flow;
                         log_debug_dir!(
                             cfg.debug_logs.handles,
                             worker_id,
@@ -856,8 +849,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 if !std::ptr::eq(mgr.as_ref(), sock_mgr) {
                                     let _ = mgr.set_client_sock_connected(
                                         Some(flow),
-                                        peer_addr,
-                                        listener_recv_icmp_local_id,
+                                        listener_flow,
                                         handles.listener_connected,
                                         &src_sa,
                                         0,

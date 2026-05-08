@@ -43,7 +43,7 @@ pub fn assert_socket_matrix_state(
 
 fn assert_identity_fields(worker: &serde_json::Value, case_desc: &str) {
     for field in [
-        "client_remote_canonical",
+        "listener_flow_outbound",
         "listen_local_filter_canonical",
         "listen_local_kernel_canonical",
         "upstream_remote_filter_canonical",

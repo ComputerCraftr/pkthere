@@ -116,7 +116,10 @@ pub(crate) fn send_sync_payload_or_cadence(
             &[],
             None,
             (0, 0),
-            handles.client_remote.map(|peer_addr| peer_addr.id),
+            handles
+                .listener_flow
+                .outbound_destination()
+                .map(|peer_addr| peer_addr.id),
             PayloadOrigin::SyntheticCadencePacket,
             true,
         )

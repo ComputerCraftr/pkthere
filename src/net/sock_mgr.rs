@@ -1,5 +1,5 @@
 use crate::cli::{SupportedProtocol, TimeoutAction};
-use crate::flow_key::ClientFlowKey;
+use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
 use crate::net::params::CanonicalAddr;
 use crate::net::socket::{
     disconnect_socket, family_changed, make_socket, make_upstream_socket_for, resolve_first,
@@ -15,13 +15,15 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
 /// Snapshot of sockets and destination used by worker threads.
 pub(crate) struct SocketHandles {
     pub locked_flow: Option<ClientFlowKey>,
-    pub client_remote: Option<CanonicalAddr>,
-    pub listener_recv_icmp_local_id: Option<u16>,
+    pub listener_flow: SocketLegFlow,
+    pub listen_local_filter: CanonicalAddr,
+    pub listen_local_kernel: CanonicalAddr,
     pub listener_connected: bool,
     pub client_sock: Socket,
     pub listen_sock_type: Type,
     pub upstream_remote_filter: CanonicalAddr,
     pub upstream_local_filter: CanonicalAddr,
+    pub upstream_flow: SocketLegFlow,
     pub upstream_sock_type: Type,
     pub upstream_connected: bool,
     pub upstream_sock: Socket,
@@ -31,7 +33,7 @@ pub(crate) struct SocketHandles {
 #[derive(Clone, Copy)]
 pub(crate) struct SocketStateSnapshot {
     pub locked_flow: Option<ClientFlowKey>,
-    pub client_remote: Option<CanonicalAddr>,
+    pub listener_flow: SocketLegFlow,
     pub listener_connected: bool,
     pub client_proto: SupportedProtocol,
     pub listen_local_filter: CanonicalAddr,
@@ -41,6 +43,7 @@ pub(crate) struct SocketStateSnapshot {
     pub upstream_remote_filter: CanonicalAddr,
     pub upstream_local_filter: CanonicalAddr,
     pub upstream_local_kernel: CanonicalAddr,
+    pub upstream_flow: SocketLegFlow,
     pub upstream_connected: bool,
     pub upstream_proto: SupportedProtocol,
     pub upstream_sock_type: Type,
@@ -51,8 +54,7 @@ struct ClientListenState {
     listen_local_filter: CanonicalAddr,
     listen_local_kernel: CanonicalAddr,
     flow: Option<ClientFlowKey>,
-    client_remote: Option<CanonicalAddr>,
-    listener_recv_icmp_local_id: Option<u16>,
+    listener_flow: SocketLegFlow,
     listener_connected: bool,
     sock: Socket,
     sock_type: Type,
@@ -63,6 +65,7 @@ struct UpstreamState {
     upstream_remote_filter: CanonicalAddr,
     upstream_local_filter: CanonicalAddr,
     upstream_local_kernel: CanonicalAddr,
+    upstream_flow: SocketLegFlow,
     upstream_connected: bool,
     sock: Socket,
     sock_type: Type,
@@ -75,6 +78,16 @@ enum ReresolveAction {
     UpdateMetadataOnly,
     ReconnectInPlace,
     ReplaceSocket,
+}
+
+#[inline]
+fn bidirectional_leg_flow(local: CanonicalAddr, remote: CanonicalAddr) -> SocketLegFlow {
+    let local = FlowEndpoint::from_canonical(local);
+    let remote = FlowEndpoint::from_canonical(remote);
+    SocketLegFlow::new(
+        Some(FlowTuple::new(remote, local)),
+        Some(FlowTuple::new(local, remote)),
+    )
 }
 
 #[inline]
@@ -180,8 +193,7 @@ impl SocketManager {
                 listen_local_filter,
                 listen_local_kernel,
                 flow: None,
-                client_remote: None,
-                listener_recv_icmp_local_id: None,
+                listener_flow: SocketLegFlow::empty(),
                 listener_connected: listen_capability.starts_connected(),
                 sock: client_sock,
                 sock_type: listen_sock_type,
@@ -194,6 +206,7 @@ impl SocketManager {
                 upstream_remote_filter: upstream_remote,
                 upstream_local_filter: upstream_local,
                 upstream_local_kernel,
+                upstream_flow: bidirectional_leg_flow(upstream_local, upstream_remote),
                 upstream_connected: upstream_capability.starts_connected(),
                 sock,
                 sock_type: upstream_sock_type,
@@ -240,15 +253,13 @@ impl SocketManager {
     pub fn set_listener_remote_connected(
         &self,
         flow: Option<ClientFlowKey>,
-        client_remote: Option<CanonicalAddr>,
-        listener_recv_icmp_local_id: Option<u16>,
+        listener_flow: SocketLegFlow,
         listener_connected: bool,
         prev_ver: u64,
     ) -> u64 {
         let mut cl_guard = self.client_listen.lock().unwrap();
         cl_guard.flow = flow;
-        cl_guard.client_remote = client_remote;
-        cl_guard.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
+        cl_guard.listener_flow = listener_flow;
         cl_guard.listener_connected = listener_connected;
         self.publish_version(true);
         prev_ver + 1
@@ -259,16 +270,14 @@ impl SocketManager {
     pub fn set_client_sock_connected(
         &self,
         flow: Option<ClientFlowKey>,
-        client_remote: Option<CanonicalAddr>,
-        listener_recv_icmp_local_id: Option<u16>,
+        listener_flow: SocketLegFlow,
         listener_connected: bool,
         client_sa: &SockAddr,
         prev_ver: u64,
     ) -> io::Result<u64> {
         let mut cl_guard = self.client_listen.lock().unwrap();
         cl_guard.flow = flow;
-        cl_guard.client_remote = client_remote;
-        cl_guard.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
+        cl_guard.listener_flow = listener_flow;
         cl_guard.listener_connected = listener_connected;
         self.publish_version(true);
         if listener_connected {
@@ -282,15 +291,13 @@ impl SocketManager {
     pub fn set_client_sock_disconnected(
         &self,
         flow: Option<ClientFlowKey>,
-        client_remote: Option<CanonicalAddr>,
-        listener_recv_icmp_local_id: Option<u16>,
+        listener_flow: SocketLegFlow,
         listener_connected: bool,
         prev_ver: u64,
     ) -> io::Result<u64> {
         let mut cl_guard = self.client_listen.lock().unwrap();
         cl_guard.flow = flow;
-        cl_guard.client_remote = client_remote;
-        cl_guard.listener_recv_icmp_local_id = listener_recv_icmp_local_id;
+        cl_guard.listener_flow = listener_flow;
         cl_guard.listener_connected = listener_connected;
         self.publish_version(true);
         if !listener_connected {
@@ -303,9 +310,9 @@ impl SocketManager {
     #[inline]
     pub fn clear_client_lock(&self, prev_ver: u64) -> io::Result<u64> {
         if self.get_listener_connected() {
-            self.set_client_sock_disconnected(None, None, None, false, prev_ver)
+            self.set_client_sock_disconnected(None, SocketLegFlow::empty(), false, prev_ver)
         } else {
-            Ok(self.set_listener_remote_connected(None, None, None, false, prev_ver))
+            Ok(self.set_listener_remote_connected(None, SocketLegFlow::empty(), false, prev_ver))
         }
     }
 
@@ -339,7 +346,7 @@ impl SocketManager {
         let up = self.upstream_state.lock().unwrap();
         SocketStateSnapshot {
             locked_flow: cl.flow,
-            client_remote: cl.client_remote,
+            listener_flow: cl.listener_flow,
             listener_connected: cl.listener_connected,
             client_proto: self.listen_proto,
             listen_local_filter: cl.listen_local_filter,
@@ -349,6 +356,7 @@ impl SocketManager {
             upstream_remote_filter: up.upstream_remote_filter,
             upstream_local_filter: up.upstream_local_filter,
             upstream_local_kernel: up.upstream_local_kernel,
+            upstream_flow: up.upstream_flow,
             upstream_connected: up.upstream_connected,
             upstream_proto: self.upstream_proto,
             upstream_sock_type: up.sock_type,
@@ -398,6 +406,8 @@ impl SocketManager {
                     fresh
                 );
                 up_guard.upstream_remote_filter = fresh;
+                up_guard.upstream_flow =
+                    bidirectional_leg_flow(up_guard.upstream_local_filter, fresh);
                 Ok((
                     up_guard.sock.try_clone()?,
                     up_guard.upstream_remote_filter,
@@ -440,6 +450,8 @@ impl SocketManager {
                     up_guard.upstream_local_filter = upstream_local_filter;
                     up_guard.upstream_local_kernel = upstream_local_kernel;
                     up_guard.upstream_remote_filter = upstream_remote_filter;
+                    up_guard.upstream_flow =
+                        bidirectional_leg_flow(upstream_local_filter, upstream_remote_filter);
                     up_guard.upstream_connected = new_capability.starts_connected();
                     up_guard.sock = new_sock.try_clone()?;
                     up_guard.sock_type = new_type;
@@ -455,6 +467,8 @@ impl SocketManager {
                 }
 
                 up_guard.upstream_remote_filter = fresh;
+                up_guard.upstream_flow =
+                    bidirectional_leg_flow(up_guard.upstream_local_filter, fresh);
                 up_guard.upstream_connected = true;
                 Ok((
                     up_guard.sock.try_clone()?,
@@ -492,6 +506,8 @@ impl SocketManager {
                 up_guard.upstream_local_filter = upstream_local_filter;
                 up_guard.upstream_local_kernel = upstream_local_kernel;
                 up_guard.upstream_remote_filter = upstream_remote_filter;
+                up_guard.upstream_flow =
+                    bidirectional_leg_flow(upstream_local_filter, upstream_remote_filter);
                 up_guard.upstream_connected = new_capability.starts_connected();
                 up_guard.sock = new_sock.try_clone()?;
                 up_guard.sock_type = new_type;
@@ -514,7 +530,8 @@ impl SocketManager {
     ) -> io::Result<(
         Socket,
         Option<ClientFlowKey>,
-        Option<CanonicalAddr>,
+        SocketLegFlow,
+        CanonicalAddr,
         CanonicalAddr,
         Type,
         SocketReuseCapability,
@@ -530,7 +547,8 @@ impl SocketManager {
             ReresolveAction::NoChange => Ok((
                 cl_guard.sock.try_clone()?,
                 cl_guard.flow,
-                cl_guard.client_remote,
+                cl_guard.listener_flow,
+                cl_guard.listen_local_filter,
                 cl_guard.listen_local_kernel,
                 cl_guard.sock_type,
                 cl_guard.capability,
@@ -551,7 +569,7 @@ impl SocketManager {
                 cl_guard.listen_local_filter = local_canonical;
                 cl_guard.listen_local_kernel = listen_local_kernel;
                 cl_guard.flow = None;
-                cl_guard.client_remote = None;
+                cl_guard.listener_flow = SocketLegFlow::empty();
                 cl_guard.listener_connected = new_capability.starts_connected();
                 cl_guard.sock = new_sock.try_clone()?;
                 cl_guard.sock_type = new_type;
@@ -559,7 +577,8 @@ impl SocketManager {
                 Ok((
                     new_sock,
                     None,
-                    None,
+                    SocketLegFlow::empty(),
+                    local_canonical,
                     listen_local_kernel,
                     new_type,
                     new_capability,
@@ -586,9 +605,9 @@ impl SocketManager {
         let (
             client_sock,
             client_flow,
-            client_remote,
-            listener_recv_icmp_local_id,
-            _listen_local_kernel,
+            listener_flow,
+            listen_local_filter,
+            listen_local_kernel,
             listen_sock_type,
             listener_connected,
             _listen_capability,
@@ -599,20 +618,20 @@ impl SocketManager {
                 res.0,
                 res.1,
                 res.2,
-                None,
                 res.3,
                 res.4,
-                res.5.starts_connected(),
                 res.5,
+                res.6.starts_connected(),
                 res.6,
+                res.7,
             )
         } else {
             let cl = self.client_listen.lock().unwrap();
             (
                 cl.sock.try_clone()?,
                 cl.flow,
-                cl.client_remote,
-                cl.listener_recv_icmp_local_id,
+                cl.listener_flow,
+                cl.listen_local_filter,
                 cl.listen_local_kernel,
                 cl.sock_type,
                 cl.listener_connected,
@@ -625,6 +644,7 @@ impl SocketManager {
             upstream_sock,
             upstream_remote_filter,
             upstream_local_filter,
+            upstream_flow,
             _upstream_local_kernel,
             upstream_sock_type,
             upstream_connected,
@@ -636,6 +656,7 @@ impl SocketManager {
                 res.0,
                 res.1,
                 res.2,
+                bidirectional_leg_flow(res.2, res.1),
                 res.3,
                 res.4,
                 res.5.starts_connected(),
@@ -648,6 +669,7 @@ impl SocketManager {
                 up.sock.try_clone()?,
                 up.upstream_remote_filter,
                 up.upstream_local_filter,
+                up.upstream_flow,
                 up.upstream_local_kernel,
                 up.sock_type,
                 up.upstream_connected,
@@ -661,13 +683,15 @@ impl SocketManager {
 
         Ok(SocketHandles {
             locked_flow: client_flow,
-            client_remote,
-            listener_recv_icmp_local_id,
+            listener_flow,
+            listen_local_filter,
+            listen_local_kernel,
             listener_connected,
             client_sock,
             listen_sock_type,
             upstream_remote_filter,
             upstream_local_filter,
+            upstream_flow,
             upstream_sock_type,
             upstream_connected,
             upstream_sock,
@@ -686,13 +710,15 @@ impl SocketManager {
 
         SocketHandles {
             locked_flow: cl.flow,
-            client_remote: cl.client_remote,
-            listener_recv_icmp_local_id: cl.listener_recv_icmp_local_id,
+            listener_flow: cl.listener_flow,
+            listen_local_filter: cl.listen_local_filter,
+            listen_local_kernel: cl.listen_local_kernel,
             listener_connected: cl.listener_connected,
             client_sock: cl.sock.try_clone().expect("clone client socket"),
             listen_sock_type: cl.sock_type,
             upstream_remote_filter: up.upstream_remote_filter,
             upstream_local_filter: up.upstream_local_filter,
+            upstream_flow: up.upstream_flow,
             upstream_sock_type: up.sock_type,
             upstream_connected: up.upstream_connected,
             upstream_sock: up.sock.try_clone().expect("clone upstream socket"),
@@ -760,8 +786,7 @@ mod tests {
             thread::spawn(move || {
                 mgr.set_listener_remote_connected(
                     Some(ClientFlowKey::Udp(addr_a)),
-                    Some(CanonicalAddr::from_socket_addr(addr_a)),
-                    None,
+                    SocketLegFlow::empty(),
                     true,
                     v0,
                 )
@@ -772,8 +797,7 @@ mod tests {
             thread::spawn(move || {
                 mgr.set_listener_remote_connected(
                     Some(ClientFlowKey::Udp(addr_b)),
-                    Some(CanonicalAddr::from_socket_addr(addr_b)),
-                    None,
+                    SocketLegFlow::empty(),
                     false,
                     v0,
                 )
@@ -795,18 +819,15 @@ mod tests {
         let v0 = cached.version;
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33333);
-        let canonical = CanonicalAddr::from_socket_addr(addr);
         let _ = mgr.set_listener_remote_connected(
             Some(ClientFlowKey::Udp(addr)),
-            Some(canonical),
-            None,
+            SocketLegFlow::empty(),
             true,
             v0,
         );
         let _ = mgr.set_listener_remote_connected(
             Some(ClientFlowKey::Udp(addr)),
-            Some(canonical),
-            None,
+            SocketLegFlow::empty(),
             false,
             v0,
         );
@@ -835,7 +856,7 @@ mod tests {
         let mgr = make_mgr();
         let snapshot = mgr.snapshot_state();
 
-        assert_eq!(snapshot.client_remote, None);
+        assert_eq!(snapshot.listener_flow, SocketLegFlow::empty());
         assert_eq!(snapshot.listen_local_filter, mgr.get_listen_addr());
         assert_eq!(snapshot.upstream_remote_filter, mgr.get_upstream_dest().0);
         assert_eq!(

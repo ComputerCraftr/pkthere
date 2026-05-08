@@ -65,8 +65,7 @@ pub(crate) fn handle_send_result(
                 handles.listener_connected = false;
                 handles.version = match sock_mgr.set_client_sock_disconnected(
                     handles.locked_flow,
-                    handles.client_remote,
-                    handles.listener_recv_icmp_local_id,
+                    handles.listener_flow,
                     false,
                     prev_ver,
                 ) {

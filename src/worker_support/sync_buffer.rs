@@ -1,8 +1,6 @@
 use super::cache::{CachedClientState, CachedSendRoute};
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::flow_key::ClientFlowKey;
 use crate::flow_state::FlowRuntimeState;
-use crate::net::params::CanonicalAddr;
 use crate::net::payload::{
     IcmpPayloadMeta, OwnedPayloadData, PayloadData, PayloadEvent, outbound_payload_event,
     send_payload,
@@ -139,15 +137,7 @@ pub(crate) fn handle_c2u_session_control(
         Ok(C2uSessionControlDecision::Consume) => {}
         Ok(C2uSessionControlDecision::ReplyLocally) => {
             let reply_route = default_reply_route.cloned().or_else(|| {
-                let dest = handles.client_remote.map(|peer| {
-                    CanonicalAddr::new(
-                        peer.addr,
-                        handles
-                            .locked_flow
-                            .and_then(ClientFlowKey::icmp_ident)
-                            .unwrap_or(peer.id),
-                    )
-                })?;
+                let dest = handles.listener_flow.outbound_destination()?;
                 Some(CachedClientState::build_local_session_control_reply_route(
                     handles, dest,
                 ))
@@ -231,6 +221,7 @@ pub(crate) fn buffer_sync_event(
 mod tests {
     use super::{BufferedPayload, BufferedSyncUpdate};
     use crate::cli::SupportedProtocol;
+    use crate::flow_key::{FlowEndpoint, FlowTuple, SocketLegFlow};
     use crate::net::params::CanonicalAddr;
     use crate::net::payload::PayloadEvent;
     use crate::net::sock_mgr::SocketHandles;
@@ -246,21 +237,41 @@ mod tests {
     }
 
     fn test_handles() -> SocketHandles {
+        let upstream_remote = CanonicalAddr::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4444)),
+            4444,
+        );
+        let upstream_local = CanonicalAddr::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555)),
+            5555,
+        );
+        let upstream_flow = SocketLegFlow::new(
+            Some(FlowTuple::new(
+                FlowEndpoint::from_canonical(upstream_remote),
+                FlowEndpoint::from_canonical(upstream_local),
+            )),
+            Some(FlowTuple::new(
+                FlowEndpoint::from_canonical(upstream_local),
+                FlowEndpoint::from_canonical(upstream_remote),
+            )),
+        );
         SocketHandles {
             locked_flow: None,
-            client_remote: None,
-            listener_recv_icmp_local_id: None,
+            listener_flow: SocketLegFlow::empty(),
+            listen_local_filter: CanonicalAddr::new(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
+                3333,
+            ),
+            listen_local_kernel: CanonicalAddr::new(
+                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
+                3333,
+            ),
             listener_connected: false,
             client_sock: udp_socket_clone(),
             listen_sock_type: Type::DGRAM, // UDP sockets are always DGRAM
-            upstream_remote_filter: CanonicalAddr::new(
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4444)),
-                4444,
-            ),
-            upstream_local_filter: CanonicalAddr::new(
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555)),
-                5555,
-            ),
+            upstream_remote_filter: upstream_remote,
+            upstream_local_filter: upstream_local,
+            upstream_flow,
             upstream_sock_type: Type::DGRAM,
             upstream_connected: true,
             upstream_sock: udp_socket_clone(),

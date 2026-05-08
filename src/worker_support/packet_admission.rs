@@ -1,4 +1,5 @@
-use crate::cli::{RuntimeConfig, SupportedProtocol};
+use crate::cli::{ListenMode, RuntimeConfig, SupportedProtocol};
+use crate::flow_key::{FlowEndpoint, FlowTuple};
 use crate::net::packet_headers::{ParsedPacketHeaders, ParsedTransport, parse_packet_headers};
 use crate::net::params::CanonicalAddr;
 use crate::net::payload::IcmpAdmissionInfo;
@@ -42,9 +43,10 @@ pub(crate) fn log_rejected_packet(
     cfg: &RuntimeConfig,
     role: SocketPeerRole,
     rejected: RejectedPacket,
-    expected_remote: Option<CanonicalAddr>,
-    expected_local_id: Option<u16>,
+    spec: PacketAdmissionSpec,
 ) {
+    let expected_remote = spec.expected_remote();
+    let expected_local_id = spec.expected_local_icmp_id();
     let role_name = match role {
         SocketPeerRole::Client => "client",
         SocketPeerRole::Upstream => "upstream",
@@ -99,8 +101,26 @@ pub(crate) struct PacketAdmissionSpec {
     pub(crate) proto: SupportedProtocol,
     pub(crate) sock_type: Type,
     pub(crate) source_evidence: SourceEvidenceMode,
-    pub(crate) expected_remote: Option<CanonicalAddr>,
-    pub(crate) expected_local_icmp_id: Option<u16>,
+    pub(crate) expected_inbound: Option<FlowTuple>,
+    pub(crate) expected_local: Option<FlowEndpoint>,
+}
+
+impl PacketAdmissionSpec {
+    #[inline]
+    pub(crate) fn expected_remote(self) -> Option<CanonicalAddr> {
+        self.expected_inbound.map(|flow| flow.src.canonical())
+    }
+
+    #[inline]
+    pub(crate) const fn expected_local_icmp_id(self) -> Option<u16> {
+        match self.expected_inbound {
+            Some(flow) => Some(flow.dst.id),
+            None => match self.expected_local {
+                Some(endpoint) => Some(endpoint.id),
+                None => None,
+            },
+        }
+    }
 }
 
 #[inline]
@@ -117,8 +137,8 @@ pub(crate) fn upstream_admission_spec(
             handles.upstream_sock_type,
             handles.upstream_connected,
         ),
-        expected_remote: Some(handles.upstream_remote_filter),
-        expected_local_icmp_id: Some(handles.upstream_local_filter.id),
+        expected_inbound: handles.upstream_flow.inbound,
+        expected_local: handles.upstream_flow.inbound.map(|flow| flow.dst),
     }
 }
 
@@ -126,9 +146,19 @@ pub(crate) fn upstream_admission_spec(
 pub(crate) fn client_admission_spec(
     cfg: &RuntimeConfig,
     handles: &SocketHandles,
-    expected_remote: Option<CanonicalAddr>,
-    expected_local_icmp_id: Option<u16>,
+    expected_inbound: Option<FlowTuple>,
 ) -> PacketAdmissionSpec {
+    let expected_local = if cfg.listen_proto == SupportedProtocol::ICMP {
+        match (cfg.listen_mode, expected_inbound) {
+            (ListenMode::Fixed, _) => Some(
+                FlowEndpoint::from_canonical(handles.listen_local_filter).with_id(cfg.listen.id),
+            ),
+            (ListenMode::Dynamic, Some(flow)) => Some(flow.dst),
+            (ListenMode::Dynamic, None) => None,
+        }
+    } else {
+        None
+    };
     PacketAdmissionSpec {
         role: SocketPeerRole::Client,
         proto: cfg.listen_proto,
@@ -138,8 +168,8 @@ pub(crate) fn client_admission_spec(
             handles.listen_sock_type,
             handles.listener_connected,
         ),
-        expected_remote,
-        expected_local_icmp_id,
+        expected_inbound,
+        expected_local,
     }
 }
 
@@ -225,7 +255,7 @@ fn admit_udp_packet(
         });
     }
     if spec
-        .expected_remote
+        .expected_remote()
         .is_some_and(|expected| canonical != expected)
     {
         PacketAdmission::Filtered(RejectedPacket {
@@ -258,7 +288,7 @@ fn admit_icmp_packet(
     };
 
     if spec
-        .expected_local_icmp_id
+        .expected_local_icmp_id()
         .is_some_and(|expected| icmp.ident != expected)
     {
         return PacketAdmission::Filtered(RejectedPacket {
@@ -302,7 +332,7 @@ fn admit_icmp_packet(
     };
 
     if spec
-        .expected_remote
+        .expected_remote()
         .is_some_and(|expected| !icmp_remote_ip_matches(canonical, expected))
     {
         return PacketAdmission::Filtered(RejectedPacket {
@@ -369,6 +399,7 @@ mod tests {
         admit_packet,
     };
     use crate::cli::SupportedProtocol;
+    use crate::flow_key::{FlowEndpoint, FlowTuple};
     use crate::net::params::CanonicalAddr;
     use socket2::Type;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
@@ -413,19 +444,48 @@ mod tests {
         }
     }
 
+    fn admission_spec(
+        role: SocketPeerRole,
+        proto: SupportedProtocol,
+        sock_type: Type,
+        source_evidence: SourceEvidenceMode,
+        expected_remote: Option<CanonicalAddr>,
+        expected_local_icmp_id: Option<u16>,
+    ) -> PacketAdmissionSpec {
+        let expected_remote_endpoint = expected_remote.map(FlowEndpoint::from_canonical);
+        let expected_local = expected_local_icmp_id.map(|id| {
+            expected_remote_endpoint
+                .unwrap_or_else(|| FlowEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), id))
+                .with_id(id)
+        });
+        let expected_inbound = expected_remote_endpoint.map(|remote| {
+            let local = expected_local
+                .unwrap_or_else(|| FlowEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+            FlowTuple::new(remote, local)
+        });
+        PacketAdmissionSpec {
+            role,
+            proto,
+            sock_type,
+            source_evidence,
+            expected_inbound,
+            expected_local,
+        }
+    }
+
     #[test]
     fn udp_admission_requires_exact_remote_ip_and_port() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::UDP,
-            sock_type: Type::DGRAM,
-            source_evidence: SourceEvidenceMode::SocketSourceRequired,
-            expected_remote: Some(CanonicalAddr::from_socket_addr(SocketAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::UDP,
+            Type::DGRAM,
+            SourceEvidenceMode::SocketSourceRequired,
+            Some(CanonicalAddr::from_socket_addr(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 4444,
             ))),
-            expected_local_icmp_id: None,
-        };
+            None,
+        );
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444).into();
         assert!(matches!(
             admit_packet(spec, &[], Some(&source)),
@@ -440,17 +500,17 @@ mod tests {
 
     #[test]
     fn udp_unconnected_admission_rejects_missing_socket_source() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::UDP,
-            sock_type: Type::DGRAM,
-            source_evidence: SourceEvidenceMode::SocketSourceRequired,
-            expected_remote: Some(CanonicalAddr::from_socket_addr(SocketAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::UDP,
+            Type::DGRAM,
+            SourceEvidenceMode::SocketSourceRequired,
+            Some(CanonicalAddr::from_socket_addr(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 4444,
             ))),
-            expected_local_icmp_id: None,
-        };
+            None,
+        );
         assert!(matches!(
             admit_packet(spec, b"payload", None),
             PacketAdmission::Filtered(rej) if rej.reason == RejectionReason::MissingSourceEvidence
@@ -459,17 +519,17 @@ mod tests {
 
     #[test]
     fn udp_connected_admission_accepts_kernel_filtered_missing_socket_source() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::UDP,
-            sock_type: Type::DGRAM,
-            source_evidence: SourceEvidenceMode::ConnectedKernelFiltered,
-            expected_remote: Some(CanonicalAddr::from_socket_addr(SocketAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::UDP,
+            Type::DGRAM,
+            SourceEvidenceMode::ConnectedKernelFiltered,
+            Some(CanonicalAddr::from_socket_addr(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::LOCALHOST),
                 4444,
             ))),
-            expected_local_icmp_id: None,
-        };
+            None,
+        );
         assert!(matches!(
             admit_packet(spec, b"payload", None),
             PacketAdmission::Accepted(admitted)
@@ -480,17 +540,17 @@ mod tests {
 
     #[test]
     fn icmp_dgram_admission_requires_remote_ip_and_local_receive_id() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Client,
-            proto: SupportedProtocol::ICMP,
-            sock_type: Type::DGRAM,
-            source_evidence: SourceEvidenceMode::SocketSourceRequired,
-            expected_remote: Some(CanonicalAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Client,
+            SupportedProtocol::ICMP,
+            Type::DGRAM,
+            SourceEvidenceMode::SocketSourceRequired,
+            Some(CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0),
                 0x1234,
             )),
-            expected_local_icmp_id: Some(0x1234),
-        };
+            Some(0x1234),
+        );
         let packet = test_icmp_echo_packet(None, None, 0x1234, true);
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1).into();
         assert!(matches!(
@@ -511,17 +571,17 @@ mod tests {
 
     #[test]
     fn icmp_dgram_admission_rejects_missing_socket_source() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::ICMP,
-            sock_type: Type::DGRAM,
-            source_evidence: SourceEvidenceMode::SocketSourceRequired,
-            expected_remote: Some(CanonicalAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::ICMP,
+            Type::DGRAM,
+            SourceEvidenceMode::SocketSourceRequired,
+            Some(CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9)), 0),
                 0x1234,
             )),
-            expected_local_icmp_id: Some(0x1234),
-        };
+            Some(0x1234),
+        );
         let packet = test_icmp_echo_packet(None, None, 0x1234, false);
         assert!(matches!(
             admit_packet(spec, &packet, None),
@@ -531,17 +591,17 @@ mod tests {
 
     #[test]
     fn icmp_raw_admission_uses_packet_source_ip_not_socket_metadata() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::ICMP,
-            sock_type: Type::RAW,
-            source_evidence: SourceEvidenceMode::RawPacketSourceRequired,
-            expected_remote: Some(CanonicalAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::ICMP,
+            Type::RAW,
+            SourceEvidenceMode::RawPacketSourceRequired,
+            Some(CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0),
                 65410,
             )),
-            expected_local_icmp_id: Some(65410),
-        };
+            Some(65410),
+        );
         let packet = test_icmp_echo_packet(
             Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3))),
             Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
@@ -559,17 +619,17 @@ mod tests {
 
     #[test]
     fn icmp_raw_admission_rejects_missing_raw_packet_source() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::ICMP,
-            sock_type: Type::RAW,
-            source_evidence: SourceEvidenceMode::RawPacketSourceRequired,
-            expected_remote: Some(CanonicalAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::ICMP,
+            Type::RAW,
+            SourceEvidenceMode::RawPacketSourceRequired,
+            Some(CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0),
                 65410,
             )),
-            expected_local_icmp_id: Some(65410),
-        };
+            Some(65410),
+        );
         let packet_without_ip_header = test_icmp_echo_packet(None, None, 65410, false);
         let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0).into();
         assert!(matches!(
@@ -580,17 +640,17 @@ mod tests {
 
     #[test]
     fn icmp_raw_reflected_self_loop_is_rejected_by_remote_ip_check() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::ICMP,
-            sock_type: Type::RAW,
-            source_evidence: SourceEvidenceMode::RawPacketSourceRequired,
-            expected_remote: Some(CanonicalAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::ICMP,
+            Type::RAW,
+            SourceEvidenceMode::RawPacketSourceRequired,
+            Some(CanonicalAddr::new(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0),
                 65410,
             )),
-            expected_local_icmp_id: Some(65410),
-        };
+            Some(65410),
+        );
         let packet = test_icmp_echo_packet(
             Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
             Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
@@ -606,17 +666,17 @@ mod tests {
 
     #[test]
     fn icmp_ipv6_raw_admission_preserves_metadata_scope_when_available() {
-        let spec = PacketAdmissionSpec {
-            role: SocketPeerRole::Upstream,
-            proto: SupportedProtocol::ICMP,
-            sock_type: Type::RAW,
-            source_evidence: SourceEvidenceMode::RawPacketSourceRequired,
-            expected_remote: Some(CanonicalAddr::new(
+        let spec = admission_spec(
+            SocketPeerRole::Upstream,
+            SupportedProtocol::ICMP,
+            Type::RAW,
+            SourceEvidenceMode::RawPacketSourceRequired,
+            Some(CanonicalAddr::new(
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 7)),
                 9999,
             )),
-            expected_local_icmp_id: Some(9999),
-        };
+            Some(9999),
+        );
         let packet = test_icmp_echo_packet(
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
             Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
