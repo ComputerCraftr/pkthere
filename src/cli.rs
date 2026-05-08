@@ -125,6 +125,7 @@ pub(crate) struct DebugLogs {
 #[derive(Clone, Debug)]
 pub(crate) struct RequestedConfig {
     pub listen_request: CanonicalAddr, // CLI UDP port or ICMP listener id
+    pub listen_reply_id: Option<u16>,  // explicit local reply ID for ICMP listeners
     pub listen_proto: SupportedProtocol, // UDP | ICMP
     pub listen_mode: ListenMode,       // Fixed or Dynamic (:0)
     pub listen_str: String,            // original --here host:port string
@@ -151,22 +152,23 @@ pub(crate) struct RequestedConfig {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeConfig {
-    pub listen: CanonicalAddr, // actual bound UDP port or ICMP local id
+    pub listen: CanonicalAddr,        // actual bound UDP port or ICMP local id
+    pub listen_reply_id: Option<u16>, // explicit local reply ID for ICMP listeners
     pub listen_proto: SupportedProtocol, // UDP | ICMP
-    pub listen_mode: ListenMode, // Fixed or Dynamic (:0)
-    pub listen_str: String,    // original --here host:port string
-    pub workers: usize,        // listener/upstream worker pairs
+    pub listen_mode: ListenMode,      // Fixed or Dynamic (:0)
+    pub listen_str: String,           // original --here host:port string
+    pub workers: usize,               // listener/upstream worker pairs
     pub worker_flow_mode: WorkerFlowMode, // shared-flow | single-flow
-    pub upstream: CanonicalAddr, // remote UDP port or ICMP peer/listener id
-    pub upstream_local_id: u16, // CLI requested local source ID
+    pub upstream: CanonicalAddr,      // remote UDP port or ICMP peer/listener id
+    pub upstream_local_id: u16,       // CLI requested local reply ID
     pub upstream_proto: SupportedProtocol, // UDP | ICMP
-    pub upstream_str: String,  // FQDN:port or IP:port
-    pub timeout_secs: u64,     // idle timeout for single client
-    pub on_timeout: TimeoutAction, // Drop | Exit
-    pub stats_interval_mins: u32, // JSON stats print interval (0 disables stats thread)
-    pub max_payload: usize,    // optional user-specified MTU/payload limit
-    pub icmp_sync_pps: u32,    // 0 = disabled; >0 targets a best-effort ICMP request rate
-    pub reresolve_secs: u64,   // 0 = disabled
+    pub upstream_str: String,         // FQDN:port or IP:port
+    pub timeout_secs: u64,            // idle timeout for single client
+    pub on_timeout: TimeoutAction,    // Drop | Exit
+    pub stats_interval_mins: u32,     // JSON stats print interval (0 disables stats thread)
+    pub max_payload: usize,           // optional user-specified MTU/payload limit
+    pub icmp_sync_pps: u32,           // 0 = disabled; >0 targets a best-effort ICMP request rate
+    pub reresolve_secs: u64,          // 0 = disabled
     pub reresolve_mode: ReresolveMode, // which side(s) to re-resolve
     #[cfg(unix)]
     pub run_as_user: Option<String>,
@@ -199,6 +201,7 @@ pub(crate) fn realize_config(
 
     Ok(RuntimeConfig {
         listen,
+        listen_reply_id: requested.listen_reply_id,
         listen_proto: requested.listen_proto,
         listen_mode: requested.listen_mode,
         listen_str: requested.listen_str,
@@ -227,7 +230,7 @@ pub(crate) fn realize_config(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedIcmpCliTarget {
     resolve_arg: String,
-    local_id: u16,
+    local_id: Option<u16>,
 }
 
 #[inline]
@@ -275,9 +278,15 @@ fn parse_icmp_cli_target(
 
         let remote_id = parse_cli_num::<u16>(ids[0], flag, "ICMP id")?;
         let local_id = if ids.len() == 2 {
-            parse_cli_num::<u16>(ids[1], flag, "ICMP local id")?
+            let id = parse_cli_num::<u16>(ids[1], flag, "ICMP local id")?;
+            if id == 0 && flag == "--here" {
+                return Err(format!(
+                    "{flag}: explicit ICMP local/reply id must be non-zero; omit it to use the default"
+                ));
+            }
+            Some(id)
         } else {
-            0
+            None
         };
 
         Ok(ParsedIcmpCliTarget {
@@ -334,6 +343,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
              \t--there UDP:host:port    Fixed remote UDP destination port\n\
              \t--here ICMP:host:0       Wildcard-learn ICMP listener (learn peer ICMP id on first lock)\n\
              \t--here ICMP:host:N       Fixed ICMP listener id N (requires raw sockets on Linux/Android)\n\
+             \t--here ICMP:host:N:R     Fixed listener id N and independent reply/source id R (raw ICMP only)\n\
              \t--there ICMP:host:0      Dynamic local ICMP source id (kernel-assigned ping-socket id)\n\
              \t--there ICMP:host:N      Fixed remote ICMP peer/listener id N (requires raw sockets on Linux/Android)\n\
              \t--max-payload N          Payload limit (default: 1500)\n\
@@ -373,13 +383,21 @@ pub(crate) fn parse_args() -> RequestedConfig {
     }
 
     // Address helpers.
-    fn parse_here(s: &str) -> (String, CanonicalAddr, SupportedProtocol, ListenMode) {
+    fn parse_here(
+        s: &str,
+    ) -> (
+        String,
+        CanonicalAddr,
+        Option<u16>,
+        SupportedProtocol,
+        ListenMode,
+    ) {
         let (proto, addr_str) = parse_proto_and_rest(s, "--here").unwrap_or_else(|msg| {
             log_error!("{msg}");
             print_usage_and_exit(2)
         });
 
-        let (resolve_arg, mode) = match proto {
+        let (resolve_arg, listen_reply_id, mode) = match proto {
             SupportedProtocol::UDP => {
                 let id_part = addr_str.rsplit_once(':').map_or("0", |(_, p)| p);
                 let mode = if id_part == "0" {
@@ -387,11 +405,11 @@ pub(crate) fn parse_args() -> RequestedConfig {
                 } else {
                     ListenMode::Fixed
                 };
-                (addr_str.to_string(), mode)
+                (addr_str.to_string(), None, mode)
             }
             SupportedProtocol::ICMP => {
                 let parsed =
-                    parse_icmp_cli_target(addr_str, "--here", false).unwrap_or_else(|msg| {
+                    parse_icmp_cli_target(addr_str, "--here", true).unwrap_or_else(|msg| {
                         log_error!("{msg}");
                         print_usage_and_exit(2)
                     });
@@ -400,7 +418,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
                 } else {
                     ListenMode::Fixed
                 };
-                (parsed.resolve_arg, mode)
+                (parsed.resolve_arg, parsed.local_id, mode)
             }
         };
 
@@ -408,6 +426,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
             Ok(sa) => (
                 sa.to_string(),
                 CanonicalAddr::from_socket_addr(sa),
+                listen_reply_id,
                 proto,
                 mode,
             ),
@@ -433,7 +452,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
                         log_error!("{msg}");
                         print_usage_and_exit(2)
                     });
-                (parsed.resolve_arg, parsed.local_id)
+                (parsed.resolve_arg, parsed.local_id.unwrap_or(0))
             }
         };
 
@@ -465,7 +484,13 @@ pub(crate) fn parse_args() -> RequestedConfig {
     }
 
     // Required
-    let mut listen_opt: Option<(String, CanonicalAddr, SupportedProtocol, ListenMode)> = None;
+    let mut listen_opt: Option<(
+        String,
+        CanonicalAddr,
+        Option<u16>,
+        SupportedProtocol,
+        ListenMode,
+    )> = None;
     let mut upstream_opt: Option<(String, CanonicalAddr, u16, SupportedProtocol)> = None;
 
     // Optional (track presence to reject duplicates cleanly)
@@ -611,13 +636,14 @@ pub(crate) fn parse_args() -> RequestedConfig {
         }
     }
 
-    let (listen_str, listen_request, listen_proto, listen_mode_parsed) = match listen_opt {
-        Some(t) => t,
-        None => {
-            log_error!("missing required flag: --here <protocol:listen_ip:port>");
-            print_usage_and_exit(2)
-        }
-    };
+    let (listen_str, listen_request, listen_reply_id, listen_proto, listen_mode_parsed) =
+        match listen_opt {
+            Some(t) => t,
+            None => {
+                log_error!("missing required flag: --here <protocol:listen_ip:port>");
+                print_usage_and_exit(2)
+            }
+        };
     let (upstream_str, upstream_request, upstream_local_id, upstream_proto) = match upstream_opt {
         Some(t) => t,
         None => {
@@ -674,6 +700,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
     }
     RequestedConfig {
         listen_request,
+        listen_reply_id,
         listen_proto,
         listen_mode: listen_mode_parsed,
         listen_str,
@@ -714,6 +741,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, id)),
                 id,
             ),
+            listen_reply_id: None,
             listen_proto: SupportedProtocol::ICMP,
             listen_mode: if id == 0 {
                 ListenMode::Dynamic
@@ -799,6 +827,20 @@ mod tests {
         let runtime = realize_config(requested, listen).expect("wildcard listener must realize");
         assert_eq!(runtime.listen.id, 7777);
         assert_eq!(runtime.listen_mode, ListenMode::Dynamic);
+        assert_eq!(runtime.listen_reply_id, None);
+    }
+
+    #[test]
+    fn realize_config_preserves_explicit_listener_reply_id() {
+        let mut requested = requested_icmp_listener(1001);
+        requested.listen_reply_id = Some(2002);
+        let listen = CanonicalAddr::new(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001)),
+            1001,
+        );
+        let runtime = realize_config(requested, listen).expect("reply id must realize");
+        assert_eq!(runtime.listen.id, 1001);
+        assert_eq!(runtime.listen_reply_id, Some(2002));
     }
 
     #[test]
@@ -807,7 +849,7 @@ mod tests {
             parse_icmp_cli_target("[::1]:2002:1001", "--there", true).unwrap(),
             ParsedIcmpCliTarget {
                 resolve_arg: String::from("[::1]:2002"),
-                local_id: 1001,
+                local_id: Some(1001),
             }
         );
     }
@@ -818,9 +860,15 @@ mod tests {
             parse_icmp_cli_target("[::1]:1234", "--there", true).unwrap(),
             ParsedIcmpCliTarget {
                 resolve_arg: String::from("[::1]:1234"),
-                local_id: 0,
+                local_id: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_icmp_cli_target_rejects_explicit_zero_local_id() {
+        let err = parse_icmp_cli_target("127.0.0.1:1234:0", "--here", true).unwrap_err();
+        assert!(err.contains("must be non-zero"), "unexpected error: {err}");
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::time::Instant;
 pub(crate) struct FlowRuntimeState {
     locked: AtomicBool,
     last_seen_s: AtomicU64,
+    upstream_reply_id_acked: AtomicBool,
+    listener_reply_id_acked: AtomicBool,
 }
 
 impl FlowRuntimeState {
@@ -11,6 +13,8 @@ impl FlowRuntimeState {
         Self {
             locked: AtomicBool::new(false),
             last_seen_s: AtomicU64::new(0),
+            upstream_reply_id_acked: AtomicBool::new(false),
+            listener_reply_id_acked: AtomicBool::new(false),
         }
     }
 
@@ -24,6 +28,10 @@ impl FlowRuntimeState {
         self.locked.store(locked, AtomOrdering::Relaxed);
         if !locked {
             self.last_seen_s.store(0, AtomOrdering::Relaxed);
+            self.upstream_reply_id_acked
+                .store(false, AtomOrdering::Relaxed);
+            self.listener_reply_id_acked
+                .store(false, AtomOrdering::Relaxed);
         }
     }
 
@@ -36,6 +44,28 @@ impl FlowRuntimeState {
     #[inline]
     pub fn last_seen_s(&self) -> u64 {
         self.last_seen_s.load(AtomOrdering::Relaxed)
+    }
+
+    #[inline]
+    pub fn upstream_reply_id_acked(&self) -> bool {
+        self.upstream_reply_id_acked.load(AtomOrdering::Relaxed)
+    }
+
+    #[inline]
+    pub fn listener_reply_id_acked(&self) -> bool {
+        self.listener_reply_id_acked.load(AtomOrdering::Relaxed)
+    }
+
+    #[inline]
+    pub fn ack_upstream_reply_id(&self) {
+        self.upstream_reply_id_acked
+            .store(true, AtomOrdering::Relaxed);
+    }
+
+    #[inline]
+    pub fn ack_listener_reply_id(&self) {
+        self.listener_reply_id_acked
+            .store(true, AtomOrdering::Relaxed);
     }
 
     #[inline]

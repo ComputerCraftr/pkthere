@@ -3,17 +3,30 @@ use std::io;
 
 const SHIM_IS_DATA: u8 = 0x80;
 const SHIM_HAS_PAYLOAD: u8 = 0x40;
-const SHIM_HAS_SOURCE_ID: u8 = 0x20;
-const SHIM_ALLOWED_BITS: u8 = SHIM_IS_DATA | SHIM_HAS_PAYLOAD | SHIM_HAS_SOURCE_ID;
+const SHIM_HAS_REPLY_ID: u8 = 0x20;
+const SHIM_NEGOTIATE_REPLY_ID: u8 = 0x10;
+const SHIM_ACK_REPLY_ID: u8 = 0x08;
+const SHIM_ALLOWED_BITS: u8 = SHIM_IS_DATA
+    | SHIM_HAS_PAYLOAD
+    | SHIM_HAS_REPLY_ID
+    | SHIM_NEGOTIATE_REPLY_ID
+    | SHIM_ACK_REPLY_ID;
 
 pub(crate) const ICMP_TUNNEL_SHIM_MAX_LEN: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplyIdNegotiation {
+    pub(crate) reply_id: u16,
+    pub(crate) negotiate: bool,
+    pub(crate) ack: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IcmpTunnelFrame<'a> {
     Cadence,
     UserPayload {
         bytes: &'a [u8],
-        source_id: Option<u16>,
+        reply_id: Option<ReplyIdNegotiation>,
     },
     SessionControl,
 }
@@ -37,31 +50,44 @@ pub(crate) fn parse_icmp_tunnel_frame(payload: &[u8]) -> io::Result<IcmpTunnelFr
 
     let is_data = (shim & SHIM_IS_DATA) != 0;
     let has_payload = (shim & SHIM_HAS_PAYLOAD) != 0;
-    let has_source_id = (shim & SHIM_HAS_SOURCE_ID) != 0;
+    let has_reply_id = (shim & SHIM_HAS_REPLY_ID) != 0;
+    let negotiate_reply_id = (shim & SHIM_NEGOTIATE_REPLY_ID) != 0;
+    let ack_reply_id = (shim & SHIM_ACK_REPLY_ID) != 0;
 
-    if has_source_id && !is_data {
+    if (has_reply_id || negotiate_reply_id || ack_reply_id) && !is_data {
         return Err(invalid_data(
-            "ICMP tunnel source ID flag requires user-data shim",
+            "ICMP reply-ID negotiation flags require user-data shim",
         ));
     }
-    if has_source_id && payload.len() < ICMP_TUNNEL_SHIM_MAX_LEN {
+    if (negotiate_reply_id || ack_reply_id) && !has_reply_id {
         return Err(invalid_data(
-            "ICMP tunnel shim has source ID flag but payload is too short",
+            "ICMP reply-ID negotiation flag requires advertised reply ID",
+        ));
+    }
+    if has_reply_id && payload.len() < ICMP_TUNNEL_SHIM_MAX_LEN {
+        return Err(invalid_data(
+            "ICMP tunnel shim has reply-ID flag but payload is too short",
         ));
     }
 
-    let data_start = if has_source_id {
+    let data_start = if has_reply_id {
         ICMP_TUNNEL_SHIM_MAX_LEN
     } else {
         1
     };
     let user_payload = &payload[data_start..];
-    let source_id = has_source_id.then(|| be16_16(payload[1], payload[2]));
+    let reply_id = has_reply_id.then(|| ReplyIdNegotiation {
+        reply_id: be16_16(payload[1], payload[2]),
+        // Legacy reply-ID frames did not have explicit negotiation bits.
+        // Treat them as negotiate-only so old peers still establish routes.
+        negotiate: negotiate_reply_id || !ack_reply_id,
+        ack: ack_reply_id,
+    });
 
     match (is_data, has_payload, user_payload.is_empty()) {
         (true, true, false) | (true, false, true) => Ok(IcmpTunnelFrame::UserPayload {
             bytes: user_payload,
-            source_id,
+            reply_id,
         }),
         (false, false, true) => Ok(IcmpTunnelFrame::SessionControl),
         _ => Err(invalid_data("ICMP tunnel shim payload flags mismatch")),
@@ -70,21 +96,21 @@ pub(crate) fn parse_icmp_tunnel_frame(payload: &[u8]) -> io::Result<IcmpTunnelFr
 
 pub(crate) fn encode_icmp_tunnel_prefix(
     kind: IcmpTunnelFrameKind,
-    source_id: Option<u16>,
+    reply_id: Option<ReplyIdNegotiation>,
     payload_len: usize,
     scratch: &mut [u8; ICMP_TUNNEL_SHIM_MAX_LEN],
 ) -> io::Result<&[u8]> {
     match kind {
         IcmpTunnelFrameKind::Cadence => {
-            if source_id.is_some() || payload_len != 0 {
+            if reply_id.is_some() || payload_len != 0 {
                 return Err(invalid_input("ICMP cadence frame cannot carry shim data"));
             }
             Ok(&[])
         }
         IcmpTunnelFrameKind::SessionControl => {
-            if source_id.is_some() || payload_len != 0 {
+            if reply_id.is_some() || payload_len != 0 {
                 return Err(invalid_input(
-                    "ICMP session-control shim cannot carry source ID or payload",
+                    "ICMP session-control shim cannot carry reply-ID negotiation or payload",
                 ));
             }
             scratch[0] = 0;
@@ -92,9 +118,16 @@ pub(crate) fn encode_icmp_tunnel_prefix(
         }
         IcmpTunnelFrameKind::UserPayload => {
             let mut shim = SHIM_IS_DATA | (((payload_len != 0) as u8) * SHIM_HAS_PAYLOAD);
-            if let Some(id) = source_id {
-                shim |= SHIM_HAS_SOURCE_ID;
-                let idb = id.to_be_bytes();
+            if let Some(negotiation) = reply_id {
+                if !negotiation.negotiate && !negotiation.ack {
+                    return Err(invalid_input(
+                        "ICMP reply-ID shim requires negotiate and/or ack flag",
+                    ));
+                }
+                shim |= SHIM_HAS_REPLY_ID
+                    | ((negotiation.negotiate as u8) * SHIM_NEGOTIATE_REPLY_ID)
+                    | ((negotiation.ack as u8) * SHIM_ACK_REPLY_ID);
+                let idb = negotiation.reply_id.to_be_bytes();
                 scratch[0] = shim;
                 scratch[1] = idb[0];
                 scratch[2] = idb[1];
@@ -142,41 +175,51 @@ mod tests {
             parse_icmp_tunnel_frame(&[0x80]).unwrap(),
             IcmpTunnelFrame::UserPayload {
                 bytes: &[],
-                source_id: None
+                reply_id: None
             }
         );
         assert_eq!(
             parse_icmp_tunnel_frame(&[0xC0, b'a', b'b', b'c']).unwrap(),
             IcmpTunnelFrame::UserPayload {
                 bytes: b"abc",
-                source_id: None
+                reply_id: None
             }
         );
     }
 
     #[test]
-    fn framing_shim_parses_source_id_user_frames() {
+    fn framing_shim_parses_reply_id_negotiation_user_frames() {
         assert_eq!(
-            parse_icmp_tunnel_frame(&[0xA0, 0x20, 0x02]).unwrap(),
+            parse_icmp_tunnel_frame(&[0xB0, 0x20, 0x02]).unwrap(),
             IcmpTunnelFrame::UserPayload {
                 bytes: &[],
-                source_id: Some(0x2002)
+                reply_id: Some(ReplyIdNegotiation {
+                    reply_id: 0x2002,
+                    negotiate: true,
+                    ack: false
+                })
             }
         );
         assert_eq!(
-            parse_icmp_tunnel_frame(&[0xE0, 0x20, 0x02, b'x']).unwrap(),
+            parse_icmp_tunnel_frame(&[0xE8, 0x20, 0x02, b'x']).unwrap(),
             IcmpTunnelFrame::UserPayload {
                 bytes: b"x",
-                source_id: Some(0x2002)
+                reply_id: Some(ReplyIdNegotiation {
+                    reply_id: 0x2002,
+                    negotiate: false,
+                    ack: true
+                })
             }
         );
     }
 
     #[test]
-    fn framing_shim_rejects_invalid_flags_and_truncated_source_id() {
-        assert!(parse_icmp_tunnel_frame(&[0x81]).is_err());
-        assert!(parse_icmp_tunnel_frame(&[0xA0, 0x20]).is_err());
+    fn framing_shim_rejects_invalid_flags_and_truncated_reply_id() {
+        assert!(parse_icmp_tunnel_frame(&[0x82]).is_err());
+        assert!(parse_icmp_tunnel_frame(&[0xB0, 0x20]).is_err());
         assert!(parse_icmp_tunnel_frame(&[0x20, 0x20, 0x02]).is_err());
+        assert!(parse_icmp_tunnel_frame(&[0x90]).is_err());
+        assert!(parse_icmp_tunnel_frame(&[0x88]).is_err());
     }
 
     #[test]
@@ -211,12 +254,30 @@ mod tests {
         assert_eq!(
             encode_icmp_tunnel_prefix(
                 IcmpTunnelFrameKind::UserPayload,
-                Some(0x2002),
+                Some(ReplyIdNegotiation {
+                    reply_id: 0x2002,
+                    negotiate: true,
+                    ack: false
+                }),
                 1,
                 &mut scratch
             )
             .unwrap(),
-            &[0xE0, 0x20, 0x02]
+            &[0xF0, 0x20, 0x02]
+        );
+        assert_eq!(
+            encode_icmp_tunnel_prefix(
+                IcmpTunnelFrameKind::UserPayload,
+                Some(ReplyIdNegotiation {
+                    reply_id: 0x2002,
+                    negotiate: true,
+                    ack: true
+                }),
+                0,
+                &mut scratch
+            )
+            .unwrap(),
+            &[0xB8, 0x20, 0x02]
         );
     }
 }

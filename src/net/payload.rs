@@ -1,5 +1,5 @@
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::net::framing_shim::{IcmpTunnelFrame, parse_icmp_tunnel_frame};
+use crate::net::framing_shim::{IcmpTunnelFrame, ReplyIdNegotiation, parse_icmp_tunnel_frame};
 use crate::stats::StatsSink;
 
 use std::io;
@@ -62,19 +62,46 @@ impl<'a> PayloadEvent<'a> {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) const fn user_payload(
-        logical_src_ident: u16,
+        negotiated_remote_reply_id: u16,
+        inbound_header_ident: u16,
         seq: u16,
         dst_proto: SupportedProtocol,
         bytes: &'a [u8],
-        shim_src_ident: Option<u16>,
+        advertised_reply_id: Option<u16>,
     ) -> Self {
         Self::UserPayload {
             data: PayloadData { dst_proto, bytes },
             icmp: Some(IcmpPayloadMeta {
-                logical_src_ident,
+                negotiated_remote_reply_id,
+                inbound_header_ident,
                 seq,
-                shim_src_ident,
+                advertised_reply_id,
+                reply_id_negotiate: advertised_reply_id.is_some(),
+                reply_id_ack: false,
+            }),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn user_payload_negotiation(
+        negotiated_remote_reply_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        bytes: &'a [u8],
+        reply_id: Option<ReplyIdNegotiation>,
+    ) -> Self {
+        Self::UserPayload {
+            data: PayloadData { dst_proto, bytes },
+            icmp: Some(IcmpPayloadMeta {
+                negotiated_remote_reply_id,
+                inbound_header_ident,
+                seq,
+                advertised_reply_id: reply_id.map(|reply_id| reply_id.reply_id),
+                reply_id_negotiate: reply_id.is_some_and(|reply_id| reply_id.negotiate),
+                reply_id_ack: reply_id.is_some_and(|reply_id| reply_id.ack),
             }),
         }
     }
@@ -89,29 +116,36 @@ impl<'a> PayloadEvent<'a> {
 
     #[inline]
     pub(crate) const fn session_control(
-        logical_src_ident: u16,
+        negotiated_remote_reply_id: u16,
+        inbound_header_ident: u16,
         seq: u16,
         dst_proto: SupportedProtocol,
         bytes: &'a [u8],
-        shim_src_ident: Option<u16>,
+        advertised_reply_id: Option<u16>,
     ) -> Self {
         Self::SessionControl {
             data: PayloadData { dst_proto, bytes },
             icmp: IcmpPayloadMeta {
-                logical_src_ident,
+                negotiated_remote_reply_id,
+                inbound_header_ident,
                 seq,
-                shim_src_ident,
+                advertised_reply_id,
+                reply_id_negotiate: advertised_reply_id.is_some(),
+                reply_id_ack: false,
             },
         }
     }
 
     #[inline]
-    pub(crate) const fn cadence_packet(logical_src_ident: u16, seq: u16) -> Self {
+    pub(crate) const fn cadence_packet(inbound_header_ident: u16, seq: u16) -> Self {
         Self::CadencePacket {
             icmp: IcmpPayloadMeta {
-                logical_src_ident,
+                negotiated_remote_reply_id: inbound_header_ident,
+                inbound_header_ident,
                 seq,
-                shim_src_ident: None,
+                advertised_reply_id: None,
+                reply_id_negotiate: false,
+                reply_id_ack: false,
             },
         }
     }
@@ -141,9 +175,12 @@ impl OwnedPayloadData {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct IcmpPayloadMeta {
-    pub(crate) logical_src_ident: u16,
+    pub(crate) negotiated_remote_reply_id: u16,
+    pub(crate) inbound_header_ident: u16,
     pub(crate) seq: u16,
-    pub(crate) shim_src_ident: Option<u16>,
+    pub(crate) advertised_reply_id: Option<u16>,
+    pub(crate) reply_id_negotiate: bool,
+    pub(crate) reply_id_ack: bool,
 }
 
 #[inline]
@@ -154,14 +191,18 @@ fn decode_icmp_tunnel_payload<'a>(
 ) -> io::Result<PayloadEvent<'a>> {
     match parse_icmp_tunnel_frame(payload)? {
         IcmpTunnelFrame::Cadence => Ok(PayloadEvent::cadence_packet(ident, seq)),
-        IcmpTunnelFrame::UserPayload { bytes, source_id } => Ok(PayloadEvent::user_payload(
-            ident,
-            seq,
-            SupportedProtocol::UDP,
-            bytes,
-            source_id,
-        )),
+        IcmpTunnelFrame::UserPayload { bytes, reply_id } => {
+            Ok(PayloadEvent::user_payload_negotiation(
+                ident,
+                ident,
+                seq,
+                SupportedProtocol::UDP,
+                bytes,
+                reply_id,
+            ))
+        }
         IcmpTunnelFrame::SessionControl => Ok(PayloadEvent::session_control(
+            ident,
             ident,
             seq,
             SupportedProtocol::ICMP,
@@ -180,6 +221,7 @@ pub(crate) fn validate_payload<'a>(
     icmp_info: Option<IcmpAdmissionInfo>,
     payload_bounds: (usize, usize),
     synthetic_icmp_ident: Option<u16>,
+    locked_icmp_negotiated_remote_reply_id: Option<u16>,
     origin: PayloadOrigin,
     is_locked: bool,
 ) -> io::Result<PayloadEvent<'a>> {
@@ -237,43 +279,65 @@ pub(crate) fn validate_payload<'a>(
                 PayloadEvent::cadence_packet(icmp_info.ident, icmp_info.seq)
             }
             PayloadEvent::UserPayload { data, icmp } => {
-                let shim_src_ident = icmp.and_then(|icmp| icmp.shim_src_ident);
-                if shim_src_ident.is_some() && c2u && is_locked {
-                    return Err(io::Error::new(
+                let icmp = icmp.ok_or_else(|| {
+                    io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "ICMP tunnel source ID shim is only valid for initial C2U lock establishment",
-                    ));
-                }
-                if c2u && !is_locked && shim_src_ident.is_none() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "initial ICMP lock establishment requires source ID shim",
-                    ));
-                }
-
-                let effective_src_ident = if c2u && !is_locked {
-                    shim_src_ident.expect("validated initial ICMP lock source ID shim")
+                        "decoded ICMP user payload is missing ICMP metadata",
+                    )
+                })?;
+                let advertised_reply_id = icmp.advertised_reply_id;
+                let negotiated_remote_reply_id = if c2u && !is_locked {
+                    advertised_reply_id.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "initial ICMP lock establishment requires reply-ID negotiation",
+                        )
+                    })?
+                } else if c2u {
+                    let locked_ident = locked_icmp_negotiated_remote_reply_id.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "locked ICMP C2U validation requires negotiated reply ID",
+                        )
+                    })?;
+                    if let Some(shim_ident) = advertised_reply_id
+                        && shim_ident != locked_ident
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "ICMP reply-ID renegotiation mismatch: got {shim_ident}, expected locked flow {locked_ident}"
+                            ),
+                        ));
+                    }
+                    locked_ident
                 } else {
-                    icmp_info.ident
+                    advertised_reply_id.unwrap_or(icmp_info.ident)
                 };
 
-                PayloadEvent::user_payload(
-                    effective_src_ident,
+                PayloadEvent::user_payload_negotiation(
+                    negotiated_remote_reply_id,
+                    icmp_info.ident,
                     icmp_info.seq,
                     dst_proto,
                     data.bytes,
-                    shim_src_ident,
+                    advertised_reply_id.map(|reply_id| ReplyIdNegotiation {
+                        reply_id,
+                        negotiate: icmp.reply_id_negotiate,
+                        ack: icmp.reply_id_ack,
+                    }),
                 )
             }
             PayloadEvent::SessionControl { data, icmp } => {
-                if icmp.shim_src_ident.is_some() {
+                if icmp.advertised_reply_id.is_some() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "ICMP tunnel handshake attempted on session-control packet",
+                        "ICMP reply-ID negotiation attempted on session-control packet",
                     ));
                 }
 
                 PayloadEvent::session_control(
+                    icmp_info.ident,
                     icmp_info.ident,
                     icmp_info.seq,
                     dst_proto,
@@ -297,23 +361,42 @@ pub(crate) fn validate_payload<'a>(
 }
 
 #[inline]
-pub(crate) fn source_id_shim_for_c2u(
+pub(crate) fn reply_id_negotiation_for_c2u(
     event: &PayloadEvent<'_>,
-    had_prior_icmp_send: bool,
+    reply_id_acked: bool,
     upstream_local_id: u16,
-) -> Option<u16> {
-    let (dst_proto, source_id) = match event {
-        PayloadEvent::UserPayload { data, icmp } => (
-            data.dst_proto,
-            icmp.map_or(upstream_local_id, |icmp| icmp.logical_src_ident),
-        ),
+) -> Option<ReplyIdNegotiation> {
+    let dst_proto = match event {
+        PayloadEvent::UserPayload { data, .. } => data.dst_proto,
         _ => return None,
     };
-    if had_prior_icmp_send || dst_proto != SupportedProtocol::ICMP {
+    if reply_id_acked || dst_proto != SupportedProtocol::ICMP || upstream_local_id == 0 {
         return None;
     }
 
-    (source_id != 0).then_some(source_id)
+    Some(ReplyIdNegotiation {
+        reply_id: upstream_local_id,
+        negotiate: true,
+        ack: false,
+    })
+}
+
+#[inline]
+pub(crate) fn reply_id_negotiation_for_u2c_listener_reply(
+    event: &PayloadEvent<'_>,
+    explicit_listen_reply_id: Option<u16>,
+    listener_reply_id: Option<u16>,
+) -> Option<ReplyIdNegotiation> {
+    if !event.is_user_payload() || explicit_listen_reply_id.is_none() {
+        return None;
+    }
+    listener_reply_id
+        .filter(|id| *id != 0)
+        .map(|reply_id| ReplyIdNegotiation {
+            reply_id,
+            negotiate: true,
+            ack: false,
+        })
 }
 
 #[cfg(test)]

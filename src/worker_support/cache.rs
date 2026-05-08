@@ -164,6 +164,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
                 8888,
             ),
+            listen_reply_id: None,
             listen_proto: lp,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("127.0.0.1:8888"),

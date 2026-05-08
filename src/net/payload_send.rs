@@ -2,7 +2,7 @@ use super::PayloadEvent;
 use crate::cli::SupportedProtocol;
 use crate::net::checksum::{checksum16, checksum16_parts};
 use crate::net::framing_shim::{
-    ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, encode_icmp_tunnel_prefix,
+    ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, ReplyIdNegotiation, encode_icmp_tunnel_prefix,
 };
 use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 use socket2::{SockAddr, Socket, Type};
@@ -19,7 +19,7 @@ pub(crate) struct OutboundIcmpMeta {
     pub(crate) header_id: u16,
     pub(crate) seq: u16,
     pub(crate) reply: bool,
-    pub(crate) source_id_shim: Option<u16>,
+    pub(crate) reply_id_negotiation: Option<ReplyIdNegotiation>,
 }
 
 pub(crate) fn outbound_payload_event<'a>(
@@ -27,7 +27,7 @@ pub(crate) fn outbound_payload_event<'a>(
     icmp_header_id: u16,
     c2u: bool,
     icmp_seq: Option<u16>,
-    source_id_for_shim: Option<u16>,
+    reply_id_negotiation: Option<ReplyIdNegotiation>,
 ) -> io::Result<OutboundPayloadEvent<'a>> {
     let dst_proto = match event {
         PayloadEvent::UserPayload { data, .. } | PayloadEvent::SessionControl { data, .. } => {
@@ -45,7 +45,7 @@ pub(crate) fn outbound_payload_event<'a>(
                 )
             })?,
             reply: !c2u,
-            source_id_shim: source_id_for_shim,
+            reply_id_negotiation,
         }),
         _ => {
             if !event.is_user_payload() {
@@ -67,11 +67,11 @@ pub(crate) fn outbound_payload_event<'a>(
 
     if let Some(meta) = icmp
         && !event.is_user_payload()
-        && meta.source_id_shim.is_some()
+        && meta.reply_id_negotiation.is_some()
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "cannot encode source ID shim on non-user ICMP packet",
+            "cannot encode reply-ID negotiation on non-user ICMP packet",
         ));
     }
 
@@ -149,7 +149,7 @@ fn send_icmp_echo(
         PayloadEvent::UserPayload { data, .. } => {
             let prefix = encode_icmp_tunnel_prefix(
                 IcmpTunnelFrameKind::UserPayload,
-                meta.source_id_shim,
+                meta.reply_id_negotiation,
                 data.bytes.len(),
                 &mut shim_storage,
             )?;

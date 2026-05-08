@@ -4,7 +4,8 @@ use crate::flow_key::ClientFlowKey as FlowKey;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::params::MAX_WIRE_PAYLOAD;
 use crate::net::payload::{
-    PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload, validate_payload,
+    PayloadEvent, PayloadOrigin, outbound_payload_event,
+    reply_id_negotiation_for_u2c_listener_reply, send_payload, validate_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketManager;
@@ -16,9 +17,9 @@ use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
     BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, PacketAdmission,
     RejectionReason, SocketPeerRole, admit_packet, buffer_sync_event, client_admission_spec,
-    handle_c2u_session_control, log_rejected_packet, recv_packet, refresh_lock_and_sync_state,
-    send_sync_payload_or_cadence, send_user_payload_event, upstream_admission_spec,
-    wait_socket_until_readable,
+    handle_c2u_session_control, log_rejected_packet, observe_reply_id_ack, recv_packet,
+    refresh_lock_and_sync_state, send_sync_payload_or_cadence, send_user_payload_event,
+    upstream_admission_spec, wait_socket_until_readable,
 };
 use std::io;
 use std::sync::Arc;
@@ -27,7 +28,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
 pub(crate) fn run_reresolve_thread(
     sock_mgrs: &[Arc<SocketManager>],
     reresolve_secs: u64,
@@ -54,7 +54,6 @@ pub(crate) fn run_watchdog_thread(
     loop {
         thread::sleep(period);
         let now_s = Instant::now().saturating_duration_since(t_start).as_secs();
-
         for (idx, flow_state) in flow_states.iter().enumerate() {
             if !flow_state.is_locked() {
                 if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
@@ -116,7 +115,6 @@ pub(crate) fn run_watchdog_thread(
                     return;
                 }
             }
-
             // If we were in SharedFlow mode, we've handled all workers by clearing all managers.
             if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
                 break;
@@ -124,7 +122,6 @@ pub(crate) fn run_watchdog_thread(
         }
     }
 }
-
 pub(crate) fn run_upstream_to_client_thread(
     t_start: Instant,
     cfg: &RuntimeConfig,
@@ -184,7 +181,6 @@ pub(crate) fn run_upstream_to_client_thread(
                         }
                     };
                 let t_recv = Instant::now();
-
                 log_debug!(
                     cfg.debug_logs.packets,
                     "[worker {}] received {} bytes from upstream socket {:?}",
@@ -210,6 +206,7 @@ pub(crate) fn run_upstream_to_client_thread(
                             admitted.icmp_info,
                             admitted.payload_bounds,
                             None,
+                            handles.locked_flow.and_then(|flow| flow.icmp_ident()),
                             PayloadOrigin::Wire,
                             true, // Already locked
                         ),
@@ -219,6 +216,7 @@ pub(crate) fn run_upstream_to_client_thread(
                         C2U,
                         "validate_payload error: {}"
                     );
+                    observe_reply_id_ack(C2U, &event, &handles, flow_state);
                     let decision = result_or_log_continue!(
                         classify_u2c(
                             cfg,
@@ -233,6 +231,12 @@ pub(crate) fn run_upstream_to_client_thread(
                         C2U,
                         "classify_u2c error: {}"
                     );
+                    let reply_id = reply_id_negotiation_for_u2c_listener_reply(
+                        &event,
+                        cfg.listen_reply_id,
+                        handles.listener_flow.outbound.map(|flow| flow.src.id),
+                    )
+                    .filter(|_| !flow_state.listener_reply_id_acked());
                     let send_res = if decision.should_send() {
                         let outbound = result_or_log_continue!(
                             outbound_payload_event(
@@ -240,7 +244,7 @@ pub(crate) fn run_upstream_to_client_thread(
                                 cache.route.icmp_header_id,
                                 C2U,
                                 prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                                None,
+                                reply_id,
                             ),
                             log_debug_dir,
                             cfg.debug_logs.drops,
@@ -286,7 +290,6 @@ pub(crate) fn run_upstream_to_client_thread(
         }
     }
 }
-
 pub(crate) fn run_client_to_upstream_thread(
     t_start: Instant,
     cfg: &RuntimeConfig,
@@ -304,7 +307,6 @@ pub(crate) fn run_client_to_upstream_thread(
     let mut buf = RecvBuf::<{ MAX_WIRE_PAYLOAD }>::new();
     let sync_icmp_mode = sync_icmp_enabled(cfg);
     let mut latest_sync_payload: Option<BufferedPayload> = None;
-
     let mut handles = sock_mgr.refresh_handles();
     let mut was_locked = false;
     let mut sync_cache = sync_state.cache();
@@ -424,6 +426,9 @@ pub(crate) fn run_client_to_upstream_thread(
                             admitted.icmp_info,
                             admitted.payload_bounds,
                             None,
+                            locked_now
+                                .then(|| handles.locked_flow.and_then(|flow| flow.icmp_ident()))
+                                .flatten(),
                             PayloadOrigin::Wire,
                             locked_now,
                         ) {
@@ -521,6 +526,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 admitted.icmp_info,
                                 admitted.payload_bounds,
                                 None,
+                                handles.locked_flow.and_then(|flow| flow.icmp_ident()),
                                 PayloadOrigin::Wire,
                                 true, // Already locked
                             ),
@@ -679,6 +685,7 @@ pub(crate) fn run_client_to_upstream_thread(
                             admitted.icmp_info,
                             admitted.payload_bounds,
                             None,
+                            handles.locked_flow.and_then(|flow| flow.icmp_ident()),
                             PayloadOrigin::Wire,
                             true, // Already locked
                         ) {
@@ -784,6 +791,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 admitted.icmp_info,
                                 admitted.payload_bounds,
                                 None,
+                                None,
                                 PayloadOrigin::Wire,
                                 flow_state.is_locked(),
                             ),
@@ -797,6 +805,7 @@ pub(crate) fn run_client_to_upstream_thread(
                             FlowKey::locked_listener_flow_from_validated_c2u(
                                 src,
                                 handles.listen_local_filter,
+                                cfg.listen_reply_id,
                                 cfg.listen_proto,
                                 &event,
                             )
@@ -916,6 +925,7 @@ pub(crate) fn run_client_to_upstream_thread(
                                 admitted.icmp_info,
                                 admitted.payload_bounds,
                                 None,
+                                handles.locked_flow.and_then(|flow| flow.icmp_ident()),
                                 PayloadOrigin::Wire,
                                 flow_state.is_locked(),
                             ),

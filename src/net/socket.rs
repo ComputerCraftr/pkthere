@@ -203,7 +203,7 @@ pub(crate) fn make_upstream_socket_for(
     };
 
     let is_icmp = proto == SupportedProtocol::ICMP;
-    let force_raw = is_icmp && upstream_requires_raw(proto, dest.id);
+    let force_raw = is_icmp && upstream_requires_raw(proto, dest.id, req_local_id);
 
     // Create socket
     let (sock, sock_type) = if is_icmp {

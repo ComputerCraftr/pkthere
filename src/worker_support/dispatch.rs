@@ -2,8 +2,8 @@ use super::{BufferedPayload, CachedClientState};
 use crate::cli::RuntimeConfig;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::{
-    PayloadEvent, PayloadOrigin, outbound_payload_event, send_payload, source_id_shim_for_c2u,
-    validate_payload,
+    PayloadEvent, PayloadOrigin, outbound_payload_event, reply_id_negotiation_for_c2u,
+    send_payload, validate_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketHandles;
@@ -51,10 +51,11 @@ pub(crate) fn send_user_payload_event(
     } = event
     {
         remember_request_seq(sync_state, sync_cache, icmp);
+        observe_reply_id_ack(true, event, handles, flow_state);
     }
-    let source_id_for_shim = source_id_shim_for_c2u(
+    let reply_id_negotiation = reply_id_negotiation_for_c2u(
         event,
-        sync_cache.latest_valid,
+        flow_state.upstream_reply_id_acked(),
         handles.upstream_local_filter.id,
     );
     let outbound = outbound_payload_event(
@@ -62,7 +63,7 @@ pub(crate) fn send_user_payload_event(
         cache.route.icmp_header_id,
         C2U,
         prepare_send(C2U, event, true, sync_state, sync_cache),
-        source_id_for_shim,
+        reply_id_negotiation,
     )?;
     let send_res = send_payload(
         &handles.upstream_sock,
@@ -120,6 +121,7 @@ pub(crate) fn send_sync_payload_or_cadence(
                 .listener_flow
                 .outbound_destination()
                 .map(|peer_addr| peer_addr.id),
+            handles.locked_flow.and_then(|flow| flow.icmp_ident()),
             PayloadOrigin::SyntheticCadencePacket,
             true,
         )
@@ -136,9 +138,9 @@ pub(crate) fn send_sync_payload_or_cadence(
         synthetic_event
     };
 
-    let source_id_for_shim = source_id_shim_for_c2u(
+    let reply_id_negotiation = reply_id_negotiation_for_c2u(
         &event,
-        sync_cache.latest_valid,
+        flow_state.upstream_reply_id_acked(),
         handles.upstream_local_filter.id,
     );
     let outbound = outbound_payload_event(
@@ -146,7 +148,7 @@ pub(crate) fn send_sync_payload_or_cadence(
         cache.route.icmp_header_id,
         C2U,
         prepare_send(C2U, &event, true, sync_state, sync_cache),
-        source_id_for_shim,
+        reply_id_negotiation,
     )?;
     let send_res = send_payload(
         &handles.upstream_sock,
@@ -171,4 +173,30 @@ pub(crate) fn send_sync_payload_or_cadence(
         None,
     );
     Ok(())
+}
+
+#[inline]
+pub(crate) fn observe_reply_id_ack(
+    c2u: bool,
+    event: &PayloadEvent<'_>,
+    handles: &SocketHandles,
+    flow_state: &FlowRuntimeState,
+) {
+    let PayloadEvent::UserPayload {
+        icmp: Some(icmp), ..
+    } = event
+    else {
+        return;
+    };
+    if !icmp.reply_id_ack {
+        return;
+    }
+    if c2u {
+        let expected = handles.listener_flow.outbound.map(|flow| flow.src.id);
+        if icmp.advertised_reply_id == expected {
+            flow_state.ack_listener_reply_id();
+        }
+    } else if icmp.advertised_reply_id == Some(handles.upstream_local_filter.id) {
+        flow_state.ack_upstream_reply_id();
+    }
 }

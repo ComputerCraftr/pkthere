@@ -105,6 +105,14 @@ pub(crate) enum ClientFlowKey {
 }
 
 impl ClientFlowKey {
+    #[inline]
+    pub(crate) const fn icmp_ident(self) -> Option<u16> {
+        match self {
+            Self::Udp(_) => None,
+            Self::IcmpV4 { ident, .. } | Self::IcmpV6 { ident, .. } => Some(ident),
+        }
+    }
+
     pub fn from_validated_client_payload(
         c2u: bool,
         src: CanonicalAddr,
@@ -119,7 +127,7 @@ impl ClientFlowKey {
             SupportedProtocol::ICMP => match event {
                 PayloadEvent::UserPayload {
                     icmp: Some(icmp), ..
-                } => Some(Self::from_icmp_source(src, icmp.logical_src_ident)),
+                } => Some(Self::from_icmp_source(src, icmp.negotiated_remote_reply_id)),
                 _ => None,
             },
         }
@@ -135,7 +143,8 @@ impl ClientFlowKey {
 
     pub(crate) fn locked_listener_flow_from_validated_c2u(
         src: CanonicalAddr,
-        listen_local: CanonicalAddr,
+        listen_local_recv: CanonicalAddr,
+        explicit_listen_reply_id: Option<u16>,
         listen_proto: SupportedProtocol,
         event: &PayloadEvent<'_>,
     ) -> Option<(Self, SocketLegFlow)> {
@@ -145,14 +154,33 @@ impl ClientFlowKey {
             SupportedProtocol::ICMP => match event {
                 PayloadEvent::UserPayload {
                     icmp: Some(icmp), ..
-                } => FlowEndpoint::from_canonical(src).with_id(icmp.logical_src_ident),
+                } => FlowEndpoint::from_canonical(src).with_id(icmp.negotiated_remote_reply_id),
                 _ => return None,
             },
         };
-        let local = FlowEndpoint::from_canonical(listen_local).with_id(src.id);
+        let inbound_local = match listen_proto {
+            SupportedProtocol::UDP => FlowEndpoint::from_canonical(listen_local_recv),
+            SupportedProtocol::ICMP => match event {
+                PayloadEvent::UserPayload {
+                    icmp: Some(icmp), ..
+                } => FlowEndpoint::from_canonical(listen_local_recv)
+                    .with_id(icmp.inbound_header_ident),
+                _ => return None,
+            },
+        };
+        let outbound_local = match listen_proto {
+            SupportedProtocol::UDP => FlowEndpoint::from_canonical(listen_local_recv),
+            SupportedProtocol::ICMP => match event {
+                PayloadEvent::UserPayload {
+                    icmp: Some(icmp), ..
+                } => FlowEndpoint::from_canonical(listen_local_recv)
+                    .with_id(explicit_listen_reply_id.unwrap_or(icmp.inbound_header_ident)),
+                _ => return None,
+            },
+        };
         let flow = SocketLegFlow::new(
-            Some(FlowTuple::new(remote, local)),
-            Some(FlowTuple::new(local, remote)),
+            Some(FlowTuple::new(remote, inbound_local)),
+            Some(FlowTuple::new(outbound_local, remote)),
         );
         Some((key, flow))
     }
@@ -258,12 +286,13 @@ mod tests {
     }
 
     #[test]
-    fn validated_icmp_flow_key_uses_payload_logical_source_id() {
+    fn validated_icmp_flow_key_uses_negotiated_reply_id() {
         let src = CanonicalAddr::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0),
             100,
         );
-        let event = PayloadEvent::user_payload(200, 1, SupportedProtocol::UDP, b"x", Some(200));
+        let event =
+            PayloadEvent::user_payload(200, 100, 1, SupportedProtocol::UDP, b"x", Some(200));
 
         assert_eq!(
             ClientFlowKey::from_validated_client_payload(
@@ -289,11 +318,13 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 1),
             1,
         );
-        let event = PayloadEvent::user_payload(200, 1, SupportedProtocol::UDP, b"x", Some(200));
+        let event =
+            PayloadEvent::user_payload(200, 100, 1, SupportedProtocol::UDP, b"x", Some(200));
 
         let (key, flow) = ClientFlowKey::locked_listener_flow_from_validated_c2u(
             src,
             listen,
+            Some(300),
             SupportedProtocol::ICMP,
             &event,
         )
@@ -310,8 +341,9 @@ mod tests {
         let outbound = flow.outbound.expect("outbound tuple");
         assert_eq!(inbound.src.id, 200);
         assert_eq!(inbound.dst.id, 100);
-        assert_eq!(outbound.src.id, 100);
+        assert_eq!(outbound.src.id, 300);
         assert_eq!(outbound.dst.id, 200);
+        assert_eq!(flow.outbound_destination().expect("outbound dest").id, 200);
     }
 
     #[test]
@@ -339,7 +371,8 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0),
             100,
         );
-        let event = PayloadEvent::user_payload(100, 1, SupportedProtocol::UDP, b"x", Some(200));
+        let event =
+            PayloadEvent::user_payload(100, 100, 1, SupportedProtocol::UDP, b"x", Some(200));
 
         assert_eq!(
             ClientFlowKey::from_validated_client_payload(

@@ -11,10 +11,19 @@ pub(crate) fn listener_requires_raw(proto: SupportedProtocol) -> bool {
 }
 
 #[inline]
-pub(crate) fn upstream_requires_raw(proto: SupportedProtocol, requested_id: u16) -> bool {
+pub(crate) fn upstream_requires_raw(
+    proto: SupportedProtocol,
+    requested_remote_id: u16,
+    requested_local_id: u16,
+) -> bool {
     if proto != SupportedProtocol::ICMP {
         false
-    } else if requested_id == 0 {
+    } else if requested_remote_id != 0
+        && requested_local_id != 0
+        && requested_remote_id != requested_local_id
+    {
+        true
+    } else if requested_remote_id == 0 {
         // Dynamic ID: only OSes that completely lack DGRAM ping sockets need RAW.
         cfg!(not(any(
             target_os = "linux",
@@ -245,15 +254,20 @@ mod tests {
         assert!(listener_requires_raw(ICMP));
 
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-        assert!(!upstream_requires_raw(ICMP, 0));
+        assert!(!upstream_requires_raw(ICMP, 0, 0));
 
         #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-        assert!(upstream_requires_raw(ICMP, 0));
+        assert!(upstream_requires_raw(ICMP, 0, 0));
 
         #[cfg(target_os = "macos")]
-        assert!(!upstream_requires_raw(ICMP, 1234));
+        assert!(!upstream_requires_raw(ICMP, 1234, 0));
 
         #[cfg(not(target_os = "macos"))]
-        assert!(upstream_requires_raw(ICMP, 1234));
+        assert!(upstream_requires_raw(ICMP, 1234, 0));
+
+        assert!(upstream_requires_raw(ICMP, 1001, 2002));
+
+        #[cfg(target_os = "macos")]
+        assert!(!upstream_requires_raw(ICMP, 1001, 1001));
     }
 }

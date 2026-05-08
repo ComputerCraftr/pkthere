@@ -24,7 +24,8 @@ mod tests {
     };
     use crate::flow_key::ClientFlowKey;
     use crate::net::framing_shim::{
-        ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, encode_icmp_tunnel_prefix,
+        ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, ReplyIdNegotiation,
+        encode_icmp_tunnel_prefix,
     };
     use crate::net::packet_headers::parse_packet_headers;
     use crate::net::params::CanonicalAddr;
@@ -40,6 +41,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
                 1234,
             ),
+            listen_reply_id: None,
             listen_proto,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
@@ -127,6 +129,7 @@ mod tests {
             None,
             (0, 0),
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -142,6 +145,7 @@ mod tests {
             None,
             (0, 0),
             Some(cfg.listen.id),
+            None,
             PayloadOrigin::SyntheticCadencePacket,
             false,
         )
@@ -165,6 +169,7 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -178,12 +183,21 @@ mod tests {
 
     fn encode_icmp_frame(
         kind: IcmpTunnelFrameKind,
-        source_id: Option<u16>,
+        reply_id: Option<u16>,
         payload: &[u8],
     ) -> Vec<u8> {
         let mut scratch = [0; ICMP_TUNNEL_SHIM_MAX_LEN];
-        let prefix = encode_icmp_tunnel_prefix(kind, source_id, payload.len(), &mut scratch)
-            .expect("test ICMP tunnel frame should serialize");
+        let prefix = encode_icmp_tunnel_prefix(
+            kind,
+            reply_id.map(|reply_id| ReplyIdNegotiation {
+                reply_id,
+                negotiate: true,
+                ack: false,
+            }),
+            payload.len(),
+            &mut scratch,
+        )
+        .expect("test ICMP tunnel frame should serialize");
         let mut buf = Vec::with_capacity(8 + prefix.len() + payload.len());
         buf.extend_from_slice(&[8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
         buf.extend_from_slice(prefix);
@@ -195,15 +209,15 @@ mod tests {
         encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, None, payload)
     }
 
-    fn encode_icmp_user_payload_with_source_id(source_id: u16, payload: &[u8]) -> Vec<u8> {
-        encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, Some(source_id), payload)
+    fn encode_icmp_user_payload_with_reply_id(reply_id: u16, payload: &[u8]) -> Vec<u8> {
+        encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, Some(reply_id), payload)
     }
 
     #[test]
     fn validate_payload_decodes_zero_len_icmp_user_datagram() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
+        let buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -213,6 +227,7 @@ mod tests {
             &buf,
             icmp_info,
             payload_bounds,
+            None,
             None,
             PayloadOrigin::Wire,
             false,
@@ -226,7 +241,7 @@ mod tests {
     fn validate_payload_decodes_non_empty_icmp_user_datagram() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_source_id(0x2002, b"abc");
+        let buf = encode_icmp_user_payload_with_reply_id(0x2002, b"abc");
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -236,6 +251,7 @@ mod tests {
             &buf,
             icmp_info,
             payload_bounds,
+            None,
             None,
             PayloadOrigin::Wire,
             false,
@@ -249,10 +265,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_uses_source_id_shim_as_logical_identifier() {
+    fn validate_payload_uses_reply_id_negotiation_as_logical_identifier() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
+        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
         buf[4] = 0xAA;
         buf[5] = 0x55;
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
@@ -265,15 +281,16 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
-        .expect("source ID shim should define logical ICMP peer identity");
+        .expect("reply-ID negotiation should define negotiated ICMP reply endpoint");
         match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             } => {
-                assert_eq!(icmp.logical_src_ident, 0x2002)
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002)
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -283,7 +300,7 @@ mod tests {
     fn validate_payload_does_not_enforce_external_icmp_id_policy() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
+        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
         buf[4] = 0xAA;
         buf[5] = 0x55;
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
@@ -296,6 +313,7 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -304,7 +322,7 @@ mod tests {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             } => {
-                assert_eq!(icmp.logical_src_ident, 0x2002)
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002)
             }
             other => panic!("unexpected event: {other:?}"),
         }
@@ -323,6 +341,7 @@ mod tests {
             &empty_icmp,
             icmp_info,
             payload_bounds,
+            None,
             None,
             PayloadOrigin::Wire,
             false,
@@ -347,6 +366,7 @@ mod tests {
                 None,
                 udp_bounds(&[]),
                 None,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -361,6 +381,7 @@ mod tests {
                 None,
                 udp_bounds(&[0]),
                 None,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -371,8 +392,8 @@ mod tests {
         let mut cfg_icmp = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg_icmp.max_payload = 0;
 
-        let ok_icmp = encode_icmp_user_payload_with_source_id(0x2002, &[]);
-        let over_icmp = encode_icmp_user_payload_with_source_id(0x2002, &[0]);
+        let ok_icmp = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
+        let over_icmp = encode_icmp_user_payload_with_reply_id(0x2002, &[0]);
         let (ok_icmp_info, ok_icmp_bounds) = admitted_icmp(&ok_icmp);
         let (over_icmp_info, over_icmp_bounds) = admitted_icmp(&over_icmp);
 
@@ -384,6 +405,7 @@ mod tests {
                 &ok_icmp,
                 ok_icmp_info,
                 ok_icmp_bounds,
+                None,
                 None,
                 PayloadOrigin::Wire,
                 false,
@@ -399,6 +421,7 @@ mod tests {
                 over_icmp_info,
                 over_icmp_bounds,
                 None,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -411,8 +434,8 @@ mod tests {
         let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg.max_payload = 3;
         let stats = Stats::new();
-        let ok = encode_icmp_user_payload_with_source_id(0x2002, b"abc");
-        let over = encode_icmp_user_payload_with_source_id(0x2002, b"abcd");
+        let ok = encode_icmp_user_payload_with_reply_id(0x2002, b"abc");
+        let over = encode_icmp_user_payload_with_reply_id(0x2002, b"abcd");
         let (ok_info, ok_bounds) = admitted_icmp(&ok);
         let (over_info, over_bounds) = admitted_icmp(&over);
 
@@ -424,6 +447,7 @@ mod tests {
                 &ok,
                 ok_info,
                 ok_bounds,
+                None,
                 None,
                 PayloadOrigin::Wire,
                 false,
@@ -439,6 +463,7 @@ mod tests {
                 over_info,
                 over_bounds,
                 None,
+                None,
                 PayloadOrigin::Wire,
                 false,
             )
@@ -452,7 +477,7 @@ mod tests {
         let stats = Stats::new();
 
         // 1. Valid handshake (Unlocked, Echo Request, UserData)
-        let mut buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
+        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
         let res = validate_payload(
             true,
@@ -462,6 +487,7 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         );
@@ -470,12 +496,12 @@ mod tests {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             } => {
-                assert_eq!(icmp.logical_src_ident, 0x2002)
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002)
             }
             other => panic!("unexpected event: {other:?}"),
         }
 
-        // 2. Locked sessions reject additional source-ID shims.
+        // 2. Locked sessions require the already-negotiated reply ID.
         let res = validate_payload(
             true,
             &cfg,
@@ -484,11 +510,12 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             true,
         )
-        .expect_err("locked session should reject additional source-ID shim");
-        assert!(res.to_string().contains("initial C2U lock"));
+        .expect_err("locked session should require negotiated reply ID context");
+        assert!(res.to_string().contains("requires negotiated reply ID"));
 
         // 3. Reject Echo Reply
         buf[0] = 0; // Type 0 = Echo Reply
@@ -502,6 +529,7 @@ mod tests {
             reply_info,
             reply_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         );
@@ -512,10 +540,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_payload_accepts_reflected_source_id_shim_on_u2c_without_adopting_it() {
+    fn validate_payload_accepts_reflected_reply_id_negotiation_on_u2c_without_adopting_it() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_user_payload_with_source_id(0x2002, b"x");
+        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, b"x");
         buf[0] = 0; // Echo Reply for u2c path
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
@@ -527,23 +555,24 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             true,
         )
-        .expect("reflected source-ID shim should be tolerated on u2c");
+        .expect("reflected reply-ID negotiation should be tolerated on u2c");
         match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             } => {
-                assert_eq!(icmp.logical_src_ident, 0x04D2);
-                assert_eq!(icmp.shim_src_ident, Some(0x2002));
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002);
+                assert_eq!(icmp.advertised_reply_id, Some(0x2002));
             }
             other => panic!("unexpected event: {other:?}"),
         }
     }
 
     #[test]
-    fn validate_payload_rejects_initial_icmp_user_payload_without_source_id() {
+    fn validate_payload_rejects_initial_icmp_user_payload_without_reply_id_negotiation() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let buf = encode_icmp_user_payload(&[]);
@@ -557,18 +586,19 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
-        .expect_err("initial ICMP lock should require source-ID shim");
-        assert!(err.to_string().contains("requires source ID shim"));
+        .expect_err("initial ICMP lock should require reply-ID negotiation");
+        assert!(err.to_string().contains("requires reply-ID negotiation"));
     }
 
     #[test]
     fn validate_payload_adopts_shim_identifier_on_initial_handshake() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_source_id(0x2002, &[]);
+        let buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -579,6 +609,7 @@ mod tests {
             icmp_info,
             payload_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
@@ -587,15 +618,15 @@ mod tests {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             } => {
-                assert_eq!(icmp.logical_src_ident, 0x2002);
-                assert_eq!(icmp.shim_src_ident, Some(0x2002));
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002);
+                assert_eq!(icmp.advertised_reply_id, Some(0x2002));
             }
             other => panic!("unexpected event: {other:?}"),
         }
     }
 
     #[test]
-    fn icmp_source_id_shim_is_single_use_for_locked_flow_identity() {
+    fn icmp_reply_id_negotiation_is_single_use_for_locked_flow_identity() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let src = CanonicalAddr::new(
@@ -603,7 +634,7 @@ mod tests {
             0x04D2,
         );
 
-        let first = encode_icmp_user_payload_with_source_id(0x2002, b"a");
+        let first = encode_icmp_user_payload_with_reply_id(0x2002, b"a");
         let (first_info, first_bounds) = admitted_icmp(&first);
         let first_event = validate_payload(
             true,
@@ -613,10 +644,11 @@ mod tests {
             first_info,
             first_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             false,
         )
-        .expect("first C2U source-ID shim should establish ICMP identity");
+        .expect("first C2U reply-ID negotiation should establish ICMP identity");
         let locked_flow =
             ClientFlowKey::from_validated_client_payload(true, src, cfg.listen_proto, &first_event)
                 .expect("first C2U user payload should produce a flow key");
@@ -628,7 +660,7 @@ mod tests {
             }
         );
 
-        let second = encode_icmp_user_payload_with_source_id(0x3003, b"b");
+        let second = encode_icmp_user_payload_with_reply_id(0x3003, b"b");
         let (second_info, second_bounds) = admitted_icmp(&second);
         let second_err = validate_payload(
             true,
@@ -638,11 +670,16 @@ mod tests {
             second_info,
             second_bounds,
             None,
+            Some(0x2002),
             PayloadOrigin::Wire,
             true,
         )
-        .expect_err("locked C2U packet must reject a second source-ID shim");
-        assert!(second_err.to_string().contains("initial C2U lock"));
+        .expect_err("locked C2U packet must reject mismatched reply-ID negotiation");
+        assert!(
+            second_err
+                .to_string()
+                .contains("reply-ID renegotiation mismatch")
+        );
         assert_eq!(
             locked_flow,
             ClientFlowKey::IcmpV4 {
@@ -651,7 +688,7 @@ mod tests {
             }
         );
 
-        let mut reflected = encode_icmp_user_payload_with_source_id(0x2002, b"a");
+        let mut reflected = encode_icmp_user_payload_with_reply_id(0x2002, b"a");
         reflected[0] = 0;
         let (reflected_info, reflected_bounds) = admitted_icmp(&reflected);
         let reflected_event = validate_payload(
@@ -662,10 +699,11 @@ mod tests {
             reflected_info,
             reflected_bounds,
             None,
+            None,
             PayloadOrigin::Wire,
             true,
         )
-        .expect("reflected U2C source-ID shim should remain payload metadata only");
+        .expect("reflected U2C reply-ID negotiation should remain payload metadata only");
         assert_eq!(
             ClientFlowKey::from_validated_client_payload(
                 false,
@@ -685,26 +723,129 @@ mod tests {
     }
 
     #[test]
-    fn source_id_shim_for_c2u_uses_upstream_local_id_for_udp_sources() {
+    fn locked_icmp_c2u_without_shim_inherits_locked_logical_identity() {
+        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
+        let stats = Stats::new();
+        let buf = encode_icmp_user_payload(b"b");
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
+
+        let event = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            icmp_info,
+            payload_bounds,
+            None,
+            Some(0x2002),
+            PayloadOrigin::Wire,
+            true,
+        )
+        .expect("locked no-shim C2U packet should inherit locked logical identity");
+
+        match event {
+            PayloadEvent::UserPayload {
+                icmp: Some(icmp), ..
+            } => {
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002);
+                assert_eq!(icmp.inbound_header_ident, 0x04D2);
+                assert_eq!(icmp.advertised_reply_id, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn locked_icmp_c2u_with_matching_shim_keeps_locked_logical_identity() {
+        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
+        let stats = Stats::new();
+        let buf = encode_icmp_user_payload_with_reply_id(0x2002, b"b");
+        let (icmp_info, payload_bounds) = admitted_icmp(&buf);
+
+        let event = validate_payload(
+            true,
+            &cfg,
+            &stats,
+            &buf,
+            icmp_info,
+            payload_bounds,
+            None,
+            Some(0x2002),
+            PayloadOrigin::Wire,
+            true,
+        )
+        .expect("locked matching-shim C2U packet should preserve locked logical identity");
+
+        match event {
+            PayloadEvent::UserPayload {
+                icmp: Some(icmp), ..
+            } => {
+                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002);
+                assert_eq!(icmp.inbound_header_ident, 0x04D2);
+                assert_eq!(icmp.advertised_reply_id, Some(0x2002));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reply_id_negotiation_for_c2u_uses_upstream_local_id_for_udp_sources() {
         let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, b"abc");
 
-        assert_eq!(source_id_shim_for_c2u(&event, false, 4321), Some(4321));
-        assert_eq!(source_id_shim_for_c2u(&event, true, 4321), None);
+        assert_eq!(
+            reply_id_negotiation_for_c2u(&event, false, 4321),
+            Some(ReplyIdNegotiation {
+                reply_id: 4321,
+                negotiate: true,
+                ack: false
+            })
+        );
+        assert_eq!(reply_id_negotiation_for_c2u(&event, true, 4321), None);
     }
 
     #[test]
-    fn source_id_shim_for_c2u_propagates_logical_icmp_source_id() {
+    fn reply_id_negotiation_for_c2u_advertises_sender_upstream_reply_id() {
         let event =
-            PayloadEvent::user_payload(2002, 9, SupportedProtocol::ICMP, b"abc", Some(2002));
+            PayloadEvent::user_payload(2002, 2002, 9, SupportedProtocol::ICMP, b"abc", Some(2002));
 
-        assert_eq!(source_id_shim_for_c2u(&event, false, 9999), Some(2002));
+        assert_eq!(
+            reply_id_negotiation_for_c2u(&event, false, 9999),
+            Some(ReplyIdNegotiation {
+                reply_id: 9999,
+                negotiate: true,
+                ack: false
+            })
+        );
     }
 
     #[test]
-    fn source_id_shim_for_c2u_never_emits_for_session_control() {
-        let event =
-            PayloadEvent::session_control(2002, 9, SupportedProtocol::ICMP, &[], Some(2002));
+    fn reply_id_negotiation_for_u2c_advertises_explicit_listener_reply_id() {
+        let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, b"abc");
 
-        assert_eq!(source_id_shim_for_c2u(&event, false, 9999), None);
+        assert_eq!(
+            reply_id_negotiation_for_u2c_listener_reply(&event, Some(2002), Some(2002)),
+            Some(ReplyIdNegotiation {
+                reply_id: 2002,
+                negotiate: true,
+                ack: false
+            })
+        );
+        assert_eq!(
+            reply_id_negotiation_for_u2c_listener_reply(&event, None, Some(2002)),
+            None
+        );
+        let control = PayloadEvent::session_control(1, 1, 1, SupportedProtocol::ICMP, &[], None);
+        assert_eq!(
+            reply_id_negotiation_for_u2c_listener_reply(&control, Some(2002), Some(2002)),
+            None
+        );
+    }
+
+    #[test]
+    fn reply_id_negotiation_for_c2u_never_emits_for_session_control() {
+        let event =
+            PayloadEvent::session_control(2002, 2002, 9, SupportedProtocol::ICMP, &[], Some(2002));
+
+        assert_eq!(reply_id_negotiation_for_c2u(&event, false, 9999), None);
     }
 }

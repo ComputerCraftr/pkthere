@@ -538,8 +538,9 @@ fn test_raw_icmp_independent_ids() {
 
     let addr_a = NODE1_IPV4_STR;
     let addr_b = NODE1_IPV4_STR;
-    let id_a = 1001;
-    let id_b = 2002;
+    let id_a = 3003;
+    let id_b_listen = 1001;
+    let id_b_reply = 2002;
 
     let _node_c = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
@@ -560,8 +561,12 @@ fn test_raw_icmp_independent_ids() {
     let mut node_b = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
         debug_upstream_unconnected: false,
-        here: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
-        there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b),
+        here: render_icmp_arg_with_local(
+            addr_b.parse().expect("node b ip"),
+            id_b_listen,
+            id_b_reply,
+        ),
+        there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b_reply),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -577,7 +582,7 @@ fn test_raw_icmp_independent_ids() {
         debug_client_unconnected: false,
         debug_upstream_unconnected: false,
         here: IpFamily::V4.listen_arg().to_string(),
-        there: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b),
+        there: render_icmp_arg(addr_b.parse().expect("node b ip"), id_b_listen),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -610,6 +615,13 @@ fn test_raw_icmp_independent_ids() {
 
     let worker_b = worker_flow::locked_worker_flow(&stats_b);
     let client_remote_b = worker_flow::listener_outbound_remote(worker_b);
+    let client_local_b = worker_b["listener_flow_outbound"]
+        .as_str()
+        .and_then(|flow| flow.split_once(" -> ").map(|(src, _)| src))
+        .expect("listener_flow_outbound local");
+    let client_inbound_b = worker_b["listener_flow_inbound"]
+        .as_str()
+        .expect("listener_flow_inbound");
     let upstream_remote_b = worker_b["upstream_remote_filter_canonical"]
         .as_str()
         .expect("upstream_remote_filter_canonical");
@@ -617,7 +629,9 @@ fn test_raw_icmp_independent_ids() {
         .as_str()
         .expect("upstream_local_filter_canonical");
 
-    assert!(client_remote_b.contains(&id_b.to_string()));
+    assert!(client_remote_b.contains(&id_b_listen.to_string()));
+    assert!(client_local_b.contains(&id_b_reply.to_string()));
+    assert!(client_inbound_b.contains(&id_b_listen.to_string()));
     assert!(upstream_remote_b.contains(&id_a.to_string()));
-    assert!(upstream_local_b.contains(&id_b.to_string()));
+    assert!(upstream_local_b.contains(&id_b_reply.to_string()));
 }

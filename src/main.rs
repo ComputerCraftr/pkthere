@@ -197,6 +197,16 @@ fn main() -> io::Result<()> {
     if !listen_capability.connects_after_lock() {
         requested_cfg.debug_behavior.client_unconnected = true;
     }
+    if requested_cfg.listen_proto == SupportedProtocol::ICMP
+        && let Some(reply_id) = requested_cfg.listen_reply_id
+        && reply_id != actual_listen.id
+        && listen_sock_type != socket2::Type::RAW
+    {
+        return Err(io::Error::other(format!(
+            "ICMP listener requested independent listen/reply ids {} -> {} but socket type {:?} cannot preserve disjoint ICMP ids; use a raw-capable deployment",
+            actual_listen.id, reply_id, listen_sock_type
+        )));
+    }
 
     let cfg = Arc::new(realize_config(requested_cfg, actual_listen)?);
 

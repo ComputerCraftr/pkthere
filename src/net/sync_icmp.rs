@@ -192,7 +192,7 @@ pub(crate) fn classify_u2c(
                 io::ErrorKind::InvalidData,
                 format!(
                     "ICMP cadence packet arrived from wire (id={}, seq={})",
-                    icmp.logical_src_ident, icmp.seq
+                    icmp.negotiated_remote_reply_id, icmp.seq
                 ),
             ));
         }
@@ -361,6 +361,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
                 1234,
             ),
+            listen_reply_id: None,
             listen_proto: SupportedProtocol::UDP,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
@@ -397,9 +398,12 @@ mod tests {
         PayloadEvent::UserPayload {
             data: crate::net::payload::PayloadData { dst_proto, bytes },
             icmp: Some(IcmpPayloadMeta {
-                logical_src_ident: 0,
+                negotiated_remote_reply_id: 0,
+                inbound_header_ident: 0,
                 seq,
-                shim_src_ident: None,
+                advertised_reply_id: None,
+                reply_id_negotiate: false,
+                reply_id_ack: false,
             }),
         }
     }
@@ -411,9 +415,12 @@ mod tests {
                 bytes: &[],
             },
             icmp: IcmpPayloadMeta {
-                logical_src_ident: 0,
+                negotiated_remote_reply_id: 0,
+                inbound_header_ident: 0,
                 seq,
-                shim_src_ident: None,
+                advertised_reply_id: None,
+                reply_id_negotiate: false,
+                reply_id_ack: false,
             },
         }
     }
