@@ -57,12 +57,12 @@ pub(crate) fn wait_socket_until_readable(sock: &Socket, timeout: Duration) -> io
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let mut pfd = WSAPOLLFD {
             fd: sock.as_raw_socket() as usize,
-            events: POLLRDNORM as i16,
+            events: POLLRDNORM,
             revents: 0,
         };
         let rc = unsafe { WSAPoll(&mut pfd, 1, timeout_ms) };
         if rc > 0 {
-            return Ok((pfd.revents & (POLLRDNORM as i16)) != 0);
+            return Ok((pfd.revents & POLLRDNORM) != 0);
         }
         if rc == 0 {
             return Ok(false);

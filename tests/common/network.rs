@@ -98,7 +98,7 @@ pub fn ensure_loopback_ip(ip: Ipv4Addr) {
 
     let address_exists = || -> bool {
         let check = Command::new("powershell")
-            .args(&[
+            .args([
                 "-NoProfile",
                 "-Command",
                 &format!(
@@ -117,7 +117,7 @@ pub fn ensure_loopback_ip(ip: Ipv4Addr) {
     }
 
     let loopback = Command::new("powershell")
-        .args(&[
+        .args([
             "-NoProfile",
             "-Command",
             "Get-NetIPInterface -AddressFamily IPv4 | \
@@ -158,7 +158,7 @@ pub fn ensure_loopback_ip(ip: Ipv4Addr) {
         .unwrap_or_else(|| panic!("failed to parse InterfaceAlias from `{loopback_json}`"));
 
     let add = Command::new("powershell")
-        .args(&[
+        .args([
             "-NoProfile",
             "-Command",
             &format!(
@@ -171,7 +171,7 @@ pub fn ensure_loopback_ip(ip: Ipv4Addr) {
 
     if !add.status.success() {
         let netsh = Command::new("netsh")
-            .args(&[
+            .args([
                 "interface",
                 "ipv4",
                 "add",

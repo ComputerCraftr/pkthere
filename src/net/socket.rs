@@ -41,7 +41,9 @@ fn enable_rcvall(sock: &Socket) -> io::Result<()> {
     if res == 0 {
         Ok(())
     } else {
-        Err(io::Error::last_os_error())
+        use windows_sys::Win32::Networking::WinSock::WSAGetLastError;
+        let err = unsafe { WSAGetLastError() };
+        Err(io::Error::from_raw_os_error(err))
     }
 }
 
@@ -143,7 +145,7 @@ fn make_icmp_socket(
 ) -> io::Result<(Socket, Type)> {
     if force_raw {
         #[cfg(windows)]
-        let active_proto = Protocol::from_raw(0); // IPPROTO_IP
+        let active_proto = Protocol::from(0); // IPPROTO_IP
         #[cfg(not(windows))]
         let active_proto = proto;
 
