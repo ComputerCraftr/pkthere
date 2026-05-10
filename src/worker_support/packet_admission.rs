@@ -67,6 +67,7 @@ pub(crate) fn log_rejected_packet(
         .normalized_source
         .map(|source| source.to_string())
         .unwrap_or_else(|| String::from("<unknown>"));
+
     match rejected.reason {
         RejectionReason::UnexpectedRemotePeer => crate::log_debug_dir!(
             cfg.debug_logs.drops,

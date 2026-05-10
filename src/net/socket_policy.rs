@@ -8,12 +8,6 @@ pub(crate) enum SocketRole {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BindMode {
-    RequestedLocal,
-    WildcardKernel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StartupPeerMode {
     Connected,
     Unconnected,
@@ -41,7 +35,6 @@ pub(crate) enum TimeoutClearMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SocketReuseCapability {
-    pub bind_mode: BindMode,
     pub startup_peer_mode: StartupPeerMode,
     pub locked_peer_mode: LockedPeerMode,
     pub reresolve_mode: SocketReresolveMode,
@@ -49,11 +42,6 @@ pub(crate) struct SocketReuseCapability {
 }
 
 impl SocketReuseCapability {
-    #[inline]
-    pub(crate) const fn binds_wildcard(self) -> bool {
-        matches!(self.bind_mode, BindMode::WildcardKernel)
-    }
-
     #[inline]
     pub(crate) const fn starts_connected(self) -> bool {
         matches!(self.startup_peer_mode, StartupPeerMode::Connected)
@@ -93,7 +81,6 @@ fn listener_reuse_capability(
 ) -> SocketReuseCapability {
     if debug_unconnected || proto == SupportedProtocol::ICMP || sock_type == Type::RAW {
         SocketReuseCapability {
-            bind_mode: wildcard_listener_bind_mode(proto, sock_type),
             startup_peer_mode: StartupPeerMode::Unconnected,
             locked_peer_mode: LockedPeerMode::StayUnconnected,
             reresolve_mode: SocketReresolveMode::ReplaceSocket,
@@ -101,7 +88,6 @@ fn listener_reuse_capability(
         }
     } else {
         SocketReuseCapability {
-            bind_mode: BindMode::RequestedLocal,
             startup_peer_mode: StartupPeerMode::Unconnected,
             locked_peer_mode: if timeout_act == TimeoutAction::Exit
                 || cfg!(not(target_os = "freebsd"))
@@ -128,15 +114,6 @@ fn listener_reuse_capability(
     }
 }
 
-#[inline]
-fn wildcard_listener_bind_mode(proto: SupportedProtocol, sock_type: Type) -> BindMode {
-    if cfg!(windows) && (proto == SupportedProtocol::ICMP || sock_type == Type::RAW) {
-        BindMode::WildcardKernel
-    } else {
-        BindMode::RequestedLocal
-    }
-}
-
 fn upstream_reuse_capability(
     proto: SupportedProtocol,
     sock_type: Type,
@@ -144,7 +121,6 @@ fn upstream_reuse_capability(
 ) -> SocketReuseCapability {
     if cfg!(windows) && proto == SupportedProtocol::ICMP && sock_type == Type::RAW {
         return SocketReuseCapability {
-            bind_mode: BindMode::RequestedLocal,
             startup_peer_mode: StartupPeerMode::Connected,
             locked_peer_mode: LockedPeerMode::ConnectAfterLock,
             reresolve_mode: SocketReresolveMode::ReplaceSocket,
@@ -154,7 +130,6 @@ fn upstream_reuse_capability(
 
     if debug_unconnected {
         SocketReuseCapability {
-            bind_mode: BindMode::RequestedLocal,
             startup_peer_mode: StartupPeerMode::Unconnected,
             locked_peer_mode: LockedPeerMode::StayUnconnected,
             reresolve_mode: SocketReresolveMode::MetadataOnlyWhenUnconnected,
@@ -162,7 +137,6 @@ fn upstream_reuse_capability(
         }
     } else if sock_type == Type::RAW {
         SocketReuseCapability {
-            bind_mode: BindMode::RequestedLocal,
             startup_peer_mode: StartupPeerMode::Connected,
             locked_peer_mode: LockedPeerMode::ConnectAfterLock,
             reresolve_mode: SocketReresolveMode::ReplaceSocket,
@@ -170,7 +144,6 @@ fn upstream_reuse_capability(
         }
     } else {
         SocketReuseCapability {
-            bind_mode: BindMode::RequestedLocal,
             startup_peer_mode: StartupPeerMode::Connected,
             locked_peer_mode: LockedPeerMode::ConnectAfterLock,
             reresolve_mode: SocketReresolveMode::ReconnectInPlace,
@@ -182,8 +155,8 @@ fn upstream_reuse_capability(
 #[cfg(test)]
 mod tests {
     use super::{
-        BindMode, LockedPeerMode, SocketReresolveMode, SocketReuseCapability, SocketRole,
-        StartupPeerMode, TimeoutClearMode, socket_reuse_capability,
+        LockedPeerMode, SocketReresolveMode, SocketReuseCapability, SocketRole, StartupPeerMode,
+        TimeoutClearMode, socket_reuse_capability,
     };
     use crate::cli::{SupportedProtocol, TimeoutAction};
     use socket2::Type;
@@ -204,7 +177,6 @@ mod tests {
         assert_capability(
             exit_policy,
             SocketReuseCapability {
-                bind_mode: BindMode::RequestedLocal,
                 startup_peer_mode: StartupPeerMode::Unconnected,
                 locked_peer_mode: LockedPeerMode::ConnectAfterLock,
                 reresolve_mode: SocketReresolveMode::ReconnectInPlace,
@@ -236,7 +208,6 @@ mod tests {
         assert_capability(
             drop_policy,
             SocketReuseCapability {
-                bind_mode: BindMode::RequestedLocal,
                 startup_peer_mode: StartupPeerMode::Unconnected,
                 locked_peer_mode,
                 reresolve_mode,
@@ -257,11 +228,6 @@ mod tests {
         assert_capability(
             policy,
             SocketReuseCapability {
-                bind_mode: if cfg!(windows) {
-                    BindMode::WildcardKernel
-                } else {
-                    BindMode::RequestedLocal
-                },
                 startup_peer_mode: StartupPeerMode::Unconnected,
                 locked_peer_mode: LockedPeerMode::StayUnconnected,
                 reresolve_mode: SocketReresolveMode::ReplaceSocket,
@@ -325,7 +291,6 @@ mod tests {
         assert_capability(
             policy,
             SocketReuseCapability {
-                bind_mode: BindMode::RequestedLocal,
                 startup_peer_mode: StartupPeerMode::Connected,
                 locked_peer_mode: LockedPeerMode::ConnectAfterLock,
                 reresolve_mode: SocketReresolveMode::ReplaceSocket,
@@ -347,34 +312,12 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(policy.startup_peer_mode, StartupPeerMode::Connected);
-            assert_eq!(policy.bind_mode, BindMode::RequestedLocal);
         }
 
         #[cfg(not(windows))]
         {
             assert_eq!(policy.startup_peer_mode, StartupPeerMode::Unconnected);
-            assert_eq!(policy.bind_mode, BindMode::RequestedLocal);
         }
-    }
-
-    #[test]
-    fn raw_icmp_listener_wildcard_bind_is_windows_only() {
-        let policy = socket_reuse_capability(
-            SocketRole::Listener,
-            SupportedProtocol::ICMP,
-            Type::RAW,
-            TimeoutAction::Drop,
-            false,
-        );
-
-        assert_eq!(
-            policy.bind_mode,
-            if cfg!(windows) {
-                BindMode::WildcardKernel
-            } else {
-                BindMode::RequestedLocal
-            }
-        );
     }
 
     #[test]
@@ -390,7 +333,6 @@ mod tests {
         assert_capability(
             policy,
             SocketReuseCapability {
-                bind_mode: BindMode::RequestedLocal,
                 startup_peer_mode: StartupPeerMode::Unconnected,
                 locked_peer_mode: LockedPeerMode::StayUnconnected,
                 reresolve_mode: SocketReresolveMode::MetadataOnlyWhenUnconnected,
@@ -412,7 +354,6 @@ mod tests {
             assert_capability(
                 default_policy,
                 SocketReuseCapability {
-                    bind_mode: BindMode::RequestedLocal,
                     startup_peer_mode: StartupPeerMode::Connected,
                     locked_peer_mode: LockedPeerMode::ConnectAfterLock,
                     reresolve_mode: SocketReresolveMode::ReconnectInPlace,
@@ -430,7 +371,6 @@ mod tests {
             assert_capability(
                 debug_policy,
                 SocketReuseCapability {
-                    bind_mode: BindMode::RequestedLocal,
                     startup_peer_mode: StartupPeerMode::Unconnected,
                     locked_peer_mode: LockedPeerMode::StayUnconnected,
                     reresolve_mode: SocketReresolveMode::MetadataOnlyWhenUnconnected,

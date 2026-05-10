@@ -16,6 +16,35 @@ use std::time::Duration;
 
 const CADENCE_PROBE_SEQ: u16 = 0;
 
+#[cfg(windows)]
+fn enable_rcvall(sock: &Socket) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{RCVALL_IPLEVEL, SIO_RCVALL, WSAIoctl};
+
+    let mut bytes_returned = 0;
+    let option: u32 = RCVALL_IPLEVEL as u32;
+
+    let res = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as _,
+            SIO_RCVALL,
+            &option as *const _ as _,
+            std::mem::size_of_val(&option) as _,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Create a socket (UDP datagram or ICMP) bound to `bind_addr`.
 /// Returns the socket and the actual local SocketAddr after bind (for ICMP
 /// datagram sockets the kernel may assign an identifier/port). When ICMP is
@@ -73,7 +102,6 @@ pub(crate) fn make_socket(
         timeout_act,
         debug_unconnected,
     );
-    let should_bind_wildcard = capability.binds_wildcard();
 
     // Best-effort bigger buffers
     let _ = sock.set_recv_buffer_size(1 << 20);
@@ -87,15 +115,12 @@ pub(crate) fn make_socket(
     })?;
 
     // Bind
-    let bind_sa = SockAddr::from(if should_bind_wildcard {
-        match domain {
-            Domain::IPV6 => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), bind_addr.port()),
-            _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bind_addr.port()),
-        }
-    } else {
-        bind_addr
-    });
-    sock.bind(&bind_sa)?;
+    sock.bind(&SockAddr::from(bind_addr))?;
+
+    #[cfg(windows)]
+    if is_icmp && sock_type == Type::RAW {
+        enable_rcvall(&sock)?;
+    }
 
     let kernel_local = CanonicalAddr::from_socket_addr(
         sock.local_addr()?
@@ -117,7 +142,15 @@ fn make_icmp_socket(
     force_raw: bool,
 ) -> io::Result<(Socket, Type)> {
     if force_raw {
-        return Ok((Socket::new(domain, Type::RAW, Some(proto))?, Type::RAW));
+        #[cfg(windows)]
+        let active_proto = Protocol::from_raw(0); // IPPROTO_IP
+        #[cfg(not(windows))]
+        let active_proto = proto;
+
+        return Ok((
+            Socket::new(domain, Type::RAW, Some(active_proto))?,
+            Type::RAW,
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -497,7 +530,7 @@ mod tests {
     #[test]
     fn udp_listener_reports_logical_and_kernel_identity() {
         let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let (_sock, logical, kernel, sock_type, capability) = make_socket(
+        let (_sock, logical, kernel, sock_type, _capability) = make_socket(
             listen_addr,
             SupportedProtocol::UDP,
             1000,
@@ -508,7 +541,6 @@ mod tests {
         .expect("udp listener socket");
 
         assert_eq!(sock_type, Type::DGRAM);
-        assert!(!capability.binds_wildcard());
         assert_eq!(logical, kernel);
         assert!(!logical.addr.ip().is_unspecified());
         assert_ne!(logical.id, 0);
