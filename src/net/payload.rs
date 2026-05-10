@@ -364,18 +364,18 @@ pub(crate) fn validate_payload<'a>(
 pub(crate) fn reply_id_negotiation_for_c2u(
     event: &PayloadEvent<'_>,
     reply_id_acked: bool,
-    upstream_local_id: u16,
+    advertised_local_reply_id: u16,
 ) -> Option<ReplyIdNegotiation> {
     let dst_proto = match event {
         PayloadEvent::UserPayload { data, .. } => data.dst_proto,
         _ => return None,
     };
-    if reply_id_acked || dst_proto != SupportedProtocol::ICMP || upstream_local_id == 0 {
+    if reply_id_acked || dst_proto != SupportedProtocol::ICMP || advertised_local_reply_id == 0 {
         return None;
     }
 
     Some(ReplyIdNegotiation {
-        reply_id: upstream_local_id,
+        reply_id: advertised_local_reply_id,
         negotiate: true,
         ack: false,
     })
@@ -384,13 +384,12 @@ pub(crate) fn reply_id_negotiation_for_c2u(
 #[inline]
 pub(crate) fn reply_id_negotiation_for_u2c_listener_reply(
     event: &PayloadEvent<'_>,
-    explicit_listen_reply_id: Option<u16>,
-    listener_reply_id: Option<u16>,
+    advertised_local_reply_id: Option<u16>,
 ) -> Option<ReplyIdNegotiation> {
-    if !event.is_user_payload() || explicit_listen_reply_id.is_none() {
+    if !event.is_user_payload() {
         return None;
     }
-    listener_reply_id
+    advertised_local_reply_id
         .filter(|id| *id != 0)
         .map(|reply_id| ReplyIdNegotiation {
             reply_id,

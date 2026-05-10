@@ -9,7 +9,7 @@ pub use network::{
     ALL_IP_FAMILIES, IpFamily, NODE1_IPV4, NODE1_IPV4_STR, NODE2_IPV4, NODE2_IPV4_STR, NODE3_IPV4,
     NODE3_IPV4_STR, bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg,
     ensure_loopback_ip, localhost_addr, random_unprivileged_port, render_canonical_ip_id,
-    render_icmp_arg, render_icmp_arg_with_local, spawn_udp_echo_server,
+    render_icmp_arg, render_icmp_arg_with_reply_id, spawn_udp_echo_server,
 };
 pub use runtime_io::{
     strip_log_prefix, take_child_stdout, wait_for_listen_addr_from, wait_for_stats_json_from,

@@ -150,8 +150,8 @@ impl CachedClientState {
 mod tests {
     use super::{CachedClientState, SocketHandles};
     use crate::cli::{
-        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
-        TimeoutAction, WorkerFlowMode,
+        DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
+        SupportedProtocol, TimeoutAction, WorkerFlowMode,
     };
     use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
     use crate::net::params::CanonicalAddr;
@@ -164,7 +164,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
                 8888,
             ),
-            listen_reply_id: None,
+            listener_reply_id_request: IcmpReplyIdRequest::Default,
             listen_proto: lp,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("127.0.0.1:8888"),
@@ -174,7 +174,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
                 9999,
             ),
-            upstream_local_id: 0,
+            upstream_reply_id_request: IcmpReplyIdRequest::Default,
             upstream_proto: up,
             upstream_str: String::from("127.0.0.1:9999"),
             timeout_secs: 10,

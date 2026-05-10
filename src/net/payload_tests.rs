@@ -19,10 +19,9 @@ fn test_icmp_echo_header(ident: u16, seq: u16) -> [u8; 8] {
 mod tests {
     use super::*;
     use crate::cli::{
-        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, RuntimeConfig, SupportedProtocol,
-        TimeoutAction, WorkerFlowMode,
+        DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
+        SupportedProtocol, TimeoutAction, WorkerFlowMode,
     };
-    use crate::flow_key::ClientFlowKey;
     use crate::net::framing_shim::{
         ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, ReplyIdNegotiation,
         encode_icmp_tunnel_prefix,
@@ -41,7 +40,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
                 1234,
             ),
-            listen_reply_id: None,
+            listener_reply_id_request: IcmpReplyIdRequest::Default,
             listen_proto,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
@@ -51,7 +50,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321)),
                 4321,
             ),
-            upstream_local_id: 0,
+            upstream_reply_id_request: IcmpReplyIdRequest::Default,
             upstream_proto,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,
@@ -629,11 +628,6 @@ mod tests {
     fn icmp_reply_id_negotiation_is_single_use_for_locked_flow_identity() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let src = CanonicalAddr::new(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 0)),
-            0x04D2,
-        );
-
         let first = encode_icmp_user_payload_with_reply_id(0x2002, b"a");
         let (first_info, first_bounds) = admitted_icmp(&first);
         let first_event = validate_payload(
@@ -649,16 +643,16 @@ mod tests {
             false,
         )
         .expect("first C2U reply-ID negotiation should establish ICMP identity");
-        let locked_flow =
-            ClientFlowKey::from_validated_client_payload(true, src, cfg.listen_proto, &first_event)
-                .expect("first C2U user payload should produce a flow key");
-        assert_eq!(
-            locked_flow,
-            ClientFlowKey::IcmpV4 {
-                ip: Ipv4Addr::new(127, 0, 0, 2),
-                ident: 0x2002,
+        assert!(matches!(
+            first_event,
+            PayloadEvent::UserPayload {
+                icmp: Some(crate::net::payload::IcmpPayloadMeta {
+                    negotiated_remote_reply_id: 0x2002,
+                    ..
+                }),
+                ..
             }
-        );
+        ));
 
         let second = encode_icmp_user_payload_with_reply_id(0x3003, b"b");
         let (second_info, second_bounds) = admitted_icmp(&second);
@@ -680,13 +674,6 @@ mod tests {
                 .to_string()
                 .contains("reply-ID renegotiation mismatch")
         );
-        assert_eq!(
-            locked_flow,
-            ClientFlowKey::IcmpV4 {
-                ip: Ipv4Addr::new(127, 0, 0, 2),
-                ident: 0x2002,
-            }
-        );
 
         let mut reflected = encode_icmp_user_payload_with_reply_id(0x2002, b"a");
         reflected[0] = 0;
@@ -704,22 +691,16 @@ mod tests {
             true,
         )
         .expect("reflected U2C reply-ID negotiation should remain payload metadata only");
-        assert_eq!(
-            ClientFlowKey::from_validated_client_payload(
-                false,
-                src,
-                cfg.listen_proto,
-                &reflected_event
-            ),
-            None
-        );
-        assert_eq!(
-            locked_flow,
-            ClientFlowKey::IcmpV4 {
-                ip: Ipv4Addr::new(127, 0, 0, 2),
-                ident: 0x2002,
+        assert!(matches!(
+            reflected_event,
+            PayloadEvent::UserPayload {
+                icmp: Some(crate::net::payload::IcmpPayloadMeta {
+                    advertised_reply_id: Some(0x2002),
+                    ..
+                }),
+                ..
             }
-        );
+        ));
     }
 
     #[test]
@@ -789,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_id_negotiation_for_c2u_uses_upstream_local_id_for_udp_sources() {
+    fn reply_id_negotiation_for_c2u_uses_advertised_local_reply_id_for_udp_sources() {
         let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, b"abc");
 
         assert_eq!(
@@ -823,7 +804,7 @@ mod tests {
         let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, b"abc");
 
         assert_eq!(
-            reply_id_negotiation_for_u2c_listener_reply(&event, Some(2002), Some(2002)),
+            reply_id_negotiation_for_u2c_listener_reply(&event, Some(2002)),
             Some(ReplyIdNegotiation {
                 reply_id: 2002,
                 negotiate: true,
@@ -831,12 +812,12 @@ mod tests {
             })
         );
         assert_eq!(
-            reply_id_negotiation_for_u2c_listener_reply(&event, None, Some(2002)),
+            reply_id_negotiation_for_u2c_listener_reply(&event, None),
             None
         );
         let control = PayloadEvent::session_control(1, 1, 1, SupportedProtocol::ICMP, &[], None);
         assert_eq!(
-            reply_id_negotiation_for_u2c_listener_reply(&control, Some(2002), Some(2002)),
+            reply_id_negotiation_for_u2c_listener_reply(&control, Some(2002)),
             None
         );
     }

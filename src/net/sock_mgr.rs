@@ -1,4 +1,4 @@
-use crate::cli::{SupportedProtocol, TimeoutAction};
+use crate::cli::{IcmpReplyIdRequest, SupportedProtocol, TimeoutAction};
 use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
 use crate::net::params::CanonicalAddr;
 use crate::net::socket::{
@@ -146,7 +146,7 @@ pub(crate) struct SocketManager {
     listen_debug_unconnected: bool,
     upstream_state: Mutex<UpstreamState>, // cold-path updates only
     upstream_target: String,              // unresolved --there host:port
-    upstream_local_id: u16,
+    upstream_reply_id_request: IcmpReplyIdRequest,
     upstream_proto: SupportedProtocol, // never changes
     upstream_debug_unconnected: bool,
     debug_handles: bool,
@@ -166,7 +166,7 @@ impl SocketManager {
         listen_debug_unconnected: bool,
         upstream_remote_filter: CanonicalAddr,
         upstream_target: String,
-        upstream_local_id: u16,
+        upstream_reply_id_request: IcmpReplyIdRequest,
         upstream_proto: SupportedProtocol,
         upstream_debug_unconnected: bool,
         timeout_act: TimeoutAction,
@@ -182,8 +182,8 @@ impl SocketManager {
         ) = make_upstream_socket_for(
             upstream_remote_filter,
             upstream_proto,
-            upstream_local_id,
-            upstream_local_id == 0,
+            upstream_reply_id_request.requested_socket_id(),
+            upstream_reply_id_request.requested_socket_id() == 0,
             timeout_act,
             upstream_debug_unconnected,
             debug_handles,
@@ -213,7 +213,7 @@ impl SocketManager {
                 capability: upstream_capability,
             }),
             upstream_target,
-            upstream_local_id,
+            upstream_reply_id_request,
             upstream_proto,
             upstream_debug_unconnected,
             debug_handles,
@@ -441,8 +441,8 @@ impl SocketManager {
                     ) = make_upstream_socket_for(
                         fresh,
                         self.upstream_proto,
-                        self.upstream_local_id,
-                        self.upstream_local_id == 0,
+                        self.upstream_reply_id_request.requested_socket_id(),
+                        self.upstream_reply_id_request.requested_socket_id() == 0,
                         self.timeout_action,
                         self.upstream_debug_unconnected,
                         self.debug_handles,
@@ -496,8 +496,8 @@ impl SocketManager {
                 ) = make_upstream_socket_for(
                     fresh,
                     self.upstream_proto,
-                    self.upstream_local_id,
-                    self.upstream_local_id == 0,
+                    self.upstream_reply_id_request.requested_socket_id(),
+                    self.upstream_reply_id_request.requested_socket_id() == 0,
                     self.timeout_action,
                     self.upstream_debug_unconnected,
                     self.debug_handles,
@@ -764,7 +764,7 @@ mod tests {
             false,
             CanonicalAddr::from_socket_addr(upstream_addr),
             upstream_addr.to_string(),
-            0,
+            IcmpReplyIdRequest::Default,
             SupportedProtocol::UDP,
             false,
             Drop,

@@ -345,8 +345,9 @@ fn help_mentions_worker_mode_and_dynamic_port_id_semantics() {
         "--here udp:host:0        bind an ephemeral local udp port",
         "--here icmp:host:0       wildcard-learn icmp listener",
         "fixed icmp listener id n (requires raw sockets on linux/android)",
-        "--there icmp:host:0      dynamic local icmp source id",
+        "--there icmp:host:0      dynamic/wildcard local icmp reply id",
         "fixed remote icmp peer/listener id n (requires raw sockets on linux/android)",
+        "preferred local reply id r; r=0 wildcard-negotiates",
         "--icmp-sync-pps n        global total best-effort icmp sync request target in packets/s",
         "--reresolve-mode what    which sockets to re-resolve: upstream|listen|both|none (default: upstream)",
         "--debug-client-unconnected leave locked client/listener socket unconnected for debug/relock behavior",
@@ -432,7 +433,7 @@ fn startup_logs_clarify_dynamic_icmp_upstream_mode() {
     );
     let out_lower = out.to_lowercase();
     assert!(
-        out_lower.contains("icmp upstream mode: dynamic local source id"),
+        out_lower.contains("icmp upstream mode: dynamic/wildcard local reply id"),
         "stdout missing dynamic ICMP upstream clarification: {out}"
     );
     assert!(
@@ -537,7 +538,7 @@ fn rejects_malformed_ipv6_icmp_upstream_shapes() {
         ("ICMP:::1:1234", "ICMP IPv6 addresses must use brackets"),
         (
             "ICMP:[::1]:1:2:3",
-            "must use ICMP:<host>:<remote_id> or ICMP:[<ipv6>]:<remote_id>[:<local_id>]",
+            "must use ICMP:<host>:<remote_id> or ICMP:[<ipv6>]:<remote_id>[:<reply_id>]",
         ),
     ] {
         assert_cli_rejects(&["--here", &here, "--there", there], &[expected]);

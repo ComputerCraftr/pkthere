@@ -346,7 +346,8 @@ pub(crate) fn prepare_send(
 mod tests {
     use super::*;
     use crate::cli::{
-        DebugBehavior, DebugLogs, ListenMode, ReresolveMode, TimeoutAction, WorkerFlowMode,
+        DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, TimeoutAction,
+        WorkerFlowMode,
     };
     use crate::net::params::CanonicalAddr;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -361,7 +362,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1234)),
                 1234,
             ),
-            listen_reply_id: None,
+            listener_reply_id_request: IcmpReplyIdRequest::Default,
             listen_proto: SupportedProtocol::UDP,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("test-listen"),
@@ -371,7 +372,7 @@ mod tests {
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 2222)),
                 2222,
             ),
-            upstream_local_id: 0,
+            upstream_reply_id_request: IcmpReplyIdRequest::Default,
             upstream_proto: SupportedProtocol::ICMP,
             upstream_str: String::from("test-upstream"),
             timeout_secs: 10,

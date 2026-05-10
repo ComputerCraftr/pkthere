@@ -14,7 +14,7 @@ use crate::orchestrator::{
     CLIENT_WAIT_MS, ForwarderConfig, IpFamily, JSON_WAIT_MS, NODE1_IPV4_STR, NODE2_IPV4,
     NODE2_IPV4_STR, NODE3_IPV4, OutputCapture, bind_udp_client, default_test_icmp_upstream_arg,
     ensure_loopback_ip, expect_session_stats_matching, launch_forwarder, localhost_addr,
-    random_unprivileged_port, render_icmp_arg, render_icmp_arg_with_local, try_launch_forwarder,
+    random_unprivileged_port, render_icmp_arg, render_icmp_arg_with_reply_id, try_launch_forwarder,
 };
 
 use std::io::ErrorKind;
@@ -561,12 +561,12 @@ fn test_raw_icmp_independent_ids() {
     let mut node_b = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
         debug_upstream_unconnected: false,
-        here: render_icmp_arg_with_local(
+        here: render_icmp_arg_with_reply_id(
             addr_b.parse().expect("node b ip"),
             id_b_listen,
             id_b_reply,
         ),
-        there: render_icmp_arg_with_local(addr_a.parse().expect("node a ip"), id_a, id_b_reply),
+        there: render_icmp_arg_with_reply_id(addr_a.parse().expect("node a ip"), id_a, id_b_reply),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,

@@ -72,10 +72,10 @@ pub fn render_icmp_arg(ip: IpAddr, remote_id: u16) -> String {
     }
 }
 
-pub fn render_icmp_arg_with_local(ip: IpAddr, remote_id: u16, local_id: u16) -> String {
+pub fn render_icmp_arg_with_reply_id(ip: IpAddr, remote_id: u16, reply_id: u16) -> String {
     match ip {
-        IpAddr::V4(ip) => format!("ICMP:{ip}:{remote_id}:{local_id}"),
-        IpAddr::V6(ip) => format!("ICMP:[{ip}]:{remote_id}:{local_id}"),
+        IpAddr::V4(ip) => format!("ICMP:{ip}:{remote_id}:{reply_id}"),
+        IpAddr::V6(ip) => format!("ICMP:[{ip}]:{remote_id}:{reply_id}"),
     }
 }
 
@@ -252,7 +252,7 @@ pub fn spawn_udp_echo_server(family: IpFamily) -> io::Result<(SocketAddr, thread
 mod tests {
     use super::{
         IpFamily, default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
-        render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_local,
+        render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_reply_id,
     };
     use std::net::{IpAddr, Ipv6Addr};
 
@@ -282,7 +282,7 @@ mod tests {
             "ICMP:[::1]:1234"
         );
         assert_eq!(
-            render_icmp_arg_with_local(IpAddr::V6(Ipv6Addr::LOCALHOST), 2002, 1001),
+            render_icmp_arg_with_reply_id(IpAddr::V6(Ipv6Addr::LOCALHOST), 2002, 1001),
             "ICMP:[::1]:2002:1001"
         );
         assert_eq!(

@@ -103,7 +103,7 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
     if cfg.upstream_proto == SupportedProtocol::ICMP {
         if cfg.upstream.id == 0 {
             log_info!(
-                "ICMP upstream mode: dynamic local source id (--there ICMP:host:0 uses a kernel-assigned ping-socket id)"
+                "ICMP upstream mode: dynamic/wildcard local reply id (--there ICMP:host:0 advertises the realized ping-socket id)"
             );
         } else {
             log_info!(
@@ -198,7 +198,8 @@ fn main() -> io::Result<()> {
         requested_cfg.debug_behavior.client_unconnected = true;
     }
     if requested_cfg.listen_proto == SupportedProtocol::ICMP
-        && let Some(reply_id) = requested_cfg.listen_reply_id
+        && let crate::cli::IcmpReplyIdRequest::Fixed(reply_id) =
+            requested_cfg.listener_reply_id_request
         && reply_id != actual_listen.id
         && listen_sock_type != socket2::Type::RAW
     {
@@ -224,7 +225,7 @@ fn main() -> io::Result<()> {
         cfg.debug_behavior.client_unconnected,
         cfg.upstream,
         cfg.upstream_str.clone(),
-        cfg.upstream_local_id,
+        cfg.upstream_reply_id_request,
         cfg.upstream_proto,
         cfg.debug_behavior.upstream_unconnected,
         cfg.on_timeout,
@@ -252,7 +253,7 @@ fn main() -> io::Result<()> {
             cfg.debug_behavior.client_unconnected,
             cfg.upstream,
             cfg.upstream_str.clone(),
-            cfg.upstream_local_id,
+            cfg.upstream_reply_id_request,
             cfg.upstream_proto,
             cfg.debug_behavior.upstream_unconnected,
             cfg.on_timeout,

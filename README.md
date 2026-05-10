@@ -41,9 +41,11 @@ Dynamic `:0` semantics:
 
 - `--here UDP:host:0` binds an ephemeral local UDP port.
 - `--there UDP:host:port` still means a fixed remote UDP destination port.
-- `--here ICMP:host:0` enables wildcard-learn ICMP listening and learns the peer ICMP ID on first lock.
-- `--there ICMP:host:0` means a dynamic local ICMP source ID chosen by the kernel ping socket.
-- Nonzero ICMP IDs remain fixed listener/peer IDs (on Linux/Android, requesting a fixed nonzero ICMP ID forces the use of privileged raw sockets).
+- `--here ICMP:host:0` enables wildcard-learn ICMP listening.
+- ICMP targets may include an optional reply ID: `ICMP:host:listen_id[:reply_id]` for `--here` and `ICMP:host:remote_listen_id[:reply_id]` for `--there`.
+- Omitted reply ID uses the normal realized local endpoint ID. Explicit nonzero reply ID prefers that exact reply endpoint. Explicit `:0` requests wildcard reply-ID negotiation and yields to the peer preference when possible.
+- The ICMP shim negotiates reply IDs: each side advertises the ICMP ID it wants peers to send replies to. RAW/wildcard-capable sockets can preserve disjoint IDs; fixed DGRAM sockets reject unsupported disjoint reply-ID negotiation with a clear error.
+- Nonzero ICMP listen/remote IDs remain fixed listener/peer IDs (on Linux/Android, requesting a fixed nonzero ICMP ID forces the use of privileged raw sockets).
 - Policy-driven unconnected modes also exist:
   - FreeBSD timeout-drop forces the client/listener side unconnected.
   - Windows raw ICMP upstream forces the upstream side unconnected.

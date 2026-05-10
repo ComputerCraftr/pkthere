@@ -23,7 +23,7 @@ pub use matrix::{
     NODE1_IPV4_STR, NODE2_IPV4, NODE2_IPV4_STR, NODE3_IPV4, NODE3_IPV4_STR, bind_client_or_skip,
     bind_udp_client, default_test_icmp_upstream_arg, default_test_upstream_arg, ensure_loopback_ip,
     localhost_addr, random_unprivileged_port, render_canonical_ip_id, render_icmp_arg,
-    render_icmp_arg_with_local, run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server,
+    render_icmp_arg_with_reply_id, run_matrix_cases, spawn_echo_or_skip, spawn_udp_echo_server,
     spawn_upstream_echo_or_skip,
 };
 pub use raw_icmp::{
