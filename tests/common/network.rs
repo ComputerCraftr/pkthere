@@ -1,8 +1,10 @@
 //! UDP test-network helpers shared across integration-style test targets.
 
 use crate::orchestrator::CLIENT_WAIT_MS;
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,36 +88,175 @@ pub fn render_canonical_ip_id(ip: IpAddr, id: u16) -> String {
     }
 }
 
-#[cfg(windows)]
-pub fn ensure_loopback_ip(ip: Ipv4Addr) {
+#[derive(Debug)]
+pub struct LoopbackAliasGuard {
+    ip: Option<Ipv4Addr>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LoopbackAliasState {
+    refs: usize,
+    created_by_test: bool,
+}
+
+static LOOPBACK_ALIASES: OnceLock<Mutex<HashMap<Ipv4Addr, LoopbackAliasState>>> = OnceLock::new();
+
+fn loopback_aliases() -> &'static Mutex<HashMap<Ipv4Addr, LoopbackAliasState>> {
+    LOOPBACK_ALIASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn ensure_loopback_ip(ip: Ipv4Addr) -> io::Result<LoopbackAliasGuard> {
+    if ip == Ipv4Addr::LOCALHOST || !platform_needs_explicit_loopback_alias() {
+        return Ok(LoopbackAliasGuard { ip: None });
+    }
+
+    let mut aliases = loopback_aliases()
+        .lock()
+        .expect("loopback alias registry lock");
+    if let Some(state) = aliases.get_mut(&ip) {
+        state.refs += 1;
+        return Ok(LoopbackAliasGuard { ip: Some(ip) });
+    }
+
+    let already_exists = loopback_alias_exists(ip)?;
+    if !already_exists {
+        create_loopback_alias(ip)?;
+        if !loopback_alias_exists(ip)? {
+            return Err(io::Error::other(format!(
+                "attempted to add loopback alias {ip}, but the OS still does not report it"
+            )));
+        }
+    }
+
+    aliases.insert(
+        ip,
+        LoopbackAliasState {
+            refs: 1,
+            created_by_test: !already_exists,
+        },
+    );
+    Ok(LoopbackAliasGuard { ip: Some(ip) })
+}
+
+impl Drop for LoopbackAliasGuard {
+    fn drop(&mut self) {
+        let Some(ip) = self.ip.take() else {
+            return;
+        };
+
+        let should_delete = {
+            let mut aliases = loopback_aliases()
+                .lock()
+                .expect("loopback alias registry lock");
+            let Some(state) = aliases.get_mut(&ip) else {
+                return;
+            };
+            state.refs -= 1;
+            if state.refs == 0 {
+                let created_by_test = state.created_by_test;
+                aliases.remove(&ip);
+                created_by_test
+            } else {
+                false
+            }
+        };
+
+        if should_delete && let Err(err) = delete_loopback_alias(ip) {
+            eprintln!("failed to remove test-created loopback alias {ip}: {err}");
+        }
+    }
+}
+
+#[cfg(any(windows, target_os = "macos"))]
+fn platform_needs_explicit_loopback_alias() -> bool {
+    true
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn platform_needs_explicit_loopback_alias() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn loopback_alias_exists(ip: Ipv4Addr) -> io::Result<bool> {
     use std::process::Command;
 
-    if ip == Ipv4Addr::new(127, 0, 0, 1) {
-        return;
+    let output = Command::new("ifconfig").arg("lo0").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "failed to inspect macOS lo0 while checking {ip}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
+    let needle = format!("inet {ip} ");
+    Ok(String::from_utf8_lossy(&output.stdout).contains(&needle))
+}
+
+#[cfg(target_os = "macos")]
+fn create_loopback_alias(ip: Ipv4Addr) -> io::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("sudo")
+        .args([
+            "-n",
+            "ifconfig",
+            "lo0",
+            "alias",
+            &ip.to_string(),
+            "255.255.255.255",
+        ])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not add macOS loopback alias {ip}; expected passwordless sudo for `ifconfig lo0 alias`. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn delete_loopback_alias(ip: Ipv4Addr) -> io::Result<()> {
+    use std::process::Command;
+
+    let output = Command::new("sudo")
+        .args(["-n", "ifconfig", "lo0", "-alias", &ip.to_string()])
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "could not remove macOS loopback alias {ip}. stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+#[cfg(windows)]
+fn loopback_alias_exists(ip: Ipv4Addr) -> io::Result<bool> {
+    use std::process::Command;
 
     let ip_s = ip.to_string();
+    let check = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Get-NetIPAddress -AddressFamily IPv4 -IPAddress '{}' -ErrorAction SilentlyContinue",
+                ip_s
+            ),
+        ])
+        .output()?;
 
-    let address_exists = || -> bool {
-        let check = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                &format!(
-                    "Get-NetIPAddress -AddressFamily IPv4 -IPAddress '{}' -ErrorAction SilentlyContinue",
-                    ip_s
-                ),
-            ])
-            .output()
-            .expect("failed to check loopback IP address");
+    Ok(check.status.success() && !String::from_utf8_lossy(&check.stdout).trim().is_empty())
+}
 
-        check.status.success() && !String::from_utf8_lossy(&check.stdout).trim().is_empty()
-    };
+#[cfg(windows)]
+fn create_loopback_alias(ip: Ipv4Addr) -> io::Result<()> {
+    use std::process::Command;
 
-    if address_exists() {
-        return;
-    }
-
+    let ip_s = ip.to_string();
     let loopback = Command::new("powershell")
         .args([
             "-NoProfile",
@@ -126,36 +267,47 @@ pub fn ensure_loopback_ip(ip: Ipv4Addr) {
              Select-Object -First 1 -Property InterfaceIndex,InterfaceAlias | \
              ConvertTo-Json -Compress",
         ])
-        .output()
-        .expect("failed to find Windows loopback interface");
+        .output()?;
 
     if !loopback.status.success() {
-        panic!(
-            "failed to query Windows loopback interface while adding {}: {}",
-            ip_s,
+        return Err(io::Error::other(format!(
+            "failed to query Windows loopback interface while adding {ip_s}: {}",
             String::from_utf8_lossy(&loopback.stderr)
-        );
+        )));
     }
 
     let loopback_json = String::from_utf8_lossy(&loopback.stdout);
     let loopback_json = loopback_json.trim();
     if loopback_json.is_empty() {
-        panic!("could not find a Windows IPv4 loopback interface to add {ip_s}");
+        return Err(io::Error::other(format!(
+            "could not find a Windows IPv4 loopback interface to add {ip_s}"
+        )));
     }
 
-    let parsed: serde_json::Value = serde_json::from_str(loopback_json)
-        .unwrap_or_else(|e| panic!("failed to parse loopback JSON `{}`: {}", loopback_json, e));
+    let parsed: serde_json::Value = serde_json::from_str(loopback_json).map_err(|e| {
+        io::Error::other(format!(
+            "failed to parse loopback JSON `{loopback_json}`: {e}"
+        ))
+    })?;
 
     let interface_index = parsed
         .get("InterfaceIndex")
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
-        .unwrap_or_else(|| panic!("failed to parse InterfaceIndex from `{loopback_json}`"));
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "failed to parse InterfaceIndex from `{loopback_json}`"
+            ))
+        })?;
 
     let interface_alias = parsed
         .get("InterfaceAlias")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| panic!("failed to parse InterfaceAlias from `{loopback_json}`"));
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "failed to parse InterfaceAlias from `{loopback_json}`"
+            ))
+        })?;
 
     let add = Command::new("powershell")
         .args([
@@ -166,46 +318,91 @@ pub fn ensure_loopback_ip(ip: Ipv4Addr) {
                 interface_index, ip_s
             ),
         ])
-        .output()
-        .expect("failed to run New-NetIPAddress for loopback IP address");
+        .output()?;
 
-    if !add.status.success() {
-        let netsh = Command::new("netsh")
-            .args([
-                "interface",
-                "ipv4",
-                "add",
-                "address",
-                &format!("name={interface_alias}"),
-                &format!("address={ip_s}"),
-                "mask=255.0.0.0",
-                "skipassource=true",
-            ])
-            .output()
-            .expect("failed to run netsh fallback for loopback IP address");
-
-        if !netsh.status.success() {
-            panic!(
-                "failed to add Windows loopback IP {} using New-NetIPAddress and netsh. \
-                 New-NetIPAddress stderr: {}\nnetsh stderr: {}",
-                ip_s,
-                String::from_utf8_lossy(&add.stderr),
-                String::from_utf8_lossy(&netsh.stderr)
-            );
-        }
+    if add.status.success() {
+        return Ok(());
     }
 
-    if !address_exists() {
-        panic!(
-            "attempted to add Windows loopback IP {}, but Get-NetIPAddress still does not report it",
-            ip_s
-        );
+    let netsh = Command::new("netsh")
+        .args([
+            "interface",
+            "ipv4",
+            "add",
+            "address",
+            &format!("name={interface_alias}"),
+            &format!("address={ip_s}"),
+            "mask=255.0.0.0",
+            "skipassource=true",
+        ])
+        .output()?;
+
+    if netsh.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "failed to add Windows loopback IP {ip_s} using New-NetIPAddress and netsh. \
+             New-NetIPAddress stderr: {}\nnetsh stderr: {}",
+            String::from_utf8_lossy(&add.stderr),
+            String::from_utf8_lossy(&netsh.stderr)
+        )))
     }
 }
 
-#[cfg(not(windows))]
-pub fn ensure_loopback_ip(_ip: Ipv4Addr) {
-    // No-op on other platforms
+#[cfg(windows)]
+fn delete_loopback_alias(ip: Ipv4Addr) -> io::Result<()> {
+    use std::process::Command;
+
+    let ip_s = ip.to_string();
+    let remove = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Get-NetIPAddress -AddressFamily IPv4 -IPAddress '{}' -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false -ErrorAction Stop",
+                ip_s
+            ),
+        ])
+        .output()?;
+
+    if remove.status.success() {
+        return Ok(());
+    }
+
+    let netsh = Command::new("netsh")
+        .args([
+            "interface",
+            "ipv4",
+            "delete",
+            "address",
+            &format!("address={ip_s}"),
+        ])
+        .output()?;
+
+    if netsh.status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "failed to remove Windows loopback IP {ip_s}. Remove-NetIPAddress stderr: {}\nnetsh stderr: {}",
+            String::from_utf8_lossy(&remove.stderr),
+            String::from_utf8_lossy(&netsh.stderr)
+        )))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn loopback_alias_exists(_ip: Ipv4Addr) -> io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn create_loopback_alias(_ip: Ipv4Addr) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn delete_loopback_alias(_ip: Ipv4Addr) -> io::Result<()> {
+    Ok(())
 }
 
 fn spawn_udp_echo_server_impl(

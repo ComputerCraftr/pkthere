@@ -41,9 +41,11 @@ fn random_icmp_listen_id() -> u16 {
     random_unprivileged_port(IpFamily::V4).expect(ICMP_LISTEN_ID_ERR)
 }
 
-fn ensure_multihop_ips() {
-    ensure_loopback_ip(NODE2_IPV4);
-    ensure_loopback_ip(NODE3_IPV4);
+fn ensure_multihop_ips() -> Vec<crate::orchestrator::LoopbackAliasGuard> {
+    vec![
+        ensure_loopback_ip(NODE2_IPV4).expect("prepare node2 loopback alias"),
+        ensure_loopback_ip(NODE3_IPV4).expect("prepare node3 loopback alias"),
+    ]
 }
 
 fn launch_icmp_endpoint_node(
@@ -69,7 +71,7 @@ fn launch_icmp_endpoint_node(
         capture_stderr,
         capture_mode,
     })
-    .expect(ICMP_ENDPOINT_NODE_ERR)
+    .unwrap_or_else(|err| panic!("{ICMP_ENDPOINT_NODE_ERR}:\n{err}"))
 }
 
 fn launch_icmp_middle_node(
@@ -97,7 +99,7 @@ fn launch_icmp_middle_node(
         capture_stderr,
         capture_mode,
     })
-    .expect(ICMP_MIDDLE_NODE_ERR)
+    .unwrap_or_else(|err| panic!("{ICMP_MIDDLE_NODE_ERR}:\n{err}"))
 }
 
 fn finalize_debug_forwarder_output(
@@ -341,7 +343,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop test was enabled, but runtime raw ICMP capability is missing");
 
-    ensure_multihop_ips();
+    let _loopback_aliases = ensure_multihop_ips();
 
     let client_sock = bind_ipv4_client();
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
@@ -449,7 +451,7 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop debug test was enabled, but runtime raw ICMP capability is missing");
 
-    ensure_multihop_ips();
+    let _loopback_aliases = ensure_multihop_ips();
 
     let client_sock = bind_ipv4_client();
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();

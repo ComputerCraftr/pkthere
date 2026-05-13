@@ -95,7 +95,7 @@ pub struct ForwarderSession {
 }
 
 pub fn launch_forwarder(cfg: ForwarderConfig<'_>) -> ForwarderSession {
-    try_launch_forwarder(cfg).expect("could not launch forwarder")
+    try_launch_forwarder(cfg).unwrap_or_else(|err| panic!("could not launch forwarder:\n{err}"))
 }
 
 pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSession> {
@@ -145,6 +145,7 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
     }
 
     crate::orchestrator::user_policy::apply_root_user_args(&mut cmd);
+    let command_line = render_command(&cmd);
 
     let mut child = ChildGuard::new(cmd.spawn()?);
     let mut out =
@@ -159,8 +160,11 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
                 use std::io::Read;
                 let _ = stderr.read_to_string(&mut err_output);
             }
-            return Err(io::Error::other(format!(
-                "forwarder exited before listen with status {status}. stdout: '{output}' stderr: '{err_output}'"
+            return Err(io::Error::other(render_launch_failure(
+                &command_line,
+                status,
+                &output,
+                &err_output,
             )));
         }
         return Err(io::Error::new(
@@ -198,6 +202,55 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
         direct_stdout,
         capture,
     })
+}
+
+fn render_command(cmd: &Command) -> String {
+    std::iter::once(cmd.get_program())
+        .chain(cmd.get_args())
+        .map(|arg| quote_command_arg(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_command_arg(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+fn render_launch_failure(
+    command_line: &str,
+    status: std::process::ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> String {
+    let mut message = format!(
+        "forwarder exited before publishing its listen address\n\
+         status: {status}\n\
+         command: {command_line}\n\
+         stdout tail:\n{}\n\
+         stderr tail:\n{}",
+        render_output_tail(stdout, 40),
+        render_output_tail(stderr, 40)
+    );
+
+    if stderr.contains("AddrNotAvailable")
+        || stderr.contains("Can't assign requested address")
+        || stderr.contains("Cannot assign requested address")
+    {
+        message.push_str(
+            "\n\nhint: the forwarder failed while binding an address that the OS does not currently own. \
+             Raw ICMP loopback tests on macOS and Windows need 127.0.0.2/127.0.0.3 assigned to the loopback interface for the full test lifetime. \
+             Check the loopback alias setup error above, sudo/Admin privileges, and any stale alias cleanup.",
+        );
+    }
+
+    message
 }
 
 pub fn collect_forwarder_output(session: &mut ForwarderSession) -> io::Result<(String, String)> {
