@@ -152,8 +152,15 @@ pub fn try_launch_forwarder(cfg: ForwarderConfig<'_>) -> io::Result<ForwarderSes
     let err = child.stderr.take();
     let Some(listen_addr) = wait_for_listen_addr_from(&mut out, MAX_WAIT_SECS) else {
         if let Some(status) = child.try_wait()? {
+            let mut output = String::new();
+            let _ = out.read_to_string(&mut output);
+            let mut err_output = String::new();
+            if let Some(mut stderr) = err {
+                use std::io::Read;
+                let _ = stderr.read_to_string(&mut err_output);
+            }
             return Err(io::Error::other(format!(
-                "forwarder exited before listen with status {status}"
+                "forwarder exited before listen with status {status}. stdout: '{output}' stderr: '{err_output}'"
             )));
         }
         return Err(io::Error::new(
