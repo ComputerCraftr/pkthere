@@ -184,22 +184,15 @@ fn make_icmp_socket(
 
 fn build_empty_cadence_probe_packet(dest: SocketAddr, remote_id: u16) -> [u8; 8] {
     let mut hdr = [0u8; 8];
-    let idb = remote_id.to_be_bytes();
-    let sqb = CADENCE_PROBE_SEQ.to_be_bytes();
-    hdr[4] = idb[0];
-    hdr[5] = idb[1];
-    hdr[6] = sqb[0];
-    hdr[7] = sqb[1];
+    hdr[4..6].copy_from_slice(&remote_id.to_be_bytes());
+    hdr[6..8].copy_from_slice(&CADENCE_PROBE_SEQ.to_be_bytes());
 
     if dest.is_ipv6() {
         hdr[0] = 128;
-        hdr[2] = 0;
-        hdr[3] = 0;
     } else {
         hdr[0] = 8;
-        let cksum = checksum16(&hdr, &[]).to_be_bytes();
-        hdr[2] = cksum[0];
-        hdr[3] = cksum[1];
+        let cksum = checksum16(&hdr, &[]);
+        hdr[2..4].copy_from_slice(&cksum.to_be_bytes());
     }
 
     hdr

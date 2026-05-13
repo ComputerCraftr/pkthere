@@ -25,15 +25,13 @@ fn test_icmp_echo_packet(
         (_, false) => 0,
     };
     let mut icmp = vec![icmp_type, 0, 0, 0, 0, 0, 0, 1];
-    let ident_bytes = ident.to_be_bytes();
-    icmp[4] = ident_bytes[0];
-    icmp[5] = ident_bytes[1];
+    icmp[4..6].copy_from_slice(&ident.to_be_bytes());
 
     match (source_ip, dest_ip) {
         (Some(IpAddr::V4(src)), Some(IpAddr::V4(dst))) => {
             let mut packet = vec![0u8; 20 + icmp.len()];
-            packet[0] = 0x45;
-            packet[9] = 1;
+            packet[0] = 0x45; // IPv4, 20-byte header
+            packet[9] = 1; // ICMP protocol
             packet[12..16].copy_from_slice(&src.octets());
             packet[16..20].copy_from_slice(&dst.octets());
             packet[20..].copy_from_slice(&icmp);
@@ -41,8 +39,8 @@ fn test_icmp_echo_packet(
         }
         (Some(IpAddr::V6(src)), Some(IpAddr::V6(dst))) => {
             let mut packet = vec![0u8; 40 + icmp.len()];
-            packet[0] = 0x60;
-            packet[6] = 58;
+            packet[0] = 0x60; // IPv6
+            packet[6] = 58; // ICMPv6 next header
             packet[8..24].copy_from_slice(&src.octets());
             packet[24..40].copy_from_slice(&dst.octets());
             packet[40..].copy_from_slice(&icmp);
@@ -252,6 +250,31 @@ fn wire_admission_rejects_locked_icmp_reply_id_renegotiation() {
         ),
         WirePacketAdmission::Filtered(rej)
             if rej.reason == RejectionReason::IcmpReplyIdRenegotiationMismatch
+    ));
+}
+
+#[test]
+fn wire_admission_rejects_mismatched_os_id_after_handshake() {
+    let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
+    let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
+    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::IcmpV4 {
+        ip: Ipv4Addr::new(127, 0, 0, 2),
+        ident: 0x2002,
+    };
+    // Packet has OS ID 9999, but expected local receive ID is 1001.
+    let packet = icmp_tunnel_packet(9999, true, &[0x80]);
+
+    assert!(matches!(
+        admit_wire_packet(
+            true,
+            &cfg,
+            icmp_wire_spec(Some(FlowTuple::new(remote, local)), Some(locked)),
+            &packet,
+            Some(&source),
+        ),
+        WirePacketAdmission::Filtered(rej) if rej.reason == RejectionReason::UnexpectedLocalReceiveId
     ));
 }
 

@@ -127,10 +127,8 @@ pub(crate) fn encode_icmp_tunnel_prefix(
                 shim |= SHIM_HAS_REPLY_ID
                     | ((negotiation.negotiate as u8) * SHIM_NEGOTIATE_REPLY_ID)
                     | ((negotiation.ack as u8) * SHIM_ACK_REPLY_ID);
-                let idb = negotiation.reply_id.to_be_bytes();
                 scratch[0] = shim;
-                scratch[1] = idb[0];
-                scratch[2] = idb[1];
+                scratch[1..3].copy_from_slice(&negotiation.reply_id.to_be_bytes());
                 Ok(&scratch[..ICMP_TUNNEL_SHIM_MAX_LEN])
             } else {
                 scratch[0] = shim;

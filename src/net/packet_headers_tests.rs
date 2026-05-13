@@ -33,7 +33,7 @@ fn parses_ipv6_icmp_echo_with_ip_header() {
     packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
     packet[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
     let mut echo = icmp_echo(0xbeef, 42, false);
-    echo[0] = 129;
+    echo[0] = 129; // Echo Reply for IPv6
     packet[40..48].copy_from_slice(&echo);
     packet[48..].copy_from_slice(b"data");
 
@@ -57,8 +57,8 @@ fn parses_headerless_icmp_echo() {
 #[test]
 fn parses_ipv4_udp_header() {
     let mut packet = vec![0u8; 32];
-    packet[0] = 0x45;
-    packet[9] = 17;
+    packet[0] = 0x45; // IPv4
+    packet[9] = 17; // UDP
     packet[12..16].copy_from_slice(&Ipv4Addr::new(127, 0, 0, 2).octets());
     packet[16..20].copy_from_slice(&Ipv4Addr::new(127, 0, 0, 3).octets());
     packet[20..22].copy_from_slice(&1111u16.to_be_bytes());
@@ -75,8 +75,8 @@ fn parses_ipv4_udp_header() {
 #[test]
 fn parses_ipv6_udp_header() {
     let mut packet = vec![0u8; 51];
-    packet[0] = 0x60;
-    packet[6] = 17;
+    packet[0] = 0x60; // IPv6
+    packet[6] = 17; // UDP
     packet[8..24].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
     packet[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
     packet[40..42].copy_from_slice(&3333u16.to_be_bytes());

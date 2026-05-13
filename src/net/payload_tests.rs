@@ -4,14 +4,10 @@ use super::*;
 
 #[cfg(test)]
 #[inline]
-fn test_icmp_echo_header(ident: u16, seq: u16) -> [u8; 8] {
-    let mut hdr = [0u8; 8];
-    let idb = ident.to_be_bytes();
-    let sqb = seq.to_be_bytes();
-    hdr[4] = idb[0];
-    hdr[5] = idb[1];
-    hdr[6] = sqb[0];
-    hdr[7] = sqb[1];
+fn test_icmp_echo_header(ident: u16, seq: u16, is_req: bool) -> [u8; 8] {
+    let mut hdr = [if is_req { 8 } else { 0 }, 0, 0, 0, 0, 0, 0, 0];
+    hdr[4..6].copy_from_slice(&ident.to_be_bytes());
+    hdr[6..8].copy_from_slice(&seq.to_be_bytes());
     hdr
 }
 
@@ -90,7 +86,7 @@ mod tests {
 
     #[test]
     fn explicit_icmp_header_id_is_serialized_verbatim() {
-        let hdr = test_icmp_echo_header(4242, 9);
+        let hdr = test_icmp_echo_header(4242, 9, true);
         let packet = super::payload_send::build_test_icmp_echo_packet(&hdr, &[], b"x");
         let parsed = parse_packet_headers(&packet);
         let icmp = parsed.icmp.expect("icmp");
@@ -102,7 +98,7 @@ mod tests {
 
     #[test]
     fn zero_length_icmp_user_payload_wire_packet_is_one_byte_longer_than_cadence() {
-        let hdr = test_icmp_echo_header(4242, 9);
+        let hdr = test_icmp_echo_header(4242, 9, true);
         let mut scratch = [0; ICMP_TUNNEL_SHIM_MAX_LEN];
         let zero_prefix =
             encode_icmp_tunnel_prefix(IcmpTunnelFrameKind::UserPayload, None, 0, &mut scratch)
@@ -157,7 +153,7 @@ mod tests {
     fn validate_payload_classifies_shimmed_zero_len_icmp_as_session_control() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_frame(IcmpTunnelFrameKind::SessionControl, None, &[]);
+        let buf = encode_icmp_frame(0x1234, IcmpTunnelFrameKind::SessionControl, None, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -181,9 +177,11 @@ mod tests {
     }
 
     fn encode_icmp_frame(
+        ident: u16,
         kind: IcmpTunnelFrameKind,
         reply_id: Option<u16>,
         payload: &[u8],
+        is_req: bool,
     ) -> Vec<u8> {
         let mut scratch = [0; ICMP_TUNNEL_SHIM_MAX_LEN];
         let prefix = encode_icmp_tunnel_prefix(
@@ -198,25 +196,42 @@ mod tests {
         )
         .expect("test ICMP tunnel frame should serialize");
         let mut buf = Vec::with_capacity(8 + prefix.len() + payload.len());
-        buf.extend_from_slice(&[8, 0, 0, 0, 0x04, 0xD2, 0x00, 0x09]);
+        buf.extend_from_slice(&test_icmp_echo_header(ident, 9, is_req));
         buf.extend_from_slice(prefix);
         buf.extend_from_slice(payload);
         buf
     }
 
-    fn encode_icmp_user_payload(payload: &[u8]) -> Vec<u8> {
-        encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, None, payload)
+    fn encode_icmp_user_payload(ident: u16, payload: &[u8], is_req: bool) -> Vec<u8> {
+        encode_icmp_frame(
+            ident,
+            IcmpTunnelFrameKind::UserPayload,
+            None,
+            payload,
+            is_req,
+        )
     }
 
-    fn encode_icmp_user_payload_with_reply_id(reply_id: u16, payload: &[u8]) -> Vec<u8> {
-        encode_icmp_frame(IcmpTunnelFrameKind::UserPayload, Some(reply_id), payload)
+    fn encode_icmp_user_payload_with_reply_id(
+        ident: u16,
+        reply_id: u16,
+        payload: &[u8],
+        is_req: bool,
+    ) -> Vec<u8> {
+        encode_icmp_frame(
+            ident,
+            IcmpTunnelFrameKind::UserPayload,
+            Some(reply_id),
+            payload,
+            is_req,
+        )
     }
 
     #[test]
     fn validate_payload_decodes_zero_len_icmp_user_datagram() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
+        let buf = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -240,7 +255,7 @@ mod tests {
     fn validate_payload_decodes_non_empty_icmp_user_datagram() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_reply_id(0x2002, b"abc");
+        let buf = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"abc", true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -267,9 +282,7 @@ mod tests {
     fn validate_payload_uses_reply_id_negotiation_as_logical_identifier() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
-        buf[4] = 0xAA;
-        buf[5] = 0x55;
+        let buf = encode_icmp_user_payload_with_reply_id(0xAA55, 0x2002, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -299,9 +312,7 @@ mod tests {
     fn validate_payload_does_not_enforce_external_icmp_id_policy() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
-        buf[4] = 0xAA;
-        buf[5] = 0x55;
+        let buf = encode_icmp_user_payload_with_reply_id(0xAA55, 0x2002, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -391,8 +402,8 @@ mod tests {
         let mut cfg_icmp = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg_icmp.max_payload = 0;
 
-        let ok_icmp = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
-        let over_icmp = encode_icmp_user_payload_with_reply_id(0x2002, &[0]);
+        let ok_icmp = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, &[], true);
+        let over_icmp = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, &[0], true);
         let (ok_icmp_info, ok_icmp_bounds) = admitted_icmp(&ok_icmp);
         let (over_icmp_info, over_icmp_bounds) = admitted_icmp(&over_icmp);
 
@@ -433,8 +444,8 @@ mod tests {
         let mut cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         cfg.max_payload = 3;
         let stats = Stats::new();
-        let ok = encode_icmp_user_payload_with_reply_id(0x2002, b"abc");
-        let over = encode_icmp_user_payload_with_reply_id(0x2002, b"abcd");
+        let ok = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"abc", true);
+        let over = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"abcd", true);
         let (ok_info, ok_bounds) = admitted_icmp(&ok);
         let (over_info, over_bounds) = admitted_icmp(&over);
 
@@ -476,7 +487,7 @@ mod tests {
         let stats = Stats::new();
 
         // 1. Valid handshake (Unlocked, Echo Request, UserData)
-        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
+        let mut buf = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
         let res = validate_payload(
             true,
@@ -542,8 +553,7 @@ mod tests {
     fn validate_payload_accepts_reflected_reply_id_negotiation_on_u2c_without_adopting_it() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
         let stats = Stats::new();
-        let mut buf = encode_icmp_user_payload_with_reply_id(0x2002, b"x");
-        buf[0] = 0; // Echo Reply for u2c path
+        let buf = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"x", false);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -574,7 +584,7 @@ mod tests {
     fn validate_payload_rejects_initial_icmp_user_payload_without_reply_id_negotiation() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload(&[]);
+        let buf = encode_icmp_user_payload(0x1234, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let err = validate_payload(
@@ -597,7 +607,7 @@ mod tests {
     fn validate_payload_adopts_shim_identifier_on_initial_handshake() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_reply_id(0x2002, &[]);
+        let buf = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, &[], true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -628,7 +638,7 @@ mod tests {
     fn icmp_reply_id_negotiation_is_single_use_for_locked_flow_identity() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let first = encode_icmp_user_payload_with_reply_id(0x2002, b"a");
+        let first = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"a", true);
         let (first_info, first_bounds) = admitted_icmp(&first);
         let first_event = validate_payload(
             true,
@@ -654,7 +664,7 @@ mod tests {
             }
         ));
 
-        let second = encode_icmp_user_payload_with_reply_id(0x3003, b"b");
+        let second = encode_icmp_user_payload_with_reply_id(0x1234, 0x3003, b"b", true);
         let (second_info, second_bounds) = admitted_icmp(&second);
         let second_err = validate_payload(
             true,
@@ -675,8 +685,7 @@ mod tests {
                 .contains("reply-ID renegotiation mismatch")
         );
 
-        let mut reflected = encode_icmp_user_payload_with_reply_id(0x2002, b"a");
-        reflected[0] = 0;
+        let reflected = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"a", false);
         let (reflected_info, reflected_bounds) = admitted_icmp(&reflected);
         let reflected_event = validate_payload(
             false,
@@ -707,7 +716,7 @@ mod tests {
     fn locked_icmp_c2u_without_shim_inherits_locked_logical_identity() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload(b"b");
+        let buf = encode_icmp_user_payload(0x04D2, b"b", true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(
@@ -740,7 +749,7 @@ mod tests {
     fn locked_icmp_c2u_with_matching_shim_keeps_locked_logical_identity() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
-        let buf = encode_icmp_user_payload_with_reply_id(0x2002, b"b");
+        let buf = encode_icmp_user_payload_with_reply_id(0x04D2, 0x2002, b"b", true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
         let event = validate_payload(

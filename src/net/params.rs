@@ -22,13 +22,10 @@ pub(crate) struct CanonicalAddr {
 impl CanonicalAddr {
     #[inline]
     pub fn new(addr: SocketAddr, id: u16) -> Self {
-        let addr = match addr {
-            SocketAddr::V4(a) => SocketAddr::V4(SocketAddrV4::new(*a.ip(), id)),
-            SocketAddr::V6(a) => {
-                SocketAddr::V6(SocketAddrV6::new(*a.ip(), id, a.flowinfo(), a.scope_id()))
-            }
-        };
-        Self { addr, id }
+        match addr {
+            SocketAddr::V4(a) => Self::from_v4(*a.ip(), id),
+            SocketAddr::V6(a) => Self::from_v6(*a.ip(), id, a.flowinfo(), a.scope_id()),
+        }
     }
 
     #[inline]
@@ -82,30 +79,27 @@ impl CanonicalAddr {
 
     #[inline]
     pub fn with_resolved_ip(self, resolved: SocketAddr) -> Self {
-        let addr = match (self.addr, resolved) {
-            (SocketAddr::V4(_current), SocketAddr::V4(resolved)) => {
-                SocketAddr::V4(SocketAddrV4::new(*resolved.ip(), self.id))
+        match (self.addr, resolved) {
+            (SocketAddr::V4(_), SocketAddr::V4(v4)) => Self::from_v4(*v4.ip(), self.id),
+            (SocketAddr::V6(current), SocketAddr::V6(v6)) => {
+                // Keep existing metadata if the newly resolved one is zero
+                let fi = if v6.flowinfo() != 0 {
+                    v6.flowinfo()
+                } else {
+                    current.flowinfo()
+                };
+                let si = if v6.scope_id() != 0 {
+                    v6.scope_id()
+                } else {
+                    current.scope_id()
+                };
+                Self::from_v6(*v6.ip(), self.id, fi, si)
             }
-            (SocketAddr::V6(current), SocketAddr::V6(resolved)) => {
-                SocketAddr::V6(SocketAddrV6::new(
-                    *resolved.ip(),
-                    self.id,
-                    current.flowinfo(),
-                    current.scope_id(),
-                ))
+            (_, SocketAddr::V4(v4)) => Self::from_v4(*v4.ip(), self.id),
+            (_, SocketAddr::V6(v6)) => {
+                Self::from_v6(*v6.ip(), self.id, v6.flowinfo(), v6.scope_id())
             }
-            (_, SocketAddr::V4(resolved)) => {
-                SocketAddr::V4(SocketAddrV4::new(*resolved.ip(), self.id))
-            }
-            (_, SocketAddr::V6(resolved)) => SocketAddr::V6(SocketAddrV6::new(
-                *resolved.ip(),
-                self.id,
-                resolved.flowinfo(),
-                resolved.scope_id(),
-            )),
-        };
-
-        Self { addr, id: self.id }
+        }
     }
 }
 

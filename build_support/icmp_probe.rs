@@ -37,9 +37,7 @@ pub fn probe_kernel_icmp_echo() -> io::Result<()> {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     let checksum = !(sum as u16);
-    let checksum_bytes = checksum.to_be_bytes();
-    request[2] = checksum_bytes[0];
-    request[3] = checksum_bytes[1];
+    request[2..4].copy_from_slice(&checksum.to_be_bytes());
 
     let dest = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     sock.connect(&SockAddr::from(dest))?;

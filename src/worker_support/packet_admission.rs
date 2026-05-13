@@ -624,10 +624,15 @@ fn parse_raw_ip_source(
     let ident = parsed.icmp?.ident;
     match parsed.src_ip? {
         IpAddr::V4(ip) => Some(CanonicalAddr::from_v4(ip, ident)),
-        IpAddr::V6(ip) => Some(match socket_source.and_then(|s| s.as_socket_ipv6()) {
-            Some(meta) => CanonicalAddr::from_v6(ip, ident, meta.flowinfo(), meta.scope_id()),
-            _ => CanonicalAddr::from_v6(ip, ident, 0, 0),
-        }),
+        IpAddr::V6(ip) => {
+            let meta = socket_source.and_then(|s| s.as_socket_ipv6())?;
+            Some(CanonicalAddr::from_v6(
+                ip,
+                ident,
+                meta.flowinfo(),
+                meta.scope_id(),
+            ))
+        }
     }
 }
 

@@ -137,12 +137,8 @@ fn send_icmp_echo(
     meta: &OutboundIcmpMeta,
 ) -> io::Result<usize> {
     let mut hdr = [0u8; 8];
-    let idb = meta.header_id.to_be_bytes();
-    let sqb = meta.seq.to_be_bytes();
-    hdr[4] = idb[0];
-    hdr[5] = idb[1];
-    hdr[6] = sqb[0];
-    hdr[7] = sqb[1];
+    hdr[4..6].copy_from_slice(&meta.header_id.to_be_bytes());
+    hdr[6..8].copy_from_slice(&meta.seq.to_be_bytes());
 
     let mut shim_storage = [0u8; ICMP_TUNNEL_SHIM_MAX_LEN];
     let (prefix, payload): (&[u8], &[u8]) = match event {
@@ -198,11 +194,9 @@ fn send_icmp_echo(
                 checksum16_parts(&hdr, prefix, payload)
             }
         }
-    }
-    .to_be_bytes();
+    };
 
-    hdr[2] = cksum[0];
-    hdr[3] = cksum[1];
+    hdr[2..4].copy_from_slice(&cksum.to_be_bytes());
     let packet = build_icmp_echo_packet(&hdr, prefix, payload);
     if sock_connected {
         sock.send(&packet)

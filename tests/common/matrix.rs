@@ -57,6 +57,12 @@ pub fn run_matrix_cases<'a>(
                 continue;
             }
 
+            #[cfg(windows)]
+            if family == IpFamily::V6 && proto.eq_ignore_ascii_case("icmp") {
+                eprintln!("skipping unreliable ICMPv6 on Windows");
+                continue;
+            }
+
             for &debug_client_unconnected in client_unconnected_modes {
                 for &debug_upstream_unconnected in upstream_unconnected_modes {
                     run(MatrixCase {
