@@ -81,8 +81,7 @@ pub(crate) fn make_socket(
         SupportedProtocol::ICMP => {
             // Linux kernels expose SOCK_DGRAM ping sockets when ping_group_range
             // permits it; fall back to raw sockets elsewhere.
-            let (s, t) = make_icmp_socket(domain, icmp_proto, force_raw)?;
-            (s, t)
+            make_icmp_socket(domain, icmp_proto, force_raw)?
         }
         _ => (
             Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?,
@@ -120,7 +119,7 @@ pub(crate) fn make_socket(
     sock.bind(&SockAddr::from(bind_addr))?;
 
     #[cfg(windows)]
-    if is_icmp && sock_type == Type::RAW {
+    if is_icmp && domain == Domain::IPV4 && sock_type == Type::RAW {
         enable_rcvall(&sock)?;
     }
 
@@ -145,7 +144,10 @@ fn make_icmp_socket(
 ) -> io::Result<(Socket, Type)> {
     if force_raw {
         #[cfg(windows)]
-        let active_proto = Protocol::from(0); // IPPROTO_IP
+        let active_proto = match domain {
+            Domain::IPV4 => Protocol::from(0), // IPv4 listener: SIO_RCVALL path
+            _ => proto,                        // IPv6 listener: normal ICMPv6 raw socket
+        };
         #[cfg(not(windows))]
         let active_proto = proto;
 
