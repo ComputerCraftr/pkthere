@@ -25,6 +25,7 @@ mod tests {
     use crate::net::packet_headers::parse_packet_headers;
     use crate::net::params::CanonicalAddr;
     use crate::stats::Stats;
+    use crate::worker_support::{AdmissionError, IcmpAdmissionInfo, validate_admitted_payload};
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
     fn test_config(
@@ -81,6 +82,31 @@ mod tests {
                 is_req: icmp.is_req,
             }),
             parsed.payload_bounds,
+        )
+    }
+
+    fn validate_payload<'a>(
+        c2u: bool,
+        cfg: &RuntimeConfig,
+        _stats: &Stats,
+        buf: &'a [u8],
+        icmp_info: Option<IcmpAdmissionInfo>,
+        payload_bounds: (usize, usize),
+        synthetic_icmp_ident: Option<u16>,
+        locked_icmp_negotiated_remote_reply_id: Option<u16>,
+        origin: PayloadOrigin,
+        is_locked: bool,
+    ) -> Result<PayloadEvent<'a>, AdmissionError> {
+        validate_admitted_payload(
+            c2u,
+            cfg,
+            buf,
+            icmp_info,
+            payload_bounds,
+            synthetic_icmp_ident,
+            locked_icmp_negotiated_remote_reply_id,
+            origin,
+            is_locked,
         )
     }
 
@@ -678,12 +704,8 @@ mod tests {
             PayloadOrigin::Wire,
             true,
         )
-        .expect_err("locked C2U packet must reject mismatched reply-ID negotiation");
-        assert!(
-            second_err
-                .to_string()
-                .contains("reply-ID renegotiation mismatch")
-        );
+        .expect_err("locked C2U packet must reject any post-lock reply-ID negotiation");
+        assert_eq!(second_err, AdmissionError::PostLockIcmpReplyIdNegotiation);
 
         let reflected = encode_icmp_user_payload_with_reply_id(0x1234, 0x2002, b"a", false);
         let (reflected_info, reflected_bounds) = admitted_icmp(&reflected);
@@ -746,13 +768,13 @@ mod tests {
     }
 
     #[test]
-    fn locked_icmp_c2u_with_matching_shim_keeps_locked_logical_identity() {
+    fn locked_icmp_c2u_with_matching_shim_is_rejected() {
         let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
         let stats = Stats::new();
         let buf = encode_icmp_user_payload_with_reply_id(0x04D2, 0x2002, b"b", true);
         let (icmp_info, payload_bounds) = admitted_icmp(&buf);
 
-        let event = validate_payload(
+        let err = validate_payload(
             true,
             &cfg,
             &stats,
@@ -764,18 +786,9 @@ mod tests {
             PayloadOrigin::Wire,
             true,
         )
-        .expect("locked matching-shim C2U packet should preserve locked logical identity");
+        .expect_err("locked C2U source-ID shim is invalid even when it matches");
 
-        match event {
-            PayloadEvent::UserPayload {
-                icmp: Some(icmp), ..
-            } => {
-                assert_eq!(icmp.negotiated_remote_reply_id, 0x2002);
-                assert_eq!(icmp.inbound_header_ident, 0x04D2);
-                assert_eq!(icmp.advertised_reply_id, Some(0x2002));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        assert_eq!(err, AdmissionError::PostLockIcmpReplyIdNegotiation);
     }
 
     #[test]

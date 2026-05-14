@@ -5,7 +5,9 @@ use std::process::Command;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
+use std::net::Ipv4Addr;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 #[path = "../../build_support/icmp_probe.rs"]
 mod icmp_probe;
@@ -60,6 +62,32 @@ pub fn require_kernel_echo_reply_supported() -> io::Result<()> {
         .as_ref()
         .map(|_| ())
         .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+}
+
+pub fn require_bound_raw_icmp_loopback_request_delivery(
+    ip: Ipv4Addr,
+    ident: u16,
+) -> io::Result<()> {
+    match icmp_probe::probe_bound_raw_icmp_loopback_request_delivery(
+        ip,
+        ident,
+        Duration::from_millis(750),
+    ) {
+        Ok(icmp_probe::RawLoopbackProbeResult::EchoRequest) => Ok(()),
+        Ok(icmp_probe::RawLoopbackProbeResult::OnlyEchoReply) => Err(io::Error::other(format!(
+            "requested-bound RAW ICMP listener on {ip}:{ident} observed only reflected Echo Replies; this host does not deliver the Echo Request stream required by the raw loopback multihop test"
+        ))),
+        Ok(icmp_probe::RawLoopbackProbeResult::NoMatchingIcmp) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "requested-bound RAW ICMP listener on {ip}:{ident} did not observe a matching Echo Request before the probe deadline"
+            ),
+        )),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!("requested-bound RAW ICMP loopback probe failed for {ip}:{ident}: {err}"),
+        )),
+    }
 }
 
 pub fn platform_supports_dgram_icmp() -> bool {

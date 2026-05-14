@@ -115,7 +115,8 @@ pub(crate) fn make_socket(
         Some(Duration::from_millis(read_timeout_ms))
     })?;
 
-    // Bind
+    // Bind the requested address by default. This is especially important for
+    // Windows RAW IPv4, where SIO_RCVALL is enabled after bind.
     sock.bind(&SockAddr::from(bind_addr))?;
 
     #[cfg(windows)]
@@ -539,6 +540,8 @@ mod tests {
 
         assert_eq!(sock_type, Type::DGRAM);
         assert_eq!(logical, kernel);
+        assert_eq!(logical.addr.ip(), listen_addr.ip());
+        assert_eq!(kernel.addr.ip(), listen_addr.ip());
         assert!(!logical.addr.ip().is_unspecified());
         assert_ne!(logical.id, 0);
     }

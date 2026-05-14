@@ -300,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_raw_icmp_upstream_ignores_debug_unconnected_wildcard_path() {
+    fn windows_raw_icmp_upstream_preserves_connected_rcvall_path() {
         let policy = socket_reuse_capability(
             SocketRole::Upstream,
             SupportedProtocol::ICMP,
@@ -321,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_upstream_debug_unconnected_never_requests_wildcard_bind() {
+    fn udp_upstream_debug_unconnected_uses_metadata_only_policy() {
         let policy = socket_reuse_capability(
             SocketRole::Upstream,
             SupportedProtocol::UDP,

@@ -1,16 +1,20 @@
 use super::{
     PacketAdmission, PacketAdmissionSpec, RejectionReason, SocketPeerRole, SourceEvidenceMode,
-    WirePacketAdmission, admit_packet, admit_wire_packet,
+    WirePacketAdmission, admit_packet, admit_wire_packet, record_rejection_stats,
 };
 use crate::cli::{
     DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
     SupportedProtocol, TimeoutAction, WorkerFlowMode,
 };
 use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple};
+use crate::net::packet_headers::parse_packet_headers;
 use crate::net::params::CanonicalAddr;
 use crate::net::payload::PayloadEvent;
+use crate::stats::StatsSink;
 use socket2::Type;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 fn test_icmp_echo_packet(
     source_ip: Option<IpAddr>,
@@ -59,11 +63,8 @@ fn admission_spec(
     expected_local_icmp_id: Option<u16>,
 ) -> PacketAdmissionSpec {
     let expected_remote_endpoint = expected_remote.map(FlowEndpoint::from_canonical);
-    let expected_local = expected_local_icmp_id.map(|id| {
-        expected_remote_endpoint
-            .unwrap_or_else(|| FlowEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), id))
-            .with_id(id)
-    });
+    let expected_local =
+        expected_local_icmp_id.map(|id| FlowEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), id));
     let expected_inbound = expected_remote_endpoint.map(|remote| {
         let local = expected_local
             .unwrap_or_else(|| FlowEndpoint::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
@@ -249,7 +250,7 @@ fn wire_admission_rejects_locked_icmp_reply_id_renegotiation() {
             Some(&source),
         ),
         WirePacketAdmission::Filtered(rej)
-            if rej.reason == RejectionReason::IcmpReplyIdRenegotiationMismatch
+            if rej.reason == RejectionReason::PostLockIcmpReplyIdNegotiation
     ));
 }
 
@@ -466,6 +467,134 @@ fn icmp_raw_admission_uses_packet_source_ip_not_socket_metadata() {
             if admitted.normalized_source
                 == Some(CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0), 65410))
     ));
+}
+
+#[test]
+fn icmp_raw_admission_requires_packet_destination_to_match_local_filter() {
+    let spec = PacketAdmissionSpec {
+        role: SocketPeerRole::Client,
+        proto: SupportedProtocol::ICMP,
+        sock_type: Type::RAW,
+        source_evidence: SourceEvidenceMode::RawPacketSourceRequired,
+        expected_inbound: None,
+        expected_local: Some(FlowEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            65410,
+        )),
+        local_filter: Some(CanonicalAddr::from_v4(Ipv4Addr::new(127, 0, 0, 2), 65410)),
+        locked_flow: None,
+    };
+    let packet = test_icmp_echo_packet(
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+        65410,
+        true,
+    );
+    let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into();
+
+    assert!(matches!(
+        admit_packet(spec, &packet, Some(&source)),
+        PacketAdmission::Accepted(admitted)
+            if admitted.normalized_source
+                == Some(CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), 65410))
+    ));
+}
+
+#[test]
+fn icmp_raw_destination_check_rejects_missing_destination_for_concrete_filter() {
+    let packet = test_icmp_echo_packet(None, None, 65410, true);
+    let parsed = parse_packet_headers(&packet);
+    let concrete_local = CanonicalAddr::from_v4(Ipv4Addr::new(127, 0, 0, 2), 65410);
+
+    assert!(
+        !super::raw_packet_destination_matches(&parsed, concrete_local),
+        "headerless RAW ICMP has no destination-IP evidence for a concrete listener filter"
+    );
+}
+
+#[test]
+fn icmp_raw_destination_check_allows_unspecified_listener_filter() {
+    let packet = test_icmp_echo_packet(None, None, 65410, true);
+    let parsed = parse_packet_headers(&packet);
+    let unspecified_local = CanonicalAddr::from_v4(Ipv4Addr::UNSPECIFIED, 65410);
+
+    assert!(super::raw_packet_destination_matches(
+        &parsed,
+        unspecified_local
+    ));
+}
+
+#[test]
+fn icmp_raw_reflected_reply_to_other_destination_is_receive_noise() {
+    let spec = PacketAdmissionSpec {
+        role: SocketPeerRole::Client,
+        proto: SupportedProtocol::ICMP,
+        sock_type: Type::RAW,
+        source_evidence: SourceEvidenceMode::RawPacketSourceRequired,
+        expected_inbound: None,
+        expected_local: Some(FlowEndpoint::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            65410,
+        )),
+        local_filter: Some(CanonicalAddr::from_v4(Ipv4Addr::new(127, 0, 0, 2), 65410)),
+        locked_flow: None,
+    };
+    let packet = test_icmp_echo_packet(
+        Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+        Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        65410,
+        false,
+    );
+    let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
+
+    assert!(matches!(
+        admit_packet(spec, &packet, Some(&source)),
+        PacketAdmission::Filtered(rej)
+            if rej.reason == RejectionReason::UnexpectedLocalReceiveAddress
+                && rej.normalized_source
+                    == Some(CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0), 65410))
+    ));
+}
+
+#[test]
+fn reflected_icmp_rejections_do_not_count_as_forwarding_errors() {
+    struct TestStats {
+        err: AtomicUsize,
+        oversize: AtomicUsize,
+    }
+
+    impl StatsSink for TestStats {
+        fn send_add(&self, _c2u: bool, _bytes: u64, _start: Instant, _end: Instant) {}
+
+        fn drop_err(&self, _c2u: bool) {
+            self.err.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn drop_oversize(&self, _c2u: bool) {
+            self.oversize.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let stats = TestStats {
+        err: AtomicUsize::new(0),
+        oversize: AtomicUsize::new(0),
+    };
+    for reason in [
+        RejectionReason::UnexpectedLocalReceiveAddress,
+        RejectionReason::IcmpDirectionMismatch,
+    ] {
+        record_rejection_stats(
+            &stats,
+            true,
+            super::RejectedPacket {
+                normalized_source: None,
+                reason,
+            },
+        );
+    }
+
+    assert_eq!(stats.err.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.oversize.load(Ordering::Relaxed), 0);
 }
 
 #[test]

@@ -1,24 +1,14 @@
 use crate::cli::{IcmpReplyIdRequest, ListenMode, RuntimeConfig, SupportedProtocol};
 use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
+use crate::net::framing_shim::{IcmpTunnelFrame, ReplyIdNegotiation, parse_icmp_tunnel_frame};
 use crate::net::packet_headers::{ParsedPacketHeaders, ParsedTransport, parse_packet_headers};
 use crate::net::params::CanonicalAddr;
-use crate::net::payload::{IcmpAdmissionInfo, PayloadEvent, PayloadOrigin, validate_payload};
+use crate::net::payload::{PayloadEvent, PayloadOrigin};
 use crate::net::sock_mgr::SocketHandles;
-use crate::stats::StatsSink;
 use socket2::{SockAddr, Type};
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
-
-struct AdmissionStats;
-
-impl StatsSink for AdmissionStats {
-    fn send_add(&self, _c2u: bool, _bytes: u64, _start: Instant, _end: Instant) {}
-    fn drop_err(&self, _c2u: bool) {}
-    fn drop_oversize(&self, _c2u: bool) {}
-}
-
-static ADMISSION_STATS: AdmissionStats = AdmissionStats;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SocketPeerRole {
@@ -90,11 +80,26 @@ pub(crate) fn log_rejected_packet(
                 expected_local_id
             )
         }
+        RejectionReason::UnexpectedLocalReceiveAddress => crate::log_debug_dir!(
+            cfg.debug_logs.drops,
+            worker_id,
+            c2u,
+            "dropping packet from {role_name} peer {} with unexpected local receive address (expected {:?})",
+            actual_source,
+            spec.local_filter
+        ),
         RejectionReason::MalformedIcmpHeader => crate::log_debug_dir!(
             cfg.debug_logs.drops,
             worker_id,
             c2u,
             "dropping malformed ICMP packet from {role_name} peer {}",
+            actual_source
+        ),
+        RejectionReason::MalformedIcmpTunnelFrame => crate::log_debug_dir!(
+            cfg.debug_logs.drops,
+            worker_id,
+            c2u,
+            "dropping malformed ICMP tunnel frame from {role_name} peer {}",
             actual_source
         ),
         RejectionReason::IcmpDirectionMismatch => crate::log_debug_dir!(
@@ -109,6 +114,20 @@ pub(crate) fn log_rejected_packet(
             worker_id,
             c2u,
             "dropping ICMP packet from {role_name} peer {} because reply-ID negotiation is required",
+            actual_source
+        ),
+        RejectionReason::MissingLockedIcmpReplyId => crate::log_debug_dir!(
+            cfg.debug_logs.drops,
+            worker_id,
+            c2u,
+            "dropping ICMP packet from {role_name} peer {} because locked reply-ID state is missing",
+            actual_source
+        ),
+        RejectionReason::PostLockIcmpReplyIdNegotiation => crate::log_debug_dir!(
+            cfg.debug_logs.drops,
+            worker_id,
+            c2u,
+            "dropping ICMP packet from {role_name} peer {} because source-ID shim is invalid after lock",
             actual_source
         ),
         RejectionReason::IcmpReplyIdRenegotiationMismatch => crate::log_debug_dir!(
@@ -235,16 +254,94 @@ pub(crate) struct AdmittedPacket {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IcmpAdmissionInfo {
+    pub(crate) ident: u16,
+    pub(crate) seq: u16,
+    pub(crate) is_req: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmissionError {
+    InvalidPayloadBounds,
+    InvalidSyntheticCadence,
+    SyntheticCadenceMissingIdent,
+    MalformedIcmpTunnelFrame,
+    IcmpDirectionMismatch,
+    MissingInitialIcmpReplyIdNegotiation,
+    MissingLockedIcmpReplyId,
+    PostLockIcmpReplyIdNegotiation,
+    IcmpReplyIdNegotiationOnSessionControl,
+    PayloadOversize,
+}
+
+impl fmt::Display for AdmissionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPayloadBounds => f.write_str("invalid payload bounds"),
+            Self::InvalidSyntheticCadence => {
+                f.write_str("synthetic cadence packet is only valid for ICMP sync sends")
+            }
+            Self::SyntheticCadenceMissingIdent => {
+                f.write_str("synthetic cadence packet requires explicit ICMP ident")
+            }
+            Self::MalformedIcmpTunnelFrame => f.write_str("malformed ICMP tunnel frame"),
+            Self::IcmpDirectionMismatch => f.write_str("ICMP Echo direction mismatch"),
+            Self::MissingInitialIcmpReplyIdNegotiation => {
+                f.write_str("initial ICMP lock establishment requires reply-ID negotiation")
+            }
+            Self::MissingLockedIcmpReplyId => {
+                f.write_str("locked ICMP C2U validation requires negotiated reply ID")
+            }
+            Self::PostLockIcmpReplyIdNegotiation => {
+                f.write_str("locked ICMP C2U packet must not carry reply-ID negotiation")
+            }
+            Self::IcmpReplyIdNegotiationOnSessionControl => {
+                f.write_str("ICMP reply-ID negotiation attempted on session-control packet")
+            }
+            Self::PayloadOversize => f.write_str("payload length exceeds max"),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RejectionReason {
     UnexpectedRemotePeer,
     UnexpectedLocalReceiveId,
+    UnexpectedLocalReceiveAddress,
     MalformedIcmpHeader,
+    MalformedIcmpTunnelFrame,
     MissingSourceEvidence,
     IcmpDirectionMismatch,
     IcmpReplyIdNegotiationRequired,
+    MissingLockedIcmpReplyId,
+    PostLockIcmpReplyIdNegotiation,
     IcmpReplyIdRenegotiationMismatch,
     UnsupportedDisjointReplyId,
     PayloadOversize,
+}
+
+impl From<AdmissionError> for RejectionReason {
+    #[inline]
+    fn from(err: AdmissionError) -> Self {
+        match err {
+            AdmissionError::PayloadOversize => Self::PayloadOversize,
+            AdmissionError::IcmpDirectionMismatch => Self::IcmpDirectionMismatch,
+            AdmissionError::MissingInitialIcmpReplyIdNegotiation => {
+                Self::IcmpReplyIdNegotiationRequired
+            }
+            AdmissionError::MissingLockedIcmpReplyId => Self::MissingLockedIcmpReplyId,
+            AdmissionError::PostLockIcmpReplyIdNegotiation => Self::PostLockIcmpReplyIdNegotiation,
+            AdmissionError::IcmpReplyIdNegotiationOnSessionControl => {
+                Self::IcmpReplyIdRenegotiationMismatch
+            }
+            AdmissionError::MalformedIcmpTunnelFrame => Self::MalformedIcmpTunnelFrame,
+            AdmissionError::InvalidPayloadBounds
+            | AdmissionError::InvalidSyntheticCadence
+            | AdmissionError::SyntheticCadenceMissingIdent => Self::MalformedIcmpHeader,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +378,131 @@ pub(crate) enum WirePacketAdmission<'a> {
 }
 
 #[inline]
+fn decode_icmp_tunnel_payload<'a>(
+    ident: u16,
+    seq: u16,
+    payload: &'a [u8],
+) -> Result<PayloadEvent<'a>, AdmissionError> {
+    match parse_icmp_tunnel_frame(payload).map_err(|_| AdmissionError::MalformedIcmpTunnelFrame)? {
+        IcmpTunnelFrame::Cadence => Ok(PayloadEvent::cadence_packet(ident, seq)),
+        IcmpTunnelFrame::UserPayload { bytes, reply_id } => {
+            Ok(PayloadEvent::user_payload_negotiation(
+                ident,
+                ident,
+                seq,
+                SupportedProtocol::UDP,
+                bytes,
+                reply_id,
+            ))
+        }
+        IcmpTunnelFrame::SessionControl => Ok(PayloadEvent::session_control(
+            ident,
+            ident,
+            seq,
+            SupportedProtocol::ICMP,
+            &[],
+            None,
+        )),
+    }
+}
+
+#[inline]
+pub(crate) fn validate_admitted_payload<'a>(
+    c2u: bool,
+    cfg: &RuntimeConfig,
+    buf: &'a [u8],
+    icmp_info: Option<IcmpAdmissionInfo>,
+    payload_bounds: (usize, usize),
+    synthetic_icmp_ident: Option<u16>,
+    locked_icmp_negotiated_remote_reply_id: Option<u16>,
+    origin: PayloadOrigin,
+    is_locked: bool,
+) -> Result<PayloadEvent<'a>, AdmissionError> {
+    let dst_proto = if c2u {
+        cfg.upstream_proto
+    } else {
+        cfg.listen_proto
+    };
+
+    if origin == PayloadOrigin::SyntheticCadencePacket {
+        if c2u && dst_proto == SupportedProtocol::ICMP && cfg.icmp_sync_pps > 0 {
+            let ident = synthetic_icmp_ident.ok_or(AdmissionError::SyntheticCadenceMissingIdent)?;
+            return Ok(PayloadEvent::cadence_packet(ident, 0));
+        }
+        return Err(AdmissionError::InvalidSyntheticCadence);
+    }
+
+    let (start, end) = payload_bounds;
+    if start > end || end > buf.len() {
+        return Err(AdmissionError::InvalidPayloadBounds);
+    }
+    let payload = &buf[start..end];
+
+    let decoded_event = if let Some(icmp_info) = icmp_info {
+        if c2u != icmp_info.is_req {
+            return Err(AdmissionError::IcmpDirectionMismatch);
+        }
+        let event = decode_icmp_tunnel_payload(icmp_info.ident, icmp_info.seq, payload)?;
+        match event {
+            PayloadEvent::CadencePacket { .. } => {
+                PayloadEvent::cadence_packet(icmp_info.ident, icmp_info.seq)
+            }
+            PayloadEvent::UserPayload { data, icmp } => {
+                let icmp = icmp.ok_or(AdmissionError::MalformedIcmpTunnelFrame)?;
+                let advertised_reply_id = icmp.advertised_reply_id;
+                let negotiated_remote_reply_id = if c2u && !is_locked {
+                    advertised_reply_id
+                        .ok_or(AdmissionError::MissingInitialIcmpReplyIdNegotiation)?
+                } else if c2u {
+                    let locked_ident = locked_icmp_negotiated_remote_reply_id
+                        .ok_or(AdmissionError::MissingLockedIcmpReplyId)?;
+                    if advertised_reply_id.is_some() {
+                        return Err(AdmissionError::PostLockIcmpReplyIdNegotiation);
+                    }
+                    locked_ident
+                } else {
+                    advertised_reply_id.unwrap_or(icmp_info.ident)
+                };
+
+                PayloadEvent::user_payload_negotiation(
+                    negotiated_remote_reply_id,
+                    icmp_info.ident,
+                    icmp_info.seq,
+                    dst_proto,
+                    data.bytes,
+                    advertised_reply_id.map(|reply_id| ReplyIdNegotiation {
+                        reply_id,
+                        negotiate: icmp.reply_id_negotiate,
+                        ack: icmp.reply_id_ack,
+                    }),
+                )
+            }
+            PayloadEvent::SessionControl { data, icmp } => {
+                if icmp.advertised_reply_id.is_some() {
+                    return Err(AdmissionError::IcmpReplyIdNegotiationOnSessionControl);
+                }
+
+                PayloadEvent::session_control(
+                    icmp_info.ident,
+                    icmp_info.ident,
+                    icmp_info.seq,
+                    dst_proto,
+                    data.bytes,
+                    None,
+                )
+            }
+        }
+    } else {
+        PayloadEvent::user_payload_plain(dst_proto, payload)
+    };
+    if decoded_event.payload_len() > cfg.max_payload {
+        return Err(AdmissionError::PayloadOversize);
+    }
+
+    Ok(decoded_event)
+}
+
+#[inline]
 pub(crate) fn admit_wire_packet<'a>(
     c2u: bool,
     cfg: &RuntimeConfig,
@@ -294,10 +516,9 @@ pub(crate) fn admit_wire_packet<'a>(
         PacketAdmission::UnsupportedSource => return WirePacketAdmission::UnsupportedSource,
     };
     let is_locked = spec.locked_flow.is_some();
-    let event = match validate_payload(
+    let event = match validate_admitted_payload(
         c2u,
         cfg,
-        &ADMISSION_STATS,
         payload,
         admitted.icmp_info,
         admitted.payload_bounds,
@@ -307,10 +528,10 @@ pub(crate) fn admit_wire_packet<'a>(
         is_locked,
     ) {
         Ok(event) => event,
-        Err(e) => {
+        Err(err) => {
             return WirePacketAdmission::Filtered(RejectedPacket {
                 normalized_source: admitted.normalized_source,
-                reason: rejection_from_payload_error(&e.to_string()),
+                reason: err.into(),
             });
         }
     };
@@ -370,28 +591,18 @@ pub(crate) fn admit_packet(
 }
 
 #[inline]
-pub(crate) fn record_rejection_stats(stats: &dyn StatsSink, c2u: bool, rejected: RejectedPacket) {
+pub(crate) fn record_rejection_stats(
+    stats: &dyn crate::stats::StatsSink,
+    c2u: bool,
+    rejected: RejectedPacket,
+) {
     match rejected.reason {
         RejectionReason::PayloadOversize => stats.drop_oversize(c2u),
-        RejectionReason::UnexpectedRemotePeer | RejectionReason::MissingSourceEvidence => {}
+        RejectionReason::UnexpectedRemotePeer
+        | RejectionReason::UnexpectedLocalReceiveAddress
+        | RejectionReason::MissingSourceEvidence
+        | RejectionReason::IcmpDirectionMismatch => {}
         _ => stats.drop_err(c2u),
-    }
-}
-
-#[inline]
-fn rejection_from_payload_error(msg: &str) -> RejectionReason {
-    if msg.contains("payload length") && msg.contains("exceeds max") {
-        RejectionReason::PayloadOversize
-    } else if msg.contains("Echo direction mismatch") {
-        RejectionReason::IcmpDirectionMismatch
-    } else if msg.contains("requires reply-ID negotiation") {
-        RejectionReason::IcmpReplyIdNegotiationRequired
-    } else if msg.contains("reply-ID renegotiation mismatch") {
-        RejectionReason::IcmpReplyIdRenegotiationMismatch
-    } else if msg.contains("unsupported disjoint reply-ID") {
-        RejectionReason::UnsupportedDisjointReplyId
-    } else {
-        RejectionReason::MalformedIcmpHeader
     }
 }
 
@@ -581,6 +792,17 @@ fn admit_icmp_packet(
         };
     };
 
+    if spec.source_evidence == SourceEvidenceMode::RawPacketSourceRequired
+        && spec
+            .local_filter
+            .is_some_and(|local| !raw_packet_destination_matches(parsed, local))
+    {
+        return PacketAdmission::Filtered(RejectedPacket {
+            normalized_source: Some(canonical),
+            reason: RejectionReason::UnexpectedLocalReceiveAddress,
+        });
+    }
+
     if spec
         .expected_remote()
         .is_some_and(|expected| !icmp_remote_ip_matches(canonical, expected))
@@ -600,6 +822,15 @@ fn admit_icmp_packet(
             is_req: icmp.is_req,
         }),
     })
+}
+
+#[inline]
+fn raw_packet_destination_matches(parsed: &ParsedPacketHeaders, local: CanonicalAddr) -> bool {
+    let local_ip = local.addr.ip();
+    if local_ip.is_unspecified() {
+        return true;
+    }
+    parsed_transport_has_ip(parsed) && parsed.dst_ip == Some(local_ip)
 }
 
 #[inline]

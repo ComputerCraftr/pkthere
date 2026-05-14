@@ -345,6 +345,14 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 
     let _loopback_aliases = ensure_multihop_ips();
 
+    let probe_id = random_icmp_listen_id();
+    if let Err(err) =
+        crate::orchestrator::require_bound_raw_icmp_loopback_request_delivery(NODE2_IPV4, probe_id)
+    {
+        eprintln!("skipping raw ICMP loopback multihop test: {err}");
+        return;
+    }
+
     let client_sock = bind_ipv4_client();
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
     let icmp_port_2 = random_icmp_listen_id();
@@ -452,6 +460,14 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
         .expect("ICMP multihop debug test was enabled, but runtime raw ICMP capability is missing");
 
     let _loopback_aliases = ensure_multihop_ips();
+
+    let probe_id = random_icmp_listen_id();
+    if let Err(err) =
+        crate::orchestrator::require_bound_raw_icmp_loopback_request_delivery(NODE2_IPV4, probe_id)
+    {
+        println!("raw ICMP debug trace skipped: {err}");
+        return;
+    }
 
     let client_sock = bind_ipv4_client();
     let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();

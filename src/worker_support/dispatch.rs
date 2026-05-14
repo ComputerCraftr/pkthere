@@ -2,8 +2,7 @@ use super::{BufferedPayload, CachedClientState};
 use crate::cli::RuntimeConfig;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::{
-    PayloadEvent, PayloadOrigin, outbound_payload_event, reply_id_negotiation_for_c2u,
-    send_payload, validate_payload,
+    PayloadEvent, outbound_payload_event, reply_id_negotiation_for_c2u, send_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketHandles;
@@ -110,31 +109,20 @@ pub(crate) fn send_sync_payload_or_cadence(
     let event = if let Some(payload) = buffered_payload {
         payload.as_event()
     } else {
-        synthetic_event = validate_payload(
-            C2U,
-            cfg,
-            stats,
-            &[],
-            None,
-            (0, 0),
-            handles
-                .listener_flow
-                .outbound_destination()
-                .map(|peer_addr| peer_addr.id),
-            handles.locked_flow.and_then(|flow| flow.icmp_ident()),
-            PayloadOrigin::SyntheticCadencePacket,
-            true,
-        )
-        .unwrap_or_else(|e| {
+        let Some(ident) = handles
+            .listener_flow
+            .outbound_destination()
+            .map(|peer_addr| peer_addr.id)
+        else {
             log_debug_dir!(
                 cfg.debug_logs.drops,
                 worker_id,
                 C2U,
-                "synthetic cadence packet error: {}",
-                e
+                "synthetic cadence packet error: missing listener outbound destination"
             );
             unreachable!("synthetic cadence packet validation must not fail")
-        });
+        };
+        synthetic_event = PayloadEvent::cadence_packet(ident, 0);
         synthetic_event
     };
 

@@ -11,6 +11,8 @@ pub(crate) use dispatch::{
     send_user_payload_event,
 };
 pub(crate) use pacing::GlobalSyncPacer;
+#[cfg(test)]
+pub(crate) use packet_admission::{AdmissionError, IcmpAdmissionInfo, validate_admitted_payload};
 pub(crate) use packet_admission::{
     SocketPeerRole, WirePacketAdmission, admit_wire_packet, client_admission_spec,
     log_rejected_packet, record_rejection_stats, upstream_admission_spec,
