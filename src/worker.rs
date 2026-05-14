@@ -213,7 +213,7 @@ pub(crate) fn run_upstream_to_client_thread(
                         cfg.debug_logs.drops,
                         worker_id,
                         C2U,
-                        "classify_u2c error: {}"
+                        "classify_u2c rejected packet: {}"
                     );
                     let reply_id = reply_id_negotiation_for_u2c_listener_reply(
                         &event,

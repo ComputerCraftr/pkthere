@@ -11,10 +11,10 @@ mod worker_flow;
 
 use crate::core::wait_for_stats_json_from;
 use crate::orchestrator::{
-    CLIENT_WAIT_MS, ForwarderConfig, IpFamily, JSON_WAIT_MS, NODE1_IPV4_STR, NODE2_IPV4,
-    NODE2_IPV4_STR, NODE3_IPV4, OutputCapture, bind_udp_client, default_test_icmp_upstream_arg,
-    ensure_loopback_ip, expect_session_stats_matching, launch_forwarder, localhost_addr,
-    random_unprivileged_port, render_icmp_arg, render_icmp_arg_with_reply_id, try_launch_forwarder,
+    CLIENT_WAIT_MS, ForwarderConfig, IpFamily, JSON_WAIT_MS, NODE2_IPV4, NODE2_IPV4_STR,
+    NODE3_IPV4, OutputCapture, bind_udp_client, default_test_icmp_upstream_arg, ensure_loopback_ip,
+    expect_session_stats_matching, launch_forwarder, localhost_addr, random_unprivileged_port,
+    render_icmp_arg, render_icmp_arg_with_reply_id, spawn_udp_echo_server, try_launch_forwarder,
 };
 
 use std::io::ErrorKind;
@@ -31,14 +31,6 @@ const DEBUG_TRACE_LOGS: &[&str] = &["packets", "drops", "handles"];
 
 fn bind_ipv4_client() -> std::net::UdpSocket {
     bind_udp_client(IpFamily::V4).expect(IPV4_CLIENT_BIND_ERR)
-}
-
-fn spawn_ipv4_udp_echo() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
-    IpFamily::V4.spawn_echo().expect(IPV4_UPSTREAM_BIND_ERR)
-}
-
-fn random_icmp_listen_id() -> u16 {
-    random_unprivileged_port(IpFamily::V4).expect(ICMP_LISTEN_ID_ERR)
 }
 
 fn ensure_multihop_ips() -> Vec<crate::orchestrator::LoopbackAliasGuard> {
@@ -340,22 +332,15 @@ fn zero_len_udp_client_payload_round_trips_over_icmp() {
     ignore = "raw ICMP tests require build-time ICMP support or PKTHERE_ALLOW_RAW_ICMP=1"
 )]
 fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
+    let _loopback_aliases = ensure_multihop_ips();
+
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop test was enabled, but runtime raw ICMP capability is missing");
 
-    let _loopback_aliases = ensure_multihop_ips();
-
-    let probe_id = random_icmp_listen_id();
-    if let Err(err) =
-        crate::orchestrator::require_bound_raw_icmp_loopback_request_delivery(NODE2_IPV4, probe_id)
-    {
-        eprintln!("skipping raw ICMP loopback multihop test: {err}");
-        return;
-    }
-
+    let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect(ICMP_LISTEN_ID_ERR);
     let client_sock = bind_ipv4_client();
-    let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
-    let icmp_port_2 = random_icmp_listen_id();
+    let (udp_up_addr, _udp_up_thread) =
+        spawn_udp_echo_server(IpFamily::V4).expect(IPV4_UPSTREAM_BIND_ERR);
 
     let node3_ip = NODE3_IPV4;
     let mut node3 =
@@ -391,6 +376,9 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     client_sock
         .connect(node1.listen_addr)
         .expect("connect client to first forwarder");
+    client_sock
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .expect("set client read timeout");
 
     let stats2 = wait_for_stats_json_from(&mut node2.out, JSON_WAIT_MS).expect("node2 stats");
     assert_eq!(stats2["worker_flows"][0]["client_sock_type"], "RAW");
@@ -456,22 +444,15 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 #[test]
 #[ignore = "manual debug trace; run with -- --nocapture and inspect printed node logs"]
 fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
+    let _loopback_aliases = ensure_multihop_ips();
+
     crate::orchestrator::require_raw_icmp_supported()
         .expect("ICMP multihop debug test was enabled, but runtime raw ICMP capability is missing");
 
-    let _loopback_aliases = ensure_multihop_ips();
-
-    let probe_id = random_icmp_listen_id();
-    if let Err(err) =
-        crate::orchestrator::require_bound_raw_icmp_loopback_request_delivery(NODE2_IPV4, probe_id)
-    {
-        println!("raw ICMP debug trace skipped: {err}");
-        return;
-    }
-
+    let icmp_port_2 = random_unprivileged_port(IpFamily::V4).expect(ICMP_LISTEN_ID_ERR);
     let client_sock = bind_ipv4_client();
-    let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
-    let icmp_port_2 = random_icmp_listen_id();
+    let (udp_up_addr, _udp_up_thread) =
+        spawn_udp_echo_server(IpFamily::V4).expect(IPV4_UPSTREAM_BIND_ERR);
 
     let node3_ip = NODE3_IPV4;
     let mut node3 = launch_icmp_endpoint_node(
@@ -513,6 +494,9 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     client_sock
         .connect(node1.listen_addr)
         .expect("connect client to first forwarder");
+    client_sock
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set client read timeout");
 
     let payload = MULTIHOP_PAYLOAD;
     client_sock.send(payload).expect("send multihop payload");
@@ -523,9 +507,6 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     client_sock
         .send(&[])
         .expect("send zero-length multihop payload");
-    client_sock
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .expect("set read timeout");
     let zero_reply = client_sock.recv(&mut buf);
 
     let (node1_stdout, node1_stderr) = finalize_debug_forwarder_output("node1", &mut node1);
@@ -548,22 +529,25 @@ fn debug_icmp_sync_multihop_bridge_zero_len_trace_manual() {
     ignore = "raw ICMP tests require build-time ICMP support or PKTHERE_ALLOW_RAW_ICMP=1"
 )]
 fn test_raw_icmp_independent_ids() {
+    let _loopback_aliases = ensure_multihop_ips();
+
     crate::orchestrator::require_raw_icmp_supported()
         .expect("RAW ICMP test was enabled, but runtime support is missing");
 
     let client_sock = bind_ipv4_client();
-    let (udp_up_addr, _udp_up_thread) = spawn_ipv4_udp_echo();
+    let (udp_up_addr, _udp_up_thread) =
+        spawn_udp_echo_server(IpFamily::V4).expect(IPV4_UPSTREAM_BIND_ERR);
 
-    let addr_a = NODE1_IPV4_STR;
-    let addr_b = NODE1_IPV4_STR;
-    let id_a = 3003;
+    let addr_c = crate::orchestrator::NODE3_IPV4_STR;
+    let addr_b = NODE2_IPV4_STR;
+    let id_c = 3003;
     let id_b_listen = 1001;
     let id_b_reply = 2002;
 
     let _node_c = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
         debug_upstream_unconnected: false,
-        here: render_icmp_arg(addr_a.parse().expect("node a ip"), id_a),
+        here: render_icmp_arg(addr_c.parse().expect("node c ip"), id_c),
         there: format!("UDP:{}", udp_up_addr),
         timeout_action: "exit",
         timeout_secs: None,
@@ -584,7 +568,7 @@ fn test_raw_icmp_independent_ids() {
             id_b_listen,
             id_b_reply,
         ),
-        there: render_icmp_arg_with_reply_id(addr_a.parse().expect("node a ip"), id_a, id_b_reply),
+        there: render_icmp_arg_with_reply_id(addr_c.parse().expect("node c ip"), id_c, id_b_reply),
         timeout_action: "exit",
         timeout_secs: None,
         max_payload: None,
@@ -615,6 +599,9 @@ fn test_raw_icmp_independent_ids() {
     client_sock
         .connect(node_a.listen_addr)
         .expect("connect client to A");
+    client_sock
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .expect("set client read timeout");
     let payload = INDEPENDENT_IDS_PAYLOAD;
     client_sock.send(payload).expect("send payload");
 
@@ -650,6 +637,6 @@ fn test_raw_icmp_independent_ids() {
     assert!(client_remote_b.contains(&id_b_listen.to_string()));
     assert!(client_local_b.contains(&id_b_reply.to_string()));
     assert!(client_inbound_b.contains(&id_b_listen.to_string()));
-    assert!(upstream_remote_b.contains(&id_a.to_string()));
+    assert!(upstream_remote_b.contains(&id_c.to_string()));
     assert!(upstream_local_b.contains(&id_b_reply.to_string()));
 }

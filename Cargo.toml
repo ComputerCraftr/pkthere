@@ -12,6 +12,7 @@ debug = 0
 
 [build-dependencies]
 socket2 = { version = "0.6.3", features = ["all"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
 
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["must_cast"] }

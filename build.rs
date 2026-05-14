@@ -1,5 +1,3 @@
-use socket2::{Domain, Protocol, Socket, Type};
-
 #[path = "build_support/icmp_probe.rs"]
 mod icmp_probe;
 
@@ -14,8 +12,8 @@ fn main() {
         .map(|v| v == "1")
         .unwrap_or(false);
 
-    // 1. Probe for raw ICMP capability (SOCK_RAW)
-    if allow_raw_env || Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4)).is_ok() {
+    // 1. Probe for requested-bound RAW ICMP delivery, not only SOCK_RAW creation.
+    if allow_raw_env || icmp_probe::probe_raw_icmp_capability().is_ok() {
         println!("cargo:rustc-cfg=supports_raw_icmp_capability");
     }
 

@@ -30,6 +30,7 @@ pub(crate) enum U2cDecision {
     ForwardPayload,
     ForwardSessionControl,
     ConsumeSessionControl,
+    ConsumeCadence,
 }
 
 impl U2cDecision {
@@ -188,13 +189,13 @@ pub(crate) fn classify_u2c(
         PayloadEvent::UserPayload { icmp: None, .. } => return Ok(U2cDecision::ForwardPayload),
         PayloadEvent::SessionControl { icmp, .. } => icmp,
         PayloadEvent::CadencePacket { icmp } => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "ICMP cadence packet arrived from wire (id={}, seq={})",
-                    icmp.negotiated_remote_reply_id, icmp.seq
-                ),
-            ));
+            log_debug!(
+                cfg.debug_logs.packets,
+                "[classify_u2c] consumed wire cadence packet id={} seq={}",
+                icmp.negotiated_remote_reply_id,
+                icmp.seq
+            );
+            return Ok(U2cDecision::ConsumeCadence);
         }
     };
 
@@ -694,17 +695,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_u2c_rejects_wire_cadence_packet() {
+    fn classify_u2c_consumes_wire_cadence_packet() {
         let _guard = lock_sync_state();
         let cfg = test_config();
         let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
         let mut cache = shared.cache();
         let event = PayloadEvent::cadence_packet(0x1234, 7);
-        assert!(
-            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache)
-                .unwrap_err()
-                .to_string()
-                .contains("cadence")
+        assert_eq!(
+            classify_u2c(&cfg, &event, PayloadOrigin::Wire, &shared, &mut cache).unwrap(),
+            U2cDecision::ConsumeCadence
         );
     }
 

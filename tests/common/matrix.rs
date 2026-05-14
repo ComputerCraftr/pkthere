@@ -4,7 +4,6 @@ pub use crate::core::{
     default_test_upstream_arg, ensure_loopback_ip, localhost_addr, random_unprivileged_port,
     render_canonical_ip_id, render_icmp_arg, render_icmp_arg_with_reply_id, spawn_udp_echo_server,
 };
-use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 
@@ -20,14 +19,6 @@ pub struct MatrixCase<'a> {
 }
 
 impl IpFamily {
-    pub fn bind_client(self) -> io::Result<UdpSocket> {
-        bind_udp_client(self)
-    }
-
-    pub fn spawn_echo(self) -> io::Result<(SocketAddr, thread::JoinHandle<()>)> {
-        spawn_udp_echo_server(self)
-    }
-
     pub const fn listen_arg(self) -> &'static str {
         match self {
             Self::V4 => "UDP:127.0.0.1:0",
@@ -78,7 +69,7 @@ pub fn run_matrix_cases<'a>(
 }
 
 pub fn bind_client_or_skip(family: IpFamily) -> Option<UdpSocket> {
-    match family.bind_client() {
+    match bind_udp_client(family) {
         Ok(sock) => Some(sock),
         Err(e) if family.is_v6() => {
             eprintln!("IPv6 loopback not available; skipping IPv6 test: {e}");
@@ -89,7 +80,7 @@ pub fn bind_client_or_skip(family: IpFamily) -> Option<UdpSocket> {
 }
 
 pub fn spawn_echo_or_skip(family: IpFamily) -> Option<(SocketAddr, thread::JoinHandle<()>)> {
-    match family.spawn_echo() {
+    match spawn_udp_echo_server(family) {
         Ok(pair) => Some(pair),
         Err(e) if family.is_v6() => {
             eprintln!("IPv6 echo server could not bind; skipping IPv6 test: {e}");

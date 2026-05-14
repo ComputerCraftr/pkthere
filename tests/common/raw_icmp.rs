@@ -5,54 +5,58 @@ use std::process::Command;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
-use std::net::Ipv4Addr;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 #[path = "../../build_support/icmp_probe.rs"]
 mod icmp_probe;
 
 pub fn require_raw_icmp_supported() -> io::Result<()> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        if linux_binary_has_raw_capability() {
-            return Ok(());
+    let has_raw_binary_capability = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            linux_binary_has_raw_capability()
         }
-    }
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        if setuid_binary_has_raw_capability() {
-            return Ok(());
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        {
+            setuid_binary_has_raw_capability()
         }
-    }
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    )))]
-    {
-        if fallback_binary_has_raw_capability() {
-            return Ok(());
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )))]
+        {
+            fallback_binary_has_raw_capability()
         }
+    };
+
+    if !has_raw_binary_capability {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "raw ICMP test support unavailable (requires cap_net_raw, setuid root, or Administrator)",
+        ));
     }
 
-    Err(io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "raw ICMP test support unavailable (requires cap_net_raw, setuid root, or Administrator)",
-    ))
+    RAW_ICMP_CAPABILITY
+        .get_or_init(icmp_probe::probe_raw_icmp_capability)
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
+
+static RAW_ICMP_CAPABILITY: OnceLock<io::Result<()>> = OnceLock::new();
 
 static KERNEL_ECHO_SUPPORT: OnceLock<io::Result<()>> = OnceLock::new();
 
@@ -64,38 +68,8 @@ pub fn require_kernel_echo_reply_supported() -> io::Result<()> {
         .map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
 
-pub fn require_bound_raw_icmp_loopback_request_delivery(
-    ip: Ipv4Addr,
-    ident: u16,
-) -> io::Result<()> {
-    match icmp_probe::probe_bound_raw_icmp_loopback_request_delivery(
-        ip,
-        ident,
-        Duration::from_millis(750),
-    ) {
-        Ok(icmp_probe::RawLoopbackProbeResult::EchoRequest) => Ok(()),
-        Ok(icmp_probe::RawLoopbackProbeResult::OnlyEchoReply) => Err(io::Error::other(format!(
-            "requested-bound RAW ICMP listener on {ip}:{ident} observed only reflected Echo Replies; this host does not deliver the Echo Request stream required by the raw loopback multihop test"
-        ))),
-        Ok(icmp_probe::RawLoopbackProbeResult::NoMatchingIcmp) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "requested-bound RAW ICMP listener on {ip}:{ident} did not observe a matching Echo Request before the probe deadline"
-            ),
-        )),
-        Err(err) => Err(io::Error::new(
-            err.kind(),
-            format!("requested-bound RAW ICMP loopback probe failed for {ip}:{ident}: {err}"),
-        )),
-    }
-}
-
 pub fn platform_supports_dgram_icmp() -> bool {
     Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4)).is_ok()
-}
-
-pub fn platform_requires_raw_privilege_for_any_icmp() -> bool {
-    !platform_supports_dgram_icmp()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -165,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_raw_requirement_check_returns_bool_without_panicking() {
-        super::platform_requires_raw_privilege_for_any_icmp();
+    fn raw_icmp_capability_probe_reports_result_without_panicking() {
+        let _ = super::icmp_probe::probe_raw_icmp_capability();
     }
 }

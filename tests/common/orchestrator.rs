@@ -27,8 +27,7 @@ pub use matrix::{
     spawn_echo_or_skip, spawn_udp_echo_server, spawn_upstream_echo_or_skip,
 };
 pub use raw_icmp::{
-    platform_supports_dgram_icmp, require_bound_raw_icmp_loopback_request_delivery,
-    require_kernel_echo_reply_supported, require_raw_icmp_supported,
+    platform_supports_dgram_icmp, require_kernel_echo_reply_supported, require_raw_icmp_supported,
 };
 pub use runtime_asserts::{
     StatsWaitOutcome, expect_no_echo, expect_session_stats_matching, json_addr, send_until_locked,

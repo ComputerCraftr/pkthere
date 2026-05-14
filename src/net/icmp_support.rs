@@ -1,9 +1,9 @@
-use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::atomic::{AtomicU16, Ordering as AtomOrdering};
 
 use crate::cli::SupportedProtocol;
 
-static EFFECTIVE_ICMP_ID_RNG_STATE: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_ICMP_ID: AtomicU16 = AtomicU16::new(49152);
 
 #[inline]
 pub(crate) fn listener_requires_raw(proto: SupportedProtocol) -> bool {
@@ -38,57 +38,19 @@ pub(crate) fn upstream_requires_raw(
 }
 
 fn next_nonzero_icmp_id() -> u16 {
-    fn initial_seed() -> u64 {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let pid = u64::from(std::process::id());
-        let seed = nanos ^ pid.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15u64;
-        if seed == 0 {
-            0xA5A5_5A5A_D3C1_B4E7
-        } else {
-            seed
-        }
-    }
-
-    let mut state = EFFECTIVE_ICMP_ID_RNG_STATE.load(AtomOrdering::Relaxed);
-    if state == 0 {
-        let seed = initial_seed();
-        match EFFECTIVE_ICMP_ID_RNG_STATE.compare_exchange(
-            0,
-            seed,
-            AtomOrdering::Relaxed,
-            AtomOrdering::Relaxed,
-        ) {
-            Ok(_) => state = seed,
-            Err(existing) => state = existing,
+    if let Ok(sock) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+        && let Ok(addr) = sock.local_addr()
+    {
+        let id = addr.port();
+        if id != 0 {
+            return id;
         }
     }
 
     loop {
-        let mut next = state;
-        next ^= next >> 12;
-        next ^= next << 25;
-        next ^= next >> 27;
-        next = next.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        if next == 0 {
-            next = initial_seed();
-        }
-        match EFFECTIVE_ICMP_ID_RNG_STATE.compare_exchange(
-            state,
-            next,
-            AtomOrdering::Relaxed,
-            AtomOrdering::Relaxed,
-        ) {
-            Ok(_) => {
-                let id = next as u16;
-                if id != 0 {
-                    return id;
-                }
-                state = next;
-            }
-            Err(observed) => state = observed,
+        let id = FALLBACK_ICMP_ID.fetch_add(1, AtomOrdering::Relaxed);
+        if id != 0 {
+            return id;
         }
     }
 }
@@ -182,17 +144,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_icmp_ids_are_not_structurally_forced_odd() {
-        let mut saw_even = false;
-        for _ in 0..256 {
-            let (id, _) = choose_upstream_icmp_ids(0, 0, 0, false, false, false);
-            assert_ne!(id, 0);
-            if id % 2 == 0 {
-                saw_even = true;
-                break;
-            }
-        }
-        assert!(saw_even);
+    fn generated_icmp_ids_come_from_nonzero_ephemeral_allocation() {
+        let (id, _) = choose_upstream_icmp_ids(0, 0, 0, false, false, false);
+        assert_ne!(id, 0);
     }
 
     #[test]
@@ -232,7 +186,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn linux_untrusts_raw_socket_getsockname_id_1() {
-        // requested 0, kernel reports 1, is_raw_socket true -> should UNTRUST 1 and generate random
+        // requested 0, kernel reports 1, is_raw_socket true -> should UNTRUST 1 and allocate an ID
         let (l, r) = choose_upstream_icmp_ids(0, 0, 1, true, true, false);
         assert_ne!(l, 1);
         assert_ne!(l, 0);
