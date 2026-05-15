@@ -172,6 +172,51 @@ fn wire_admission_builds_initial_icmp_lock_from_reply_id_negotiation() {
 }
 
 #[test]
+fn wire_admission_builds_initial_icmp_lock_from_session_control_negotiation_without_user_bytes() {
+    let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
+    let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
+    let packet = icmp_tunnel_packet(1001, true, &[0x30, 0x20, 0x02]);
+
+    let admitted = match admit_wire_packet(
+        true,
+        &cfg,
+        icmp_wire_spec(None, None),
+        &packet,
+        Some(&source),
+    ) {
+        WirePacketAdmission::Accepted(admitted) => admitted,
+        other => panic!("unexpected admission: {other:?}"),
+    };
+    assert!(matches!(
+        admitted.event,
+        PayloadEvent::SessionControl {
+            icmp: crate::net::payload::IcmpPayloadMeta {
+                negotiated_remote_reply_id: 0x2002,
+                advertised_reply_id: Some(0x2002),
+                reply_id_negotiate: true,
+                reply_id_ack: false,
+                ..
+            },
+            ..
+        }
+    ));
+    let lock = admitted.lock_candidate.expect("lock candidate");
+    assert_eq!(
+        lock.flow_key,
+        ClientFlowKey::IcmpV4 {
+            ip: Ipv4Addr::new(127, 0, 0, 2),
+            ident: 0x2002
+        }
+    );
+    let inbound = lock.listener_flow.inbound.expect("inbound tuple");
+    let outbound = lock.listener_flow.outbound.expect("outbound tuple");
+    assert_eq!(inbound.src.id, 0x2002);
+    assert_eq!(inbound.dst.id, 1001);
+    assert_eq!(outbound.src.id, 3003);
+    assert_eq!(outbound.dst.id, 0x2002);
+}
+
+#[test]
 fn wire_admission_wildcard_local_reply_id_yields_to_peer_reply_id_and_uses_realized_local() {
     let cfg = test_config(IcmpReplyIdRequest::Wildcard);
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();

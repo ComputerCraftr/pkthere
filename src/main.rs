@@ -33,11 +33,8 @@ use net::sync_icmp::SharedSyncIcmpState;
 use nix::unistd::{self, Group, User};
 use runtime_support::SIGINT_EXIT;
 use stats::Stats;
-use worker::{
-    run_client_to_upstream_thread, run_reresolve_thread, run_upstream_to_client_thread,
-    run_watchdog_thread,
-};
-use worker_support::GlobalSyncPacer;
+use worker::{run_client_to_upstream_thread, run_upstream_to_client_thread};
+use worker_support::{GlobalSyncPacer, run_reresolve_thread, run_watchdog_thread};
 
 use std::io;
 use std::process;

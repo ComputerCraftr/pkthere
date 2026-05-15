@@ -1,8 +1,9 @@
-use super::{BufferedPayload, CachedClientState};
+use super::CachedClientState;
 use crate::cli::RuntimeConfig;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::{
-    PayloadEvent, outbound_payload_event, reply_id_negotiation_for_c2u, send_payload,
+    BufferedPayload, PayloadEvent, outbound_payload_event, reply_id_negotiation_for_c2u,
+    send_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
 use crate::net::sock_mgr::SocketHandles;
@@ -50,13 +51,65 @@ pub(crate) fn send_user_payload_event(
     } = event
     {
         remember_request_seq(sync_state, sync_cache, icmp);
-        observe_reply_id_ack(true, event, handles, flow_state);
+        let _ = observe_reply_id_ack(true, event, handles, flow_state);
     }
     let reply_id_negotiation = reply_id_negotiation_for_c2u(
         event,
         flow_state.upstream_reply_id_acked(),
         handles.upstream_local_filter.id,
     );
+    let needs_control_handshake = handles.upstream_sock_type == socket2::Type::RAW
+        || cfg.upstream.id != 0
+        || matches!(event, PayloadEvent::UserPayload { icmp: Some(_), .. });
+    if let Some(reply_id_negotiation) = reply_id_negotiation
+        && needs_control_handshake
+    {
+        let started_s = t_recv.saturating_duration_since(t_start).as_secs().max(1);
+        if flow_state.begin_upstream_reply_id_handshake(
+            reply_id_negotiation.reply_id,
+            started_s,
+            BufferedPayload::from_event(event),
+        ) {
+            let control_event = PayloadEvent::session_control_negotiation(
+                reply_id_negotiation.reply_id,
+                reply_id_negotiation.reply_id,
+                0,
+                crate::cli::SupportedProtocol::ICMP,
+                Some(reply_id_negotiation),
+            );
+            let outbound = outbound_payload_event(
+                &control_event,
+                cache.route.icmp_header_id,
+                C2U,
+                prepare_send(C2U, &control_event, true, sync_state, sync_cache),
+                Some(reply_id_negotiation),
+            )?;
+            let send_res = send_payload(
+                &handles.upstream_sock,
+                handles.upstream_connected,
+                cache.dest_sock_type,
+                &cache.route.dest_sa,
+                &outbound,
+            );
+            handle_send_result(
+                C2U,
+                worker_id,
+                t_start,
+                t_recv,
+                cfg,
+                stats,
+                flow_state,
+                &control_event,
+                false,
+                &send_res,
+                handles.upstream_connected,
+                &cache.route.dest_sa,
+                None,
+            );
+            return Ok(());
+        }
+        return Ok(());
+    }
     let outbound = outbound_payload_event(
         event,
         cache.route.icmp_header_id,
@@ -169,22 +222,27 @@ pub(crate) fn observe_reply_id_ack(
     event: &PayloadEvent<'_>,
     handles: &SocketHandles,
     flow_state: &FlowRuntimeState,
-) {
-    let PayloadEvent::UserPayload {
-        icmp: Some(icmp), ..
-    } = event
-    else {
-        return;
+) -> Option<BufferedPayload> {
+    let icmp = match event {
+        PayloadEvent::UserPayload {
+            icmp: Some(icmp), ..
+        }
+        | PayloadEvent::SessionControl { icmp, .. } => icmp,
+        _ => return None,
     };
-    if !icmp.reply_id_ack {
-        return;
+    let reflected_negotiate_ack = !c2u && icmp.reply_id_negotiate;
+    if !icmp.reply_id_ack && !reflected_negotiate_ack {
+        return None;
     }
     if c2u {
         let expected = handles.listener_flow.outbound.map(|flow| flow.src.id);
         if icmp.advertised_reply_id == expected {
-            flow_state.ack_listener_reply_id();
+            return flow_state.ack_listener_reply_id_handshake(icmp.advertised_reply_id?);
         }
-    } else if icmp.advertised_reply_id == Some(handles.upstream_local_filter.id) {
-        flow_state.ack_upstream_reply_id();
+    } else if reflected_negotiate_ack
+        || icmp.advertised_reply_id == Some(handles.upstream_local_filter.id)
+    {
+        return flow_state.ack_upstream_reply_id_handshake(icmp.advertised_reply_id?);
     }
+    None
 }

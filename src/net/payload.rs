@@ -105,6 +105,7 @@ impl<'a> PayloadEvent<'a> {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) const fn session_control(
         negotiated_remote_reply_id: u16,
         inbound_header_ident: u16,
@@ -122,6 +123,30 @@ impl<'a> PayloadEvent<'a> {
                 advertised_reply_id,
                 reply_id_negotiate: advertised_reply_id.is_some(),
                 reply_id_ack: false,
+            },
+        }
+    }
+
+    #[inline]
+    pub(crate) fn session_control_negotiation(
+        negotiated_remote_reply_id: u16,
+        inbound_header_ident: u16,
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        reply_id: Option<ReplyIdNegotiation>,
+    ) -> Self {
+        Self::SessionControl {
+            data: PayloadData {
+                dst_proto,
+                bytes: &[],
+            },
+            icmp: IcmpPayloadMeta {
+                negotiated_remote_reply_id,
+                inbound_header_ident,
+                seq,
+                advertised_reply_id: reply_id.map(|reply_id| reply_id.reply_id),
+                reply_id_negotiate: reply_id.is_some_and(|reply_id| reply_id.negotiate),
+                reply_id_ack: reply_id.is_some_and(|reply_id| reply_id.ack),
             },
         }
     }
@@ -173,6 +198,37 @@ pub(crate) struct IcmpPayloadMeta {
     pub(crate) reply_id_ack: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferedPayload {
+    data: OwnedPayloadData,
+    icmp: Option<IcmpPayloadMeta>,
+}
+
+impl BufferedPayload {
+    #[inline]
+    pub(crate) fn from_event(event: &PayloadEvent<'_>) -> Self {
+        let (dst_proto, bytes, icmp) = match event {
+            PayloadEvent::UserPayload { data, icmp } => (data.dst_proto, data.bytes, *icmp),
+            _ => unreachable!("only user payloads are buffered"),
+        };
+        Self {
+            data: OwnedPayloadData {
+                dst_proto,
+                bytes: bytes.to_vec(),
+            },
+            icmp,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_event(&self) -> PayloadEvent<'_> {
+        PayloadEvent::UserPayload {
+            data: self.data.as_borrowed(),
+            icmp: self.icmp,
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn reply_id_negotiation_for_c2u(
     event: &PayloadEvent<'_>,
@@ -191,6 +247,22 @@ pub(crate) fn reply_id_negotiation_for_c2u(
         reply_id: advertised_local_reply_id,
         negotiate: true,
         ack: false,
+    })
+}
+
+#[inline]
+pub(crate) fn reply_id_ack_for_event(event: &PayloadEvent<'_>) -> Option<ReplyIdNegotiation> {
+    let icmp = match event {
+        PayloadEvent::SessionControl { icmp, .. } => icmp,
+        _ => return None,
+    };
+    if !icmp.reply_id_negotiate {
+        return None;
+    }
+    icmp.advertised_reply_id.map(|reply_id| ReplyIdNegotiation {
+        reply_id,
+        negotiate: false,
+        ack: true,
     })
 }
 

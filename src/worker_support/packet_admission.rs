@@ -130,13 +130,6 @@ pub(crate) fn log_rejected_packet(
             "dropping ICMP packet from {role_name} peer {} because source-ID shim is invalid after lock",
             actual_source
         ),
-        RejectionReason::IcmpReplyIdRenegotiationMismatch => crate::log_debug_dir!(
-            cfg.debug_logs.drops,
-            worker_id,
-            c2u,
-            "dropping ICMP packet from {role_name} peer {} due to reply-ID renegotiation mismatch",
-            actual_source
-        ),
         RejectionReason::UnsupportedDisjointReplyId => crate::log_debug_dir!(
             cfg.debug_logs.drops,
             worker_id,
@@ -270,7 +263,6 @@ pub(crate) enum AdmissionError {
     MissingInitialIcmpReplyIdNegotiation,
     MissingLockedIcmpReplyId,
     PostLockIcmpReplyIdNegotiation,
-    IcmpReplyIdNegotiationOnSessionControl,
     PayloadOversize,
 }
 
@@ -295,9 +287,6 @@ impl fmt::Display for AdmissionError {
             Self::PostLockIcmpReplyIdNegotiation => {
                 f.write_str("locked ICMP C2U packet must not carry reply-ID negotiation")
             }
-            Self::IcmpReplyIdNegotiationOnSessionControl => {
-                f.write_str("ICMP reply-ID negotiation attempted on session-control packet")
-            }
             Self::PayloadOversize => f.write_str("payload length exceeds max"),
         }
     }
@@ -317,7 +306,6 @@ pub(crate) enum RejectionReason {
     IcmpReplyIdNegotiationRequired,
     MissingLockedIcmpReplyId,
     PostLockIcmpReplyIdNegotiation,
-    IcmpReplyIdRenegotiationMismatch,
     UnsupportedDisjointReplyId,
     PayloadOversize,
 }
@@ -333,9 +321,6 @@ impl From<AdmissionError> for RejectionReason {
             }
             AdmissionError::MissingLockedIcmpReplyId => Self::MissingLockedIcmpReplyId,
             AdmissionError::PostLockIcmpReplyIdNegotiation => Self::PostLockIcmpReplyIdNegotiation,
-            AdmissionError::IcmpReplyIdNegotiationOnSessionControl => {
-                Self::IcmpReplyIdRenegotiationMismatch
-            }
             AdmissionError::MalformedIcmpTunnelFrame => Self::MalformedIcmpTunnelFrame,
             AdmissionError::InvalidPayloadBounds
             | AdmissionError::InvalidSyntheticCadence
@@ -395,14 +380,15 @@ fn decode_icmp_tunnel_payload<'a>(
                 reply_id,
             ))
         }
-        IcmpTunnelFrame::SessionControl => Ok(PayloadEvent::session_control(
-            ident,
-            ident,
-            seq,
-            SupportedProtocol::ICMP,
-            &[],
-            None,
-        )),
+        IcmpTunnelFrame::SessionControl { reply_id } => {
+            Ok(PayloadEvent::session_control_negotiation(
+                ident,
+                ident,
+                seq,
+                SupportedProtocol::ICMP,
+                reply_id,
+            ))
+        }
     }
 }
 
@@ -477,18 +463,25 @@ pub(crate) fn validate_admitted_payload<'a>(
                     }),
                 )
             }
-            PayloadEvent::SessionControl { data, icmp } => {
-                if icmp.advertised_reply_id.is_some() {
-                    return Err(AdmissionError::IcmpReplyIdNegotiationOnSessionControl);
-                }
-
-                PayloadEvent::session_control(
-                    icmp_info.ident,
+            PayloadEvent::SessionControl { data: _, icmp } => {
+                let negotiated_remote_reply_id = if c2u && !is_locked {
+                    icmp.advertised_reply_id.unwrap_or(icmp_info.ident)
+                } else if c2u {
+                    locked_icmp_negotiated_remote_reply_id
+                        .ok_or(AdmissionError::MissingLockedIcmpReplyId)?
+                } else {
+                    icmp.advertised_reply_id.unwrap_or(icmp_info.ident)
+                };
+                PayloadEvent::session_control_negotiation(
+                    negotiated_remote_reply_id,
                     icmp_info.ident,
                     icmp_info.seq,
                     dst_proto,
-                    data.bytes,
-                    None,
+                    icmp.advertised_reply_id.map(|reply_id| ReplyIdNegotiation {
+                        reply_id,
+                        negotiate: icmp.reply_id_negotiate,
+                        ack: icmp.reply_id_ack,
+                    }),
                 )
             }
         }
@@ -547,7 +540,11 @@ pub(crate) fn admit_wire_packet<'a>(
             reason: RejectionReason::UnsupportedDisjointReplyId,
         });
     }
-    let lock_candidate = if c2u && spec.role == SocketPeerRole::Client && !is_locked {
+    let lock_candidate = if c2u
+        && spec.role == SocketPeerRole::Client
+        && !is_locked
+        && (spec.proto != SupportedProtocol::ICMP || event_advertised_reply_id(&event).is_some())
+    {
         admitted.normalized_source.and_then(|src| {
             build_client_lock_candidate(
                 src,
@@ -572,7 +569,8 @@ fn event_advertised_reply_id(event: &PayloadEvent<'_>) -> Option<u16> {
     match event {
         PayloadEvent::UserPayload {
             icmp: Some(icmp), ..
-        } => icmp.advertised_reply_id,
+        }
+        | PayloadEvent::SessionControl { icmp, .. } => icmp.advertised_reply_id,
         _ => None,
     }
 }
@@ -620,7 +618,10 @@ fn build_client_lock_candidate(
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
-            } => FlowEndpoint::from_canonical(src).with_id(icmp.negotiated_remote_reply_id),
+            }
+            | PayloadEvent::SessionControl { icmp, .. } => {
+                FlowEndpoint::from_canonical(src).with_id(icmp.negotiated_remote_reply_id)
+            }
             _ => return None,
         },
     };
@@ -629,7 +630,10 @@ fn build_client_lock_candidate(
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
-            } => FlowEndpoint::from_canonical(listen_local_recv).with_id(icmp.inbound_header_ident),
+            }
+            | PayloadEvent::SessionControl { icmp, .. } => {
+                FlowEndpoint::from_canonical(listen_local_recv).with_id(icmp.inbound_header_ident)
+            }
             _ => return None,
         },
     };
@@ -638,11 +642,14 @@ fn build_client_lock_candidate(
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
-            } => FlowEndpoint::from_canonical(listen_local_recv).with_id(
-                listener_reply_id_request
-                    .resolved_reply_id(icmp.inbound_header_ident)
-                    .unwrap_or(icmp.inbound_header_ident),
-            ),
+            }
+            | PayloadEvent::SessionControl { icmp, .. } => {
+                FlowEndpoint::from_canonical(listen_local_recv).with_id(
+                    listener_reply_id_request
+                        .resolved_reply_id(icmp.inbound_header_ident)
+                        .unwrap_or(icmp.inbound_header_ident),
+                )
+            }
             _ => return None,
         },
     };
@@ -666,7 +673,8 @@ fn client_flow_key_from_event(
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
-            } => Some(ClientFlowKey::from_icmp_reply_id(
+            }
+            | PayloadEvent::SessionControl { icmp, .. } => Some(ClientFlowKey::from_icmp_reply_id(
                 src,
                 icmp.negotiated_remote_reply_id,
             )),

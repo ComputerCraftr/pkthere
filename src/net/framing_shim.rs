@@ -28,7 +28,9 @@ pub(crate) enum IcmpTunnelFrame<'a> {
         bytes: &'a [u8],
         reply_id: Option<ReplyIdNegotiation>,
     },
-    SessionControl,
+    SessionControl {
+        reply_id: Option<ReplyIdNegotiation>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,11 +56,6 @@ pub(crate) fn parse_icmp_tunnel_frame(payload: &[u8]) -> io::Result<IcmpTunnelFr
     let negotiate_reply_id = (shim & SHIM_NEGOTIATE_REPLY_ID) != 0;
     let ack_reply_id = (shim & SHIM_ACK_REPLY_ID) != 0;
 
-    if (has_reply_id || negotiate_reply_id || ack_reply_id) && !is_data {
-        return Err(invalid_data(
-            "ICMP reply-ID negotiation flags require user-data shim",
-        ));
-    }
     if (negotiate_reply_id || ack_reply_id) && !has_reply_id {
         return Err(invalid_data(
             "ICMP reply-ID negotiation flag requires advertised reply ID",
@@ -89,7 +86,7 @@ pub(crate) fn parse_icmp_tunnel_frame(payload: &[u8]) -> io::Result<IcmpTunnelFr
             bytes: user_payload,
             reply_id,
         }),
-        (false, false, true) => Ok(IcmpTunnelFrame::SessionControl),
+        (false, false, true) => Ok(IcmpTunnelFrame::SessionControl { reply_id }),
         _ => Err(invalid_data("ICMP tunnel shim payload flags mismatch")),
     }
 }
@@ -108,13 +105,28 @@ pub(crate) fn encode_icmp_tunnel_prefix(
             Ok(&[])
         }
         IcmpTunnelFrameKind::SessionControl => {
-            if reply_id.is_some() || payload_len != 0 {
+            if payload_len != 0 {
                 return Err(invalid_input(
-                    "ICMP session-control shim cannot carry reply-ID negotiation or payload",
+                    "ICMP session-control shim cannot carry payload",
                 ));
             }
-            scratch[0] = 0;
-            Ok(&scratch[..1])
+            let mut shim = 0u8;
+            if let Some(negotiation) = reply_id {
+                if !negotiation.negotiate && !negotiation.ack {
+                    return Err(invalid_input(
+                        "ICMP reply-ID shim requires negotiate and/or ack flag",
+                    ));
+                }
+                shim |= SHIM_HAS_REPLY_ID
+                    | ((negotiation.negotiate as u8) * SHIM_NEGOTIATE_REPLY_ID)
+                    | ((negotiation.ack as u8) * SHIM_ACK_REPLY_ID);
+                scratch[0] = shim;
+                scratch[1..3].copy_from_slice(&negotiation.reply_id.to_be_bytes());
+                Ok(&scratch[..ICMP_TUNNEL_SHIM_MAX_LEN])
+            } else {
+                scratch[0] = shim;
+                Ok(&scratch[..1])
+            }
         }
         IcmpTunnelFrameKind::UserPayload => {
             let mut shim = SHIM_IS_DATA | (((payload_len != 0) as u8) * SHIM_HAS_PAYLOAD);
@@ -162,7 +174,7 @@ mod tests {
     fn framing_shim_parses_session_control_only_from_single_zero_byte() {
         assert_eq!(
             parse_icmp_tunnel_frame(&[0x00]).unwrap(),
-            IcmpTunnelFrame::SessionControl
+            IcmpTunnelFrame::SessionControl { reply_id: None }
         );
         assert!(parse_icmp_tunnel_frame(&[0x00, b'x']).is_err());
     }
@@ -186,11 +198,10 @@ mod tests {
     }
 
     #[test]
-    fn framing_shim_parses_reply_id_negotiation_user_frames() {
+    fn framing_shim_parses_reply_id_negotiation_session_control_frames() {
         assert_eq!(
-            parse_icmp_tunnel_frame(&[0xB0, 0x20, 0x02]).unwrap(),
-            IcmpTunnelFrame::UserPayload {
-                bytes: &[],
+            parse_icmp_tunnel_frame(&[0x30, 0x20, 0x02]).unwrap(),
+            IcmpTunnelFrame::SessionControl {
                 reply_id: Some(ReplyIdNegotiation {
                     reply_id: 0x2002,
                     negotiate: true,
@@ -199,9 +210,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_icmp_tunnel_frame(&[0xE8, 0x20, 0x02, b'x']).unwrap(),
-            IcmpTunnelFrame::UserPayload {
-                bytes: b"x",
+            parse_icmp_tunnel_frame(&[0x28, 0x20, 0x02]).unwrap(),
+            IcmpTunnelFrame::SessionControl {
                 reply_id: Some(ReplyIdNegotiation {
                     reply_id: 0x2002,
                     negotiate: false,
@@ -215,7 +225,6 @@ mod tests {
     fn framing_shim_rejects_invalid_flags_and_truncated_reply_id() {
         assert!(parse_icmp_tunnel_frame(&[0x82]).is_err());
         assert!(parse_icmp_tunnel_frame(&[0xB0, 0x20]).is_err());
-        assert!(parse_icmp_tunnel_frame(&[0x20, 0x20, 0x02]).is_err());
         assert!(parse_icmp_tunnel_frame(&[0x90]).is_err());
         assert!(parse_icmp_tunnel_frame(&[0x88]).is_err());
     }
@@ -240,6 +249,20 @@ mod tests {
             &[0x00]
         );
         assert_eq!(
+            encode_icmp_tunnel_prefix(
+                IcmpTunnelFrameKind::SessionControl,
+                Some(ReplyIdNegotiation {
+                    reply_id: 0x2002,
+                    negotiate: true,
+                    ack: false
+                }),
+                0,
+                &mut scratch
+            )
+            .unwrap(),
+            &[0x30, 0x20, 0x02]
+        );
+        assert_eq!(
             encode_icmp_tunnel_prefix(IcmpTunnelFrameKind::UserPayload, None, 0, &mut scratch)
                 .unwrap(),
             &[0x80]
@@ -248,34 +271,6 @@ mod tests {
             encode_icmp_tunnel_prefix(IcmpTunnelFrameKind::UserPayload, None, 1, &mut scratch)
                 .unwrap(),
             &[0xC0]
-        );
-        assert_eq!(
-            encode_icmp_tunnel_prefix(
-                IcmpTunnelFrameKind::UserPayload,
-                Some(ReplyIdNegotiation {
-                    reply_id: 0x2002,
-                    negotiate: true,
-                    ack: false
-                }),
-                1,
-                &mut scratch
-            )
-            .unwrap(),
-            &[0xF0, 0x20, 0x02]
-        );
-        assert_eq!(
-            encode_icmp_tunnel_prefix(
-                IcmpTunnelFrameKind::UserPayload,
-                Some(ReplyIdNegotiation {
-                    reply_id: 0x2002,
-                    negotiate: true,
-                    ack: true
-                }),
-                0,
-                &mut scratch
-            )
-            .unwrap(),
-            &[0xB8, 0x20, 0x02]
         );
     }
 }

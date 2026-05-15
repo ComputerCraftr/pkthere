@@ -18,7 +18,6 @@ const RAW_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 const RAW_CAPABILITY_NODE2_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
 const RAW_CAPABILITY_NODE3_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 3);
 const RAW_CAPABILITY_CONCRETE_ID: u16 = 1001;
-const RAW_CAPABILITY_REPLY_ID: u16 = 2002;
 const RAW_CAPABILITY_REMOTE_ID: u16 = 3003;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,12 +74,6 @@ pub fn probe_raw_icmp_capability() -> io::Result<()> {
             RAW_CAPABILITY_NODE3_IP,
             0,
             RAW_CAPABILITY_REMOTE_ID,
-        ),
-        (
-            "node2 independent reply/local listener",
-            RAW_CAPABILITY_NODE2_IP,
-            RAW_CAPABILITY_REPLY_ID,
-            RAW_CAPABILITY_REPLY_ID,
         ),
     ];
     let mut diagnostics = Vec::new();
@@ -447,15 +440,11 @@ mod tests {
         let diagnostic = format_raw_capability_probe_failure(&[
             "node2 concrete listener: failed (127.0.0.2:1001, request id 1001)".to_string(),
             "node3 wildcard-learn listener: failed (127.0.0.3:0, request id 3003)".to_string(),
-            "node2 independent reply/local listener: failed (127.0.0.2:2002, request id 2002)"
-                .to_string(),
         ]);
         assert!(diagnostic.contains("requested-bound RAW ICMP capability probe failed"));
         assert!(diagnostic.contains("node2 concrete listener"));
         assert!(diagnostic.contains("node3 wildcard-learn listener"));
-        assert!(diagnostic.contains("node2 independent reply/local listener"));
         assert!(diagnostic.contains("127.0.0.2:1001"));
         assert!(diagnostic.contains("127.0.0.3:0"));
-        assert!(diagnostic.contains("127.0.0.2:2002"));
     }
 }

@@ -1,9 +1,9 @@
-use crate::cli::{RuntimeConfig, TimeoutAction, WorkerFlowMode};
+use crate::cli::{RuntimeConfig, WorkerFlowMode};
 use crate::flow_claim::FlowClaimTable;
 use crate::flow_state::FlowRuntimeState;
 use crate::net::params::MAX_WIRE_PAYLOAD;
 use crate::net::payload::{
-    PayloadEvent, PayloadOrigin, outbound_payload_event,
+    BufferedPayload, PayloadEvent, PayloadOrigin, outbound_payload_event,
     reply_id_negotiation_for_u2c_listener_reply, send_payload,
 };
 use crate::net::session::{counts_as_session_activity, handle_send_result};
@@ -14,113 +14,68 @@ use crate::net::sync_icmp::{
 use crate::recv_buf::RecvBuf;
 use crate::stats::{StatsShard, StatsSink};
 use crate::worker_support::{
-    BufferedPayload, BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, SocketPeerRole,
-    WirePacketAdmission, admit_wire_packet, buffer_sync_event, client_admission_spec,
-    handle_c2u_session_control, log_rejected_packet, observe_reply_id_ack, record_rejection_stats,
-    recv_packet, refresh_lock_and_sync_state, send_sync_payload_or_cadence,
-    send_user_payload_event, upstream_admission_spec, wait_socket_until_readable,
+    BufferedSyncUpdate, CachedClientState, GlobalSyncPacer, SocketPeerRole, WirePacketAdmission,
+    admit_wire_packet, buffer_sync_event, client_admission_spec, handle_c2u_session_control,
+    log_rejected_packet, observe_reply_id_ack, record_rejection_stats, recv_packet,
+    refresh_lock_and_sync_state, send_sync_payload_or_cadence, send_user_payload_event,
+    upstream_admission_spec, wait_socket_until_readable,
 };
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering as AtomOrdering};
 use std::{
     thread,
     time::{Duration, Instant},
 };
-pub(crate) fn run_reresolve_thread(
-    sock_mgrs: &[Arc<SocketManager>],
-    reresolve_secs: u64,
-    allow_upstream: bool,
-    allow_listen_rebind: bool,
-) {
-    let period = Duration::from_secs(reresolve_secs);
-    loop {
-        thread::sleep(period);
-        for sock_mgr in sock_mgrs {
-            let _ = sock_mgr.reresolve(allow_upstream, allow_listen_rebind, "Periodic re-resolve");
-        }
-    }
-}
-pub(crate) fn run_watchdog_thread(
+
+#[allow(clippy::too_many_arguments)]
+fn handle_or_forward_c2u_session_control(
+    worker_id: usize,
     t_start: Instant,
+    t_recv: Instant,
     cfg: &RuntimeConfig,
-    sock_mgrs: &[Arc<SocketManager>],
-    flow_states: &[Arc<FlowRuntimeState>],
-    exit_code_set: &AtomicU32,
-    flow_claims: Option<&FlowClaimTable>,
+    stats: &dyn StatsSink,
+    flow_state: &FlowRuntimeState,
+    handles: &mut crate::net::sock_mgr::SocketHandles,
+    cache: &CachedClientState,
+    sync_state: &SharedSyncIcmpState,
+    sync_cache: &mut crate::net::sync_icmp::SyncIcmpCache,
+    event: &PayloadEvent<'_>,
 ) {
-    let period = Duration::from_secs(1);
-    loop {
-        thread::sleep(period);
-        let now_s = Instant::now().saturating_duration_since(t_start).as_secs();
-        for (idx, flow_state) in flow_states.iter().enumerate() {
-            if !flow_state.is_locked() {
-                if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
-                    break;
-                }
-                continue;
-            }
-            let last_s = flow_state.last_seen_s();
-            if last_s == 0 || now_s.saturating_sub(last_s) < cfg.timeout_secs {
-                if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
-                    break;
-                }
-                continue;
-            }
-            match cfg.on_timeout {
-                TimeoutAction::Drop => {
-                    let locked_flow = sock_mgrs[idx].get_client_dest().0;
-                    log_warn!(
-                        "Idle timeout reached ({}s): dropping locked client on worker pair {}",
-                        cfg.timeout_secs,
-                        idx
-                    );
-                    // In SharedFlow mode, we must clear ALL managers because they share a single flow_state.
-                    // In SingleFlow mode, we only clear the specific manager.
-                    let managers_to_clear: Vec<_> =
-                        if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
-                            sock_mgrs.iter().collect()
-                        } else {
-                            vec![&sock_mgrs[idx]]
-                        };
-                    for mgr in managers_to_clear {
-                        let prev = mgr.get_version();
-                        let ver = match mgr.clear_client_lock(prev) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_error!("watchdog disconnect_socket failed: {}", e);
-                                exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
-                                return;
-                            }
-                        };
-                        log_debug!(
-                            cfg.debug_logs.handles,
-                            "watchdog publish disconnect: ver {}->{}",
-                            prev,
-                            ver
-                        );
-                    }
-                    flow_state.reset();
-                    if let (Some(flow_claims), Some(flow)) = (flow_claims, locked_flow) {
-                        flow_claims.release(flow, idx);
-                    }
-                }
-                _ => {
-                    log_warn!(
-                        "Idle timeout reached ({}s): exiting cleanly",
-                        cfg.timeout_secs
-                    );
-                    exit_code_set.store(1 << 31, AtomOrdering::Relaxed);
-                    return;
-                }
-            }
-            // If we were in SharedFlow mode, we've handled all workers by clearing all managers.
-            if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
-                break;
-            }
+    let should_forward = matches!(
+        event,
+        PayloadEvent::SessionControl { data, .. } if data.dst_proto == cfg.upstream_proto
+            && data.dst_proto == crate::cli::SupportedProtocol::ICMP
+    );
+    if should_forward {
+        if let Err(e) = send_user_payload_event(
+            worker_id, t_start, t_recv, cfg, stats, flow_state, event, handles, cache, sync_state,
+            sync_cache,
+        ) {
+            log_debug_dir!(
+                cfg.debug_logs.drops,
+                worker_id,
+                true,
+                "session-control forward error: {}",
+                e
+            );
         }
+    } else {
+        handle_c2u_session_control(
+            worker_id,
+            t_start,
+            t_recv,
+            cfg,
+            stats,
+            flow_state,
+            handles,
+            sync_state,
+            sync_cache,
+            cache.session_control_reply_route.as_ref(),
+            event,
+        );
     }
 }
+
 pub(crate) fn run_upstream_to_client_thread(
     t_start: Instant,
     cfg: &RuntimeConfig,
@@ -200,7 +155,31 @@ pub(crate) fn run_upstream_to_client_thread(
                 );
                 if locked_now {
                     let event = admitted.event;
-                    observe_reply_id_ack(C2U, &event, &handles, flow_state);
+                    if let Some(buffered_payload) =
+                        observe_reply_id_ack(C2U, &event, &handles, flow_state)
+                    {
+                        let buffered_event = buffered_payload.as_event();
+                        result_or_log_continue!(
+                            send_user_payload_event(
+                                worker_id,
+                                t_start,
+                                t_recv,
+                                cfg,
+                                stats,
+                                flow_state,
+                                &buffered_event,
+                                &handles,
+                                &cache,
+                                sync_state,
+                                &mut sync_cache,
+                            ),
+                            log_debug_dir,
+                            cfg.debug_logs.drops,
+                            worker_id,
+                            C2U,
+                            "buffered payload flush error: {}"
+                        );
+                    }
                     let decision = result_or_log_continue!(
                         classify_u2c(
                             cfg,
@@ -221,7 +200,67 @@ pub(crate) fn run_upstream_to_client_thread(
                             cfg.listener_reply_id_request.resolved_reply_id(flow.src.id)
                         }),
                     )
+                    .filter(|_| cfg.listen_proto == crate::cli::SupportedProtocol::ICMP)
                     .filter(|_| !flow_state.listener_reply_id_acked());
+                    if let Some(reply_id) = reply_id {
+                        let started_s = t_recv.saturating_duration_since(t_start).as_secs().max(1);
+                        if flow_state.begin_listener_reply_id_handshake(
+                            reply_id.reply_id,
+                            started_s,
+                            BufferedPayload::from_event(&event),
+                        ) {
+                            let control_event = PayloadEvent::session_control_negotiation(
+                                reply_id.reply_id,
+                                reply_id.reply_id,
+                                0,
+                                cfg.listen_proto,
+                                Some(reply_id),
+                            );
+                            let outbound = result_or_log_continue!(
+                                outbound_payload_event(
+                                    &control_event,
+                                    cache.route.icmp_header_id,
+                                    C2U,
+                                    prepare_send(
+                                        C2U,
+                                        &control_event,
+                                        true,
+                                        sync_state,
+                                        &mut sync_cache
+                                    ),
+                                    Some(reply_id),
+                                ),
+                                log_debug_dir,
+                                cfg.debug_logs.drops,
+                                worker_id,
+                                C2U,
+                                "reply-ID session-control build error: {}"
+                            );
+                            let send_res = send_payload(
+                                &handles.client_sock,
+                                handles.listener_connected,
+                                cache.dest_sock_type,
+                                &cache.route.dest_sa,
+                                &outbound,
+                            );
+                            handle_send_result(
+                                C2U,
+                                worker_id,
+                                t_start,
+                                t_recv,
+                                cfg,
+                                stats,
+                                flow_state,
+                                &control_event,
+                                false,
+                                &send_res,
+                                handles.listener_connected,
+                                &cache.route.dest_sa,
+                                None,
+                            );
+                            continue;
+                        }
+                    }
                     let send_res = if decision.should_send() {
                         let outbound = result_or_log_continue!(
                             outbound_payload_event(
@@ -229,7 +268,7 @@ pub(crate) fn run_upstream_to_client_thread(
                                 cache.route.icmp_header_id,
                                 C2U,
                                 prepare_send(C2U, &event, true, sync_state, &mut sync_cache),
-                                reply_id,
+                                None,
                             ),
                             log_debug_dir,
                             cfg.debug_logs.drops,
@@ -481,6 +520,67 @@ pub(crate) fn run_client_to_upstream_thread(
 
                     if flow_state.is_locked() {
                         let event = admitted.event;
+                        if let Some(buffered_payload) =
+                            observe_reply_id_ack(true, &event, &handles, flow_state)
+                        {
+                            let buffered_event = buffered_payload.as_event();
+                            if let Some(reply_route) = cache
+                                .session_control_reply_route
+                                .as_ref()
+                                .cloned()
+                                .or_else(|| {
+                                    let dest = handles.listener_flow.outbound_destination()?;
+                                    Some(
+                                        CachedClientState::build_local_session_control_reply_route(
+                                            &handles, dest,
+                                        ),
+                                    )
+                                })
+                            {
+                                let outbound = result_or_log_continue!(
+                                    outbound_payload_event(
+                                        &buffered_event,
+                                        reply_route.icmp_header_id,
+                                        false,
+                                        prepare_send(
+                                            false,
+                                            &buffered_event,
+                                            true,
+                                            sync_state,
+                                            &mut sync_cache
+                                        ),
+                                        None,
+                                    ),
+                                    log_debug_dir,
+                                    cfg.debug_logs.drops,
+                                    worker_id,
+                                    C2U,
+                                    "buffered listener payload flush build error: {}"
+                                );
+                                let send_res = send_payload(
+                                    &handles.client_sock,
+                                    handles.listener_connected,
+                                    handles.listen_sock_type,
+                                    &reply_route.dest_sa,
+                                    &outbound,
+                                );
+                                handle_send_result(
+                                    false,
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    flow_state,
+                                    &buffered_event,
+                                    true,
+                                    &send_res,
+                                    handles.listener_connected,
+                                    &reply_route.dest_sa,
+                                    None,
+                                );
+                            }
+                        }
                         match event {
                             PayloadEvent::UserPayload { .. } => result_or_log_continue!(
                                 send_user_payload_event(
@@ -502,19 +602,21 @@ pub(crate) fn run_client_to_upstream_thread(
                                 C2U,
                                 "outbound payload build error: {}"
                             ),
-                            PayloadEvent::SessionControl { .. } => handle_c2u_session_control(
-                                worker_id,
-                                t_start,
-                                t_recv,
-                                cfg,
-                                stats,
-                                flow_state,
-                                &mut handles,
-                                sync_state,
-                                &mut sync_cache,
-                                cache.session_control_reply_route.as_ref(),
-                                &event,
-                            ),
+                            PayloadEvent::SessionControl { .. } => {
+                                handle_or_forward_c2u_session_control(
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    flow_state,
+                                    &mut handles,
+                                    &cache,
+                                    sync_state,
+                                    &mut sync_cache,
+                                    &event,
+                                )
+                            }
                             PayloadEvent::CadencePacket { .. } => log_debug_dir!(
                                 cfg.debug_logs.drops,
                                 worker_id,
@@ -788,19 +890,21 @@ pub(crate) fn run_client_to_upstream_thread(
                                 C2U,
                                 "outbound payload build error: {}"
                             ),
-                            PayloadEvent::SessionControl { .. } => handle_c2u_session_control(
-                                worker_id,
-                                t_start,
-                                t_recv,
-                                cfg,
-                                stats,
-                                flow_state,
-                                &mut handles,
-                                sync_state,
-                                &mut sync_cache,
-                                cache.session_control_reply_route.as_ref(),
-                                &event,
-                            ),
+                            PayloadEvent::SessionControl { .. } => {
+                                handle_or_forward_c2u_session_control(
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    flow_state,
+                                    &mut handles,
+                                    &cache,
+                                    sync_state,
+                                    &mut sync_cache,
+                                    &event,
+                                )
+                            }
                             PayloadEvent::CadencePacket { .. } => log_debug_dir!(
                                 cfg.debug_logs.drops,
                                 worker_id,
@@ -831,19 +935,21 @@ pub(crate) fn run_client_to_upstream_thread(
                                 C2U,
                                 "outbound payload build error: {}"
                             ),
-                            PayloadEvent::SessionControl { .. } => handle_c2u_session_control(
-                                worker_id,
-                                t_start,
-                                t_recv,
-                                cfg,
-                                stats,
-                                flow_state,
-                                &mut handles,
-                                sync_state,
-                                &mut sync_cache,
-                                cache.session_control_reply_route.as_ref(),
-                                &event,
-                            ),
+                            PayloadEvent::SessionControl { .. } => {
+                                handle_or_forward_c2u_session_control(
+                                    worker_id,
+                                    t_start,
+                                    t_recv,
+                                    cfg,
+                                    stats,
+                                    flow_state,
+                                    &mut handles,
+                                    &cache,
+                                    sync_state,
+                                    &mut sync_cache,
+                                    &event,
+                                )
+                            }
                             PayloadEvent::CadencePacket { .. } => log_debug_dir!(
                                 cfg.debug_logs.drops,
                                 worker_id,

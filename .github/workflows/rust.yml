@@ -8,7 +8,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PKTHERE_ALLOW_RAW_ICMP: 1
   PKTHERE_ALLOW_KERNEL_ICMP_ECHO: 1
 
 jobs:
@@ -33,6 +32,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          echo "PKTHERE_ALLOW_RAW_ICMP=1" >> "$GITHUB_ENV"
 
       - name: Build
         run: cargo test --no-run --verbose

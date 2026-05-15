@@ -2,8 +2,7 @@ use super::cache::{CachedClientState, CachedSendRoute};
 use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::flow_state::FlowRuntimeState;
 use crate::net::payload::{
-    IcmpPayloadMeta, OwnedPayloadData, PayloadData, PayloadEvent, outbound_payload_event,
-    send_payload,
+    BufferedPayload, PayloadEvent, outbound_payload_event, reply_id_ack_for_event, send_payload,
 };
 use crate::net::session::handle_send_result;
 use crate::net::sock_mgr::SocketHandles;
@@ -14,57 +13,17 @@ use crate::net::sync_icmp::{
 use crate::stats::StatsSink;
 use std::time::Instant;
 
-pub(crate) struct BufferedPayload {
-    data: OwnedPayloadData,
-    icmp: Option<IcmpPayloadMeta>,
-}
-
-impl BufferedPayload {
-    #[inline]
-    pub(crate) fn from_event(event: &PayloadEvent<'_>) -> Self {
-        let (dst_proto, bytes, icmp) = match event {
-            PayloadEvent::UserPayload { data, icmp } => (data.dst_proto, data.bytes, *icmp),
-            _ => unreachable!("only user payloads are buffered for sync replay"),
-        };
-        Self {
-            data: OwnedPayloadData {
-                dst_proto,
-                bytes: bytes.to_vec(),
-            },
-            icmp,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn as_event(&self) -> PayloadEvent<'_> {
-        PayloadEvent::UserPayload {
-            data: self.data.as_borrowed(),
-            icmp: self.icmp,
-        }
-    }
-}
-
 pub(crate) enum BufferedSyncUpdate {
     Replace(BufferedPayload),
     Keep,
 }
 
 #[inline]
-fn empty_icmp_reply_event(seq: u16) -> PayloadEvent<'static> {
-    PayloadEvent::SessionControl {
-        data: PayloadData {
-            dst_proto: SupportedProtocol::ICMP,
-            bytes: &[],
-        },
-        icmp: IcmpPayloadMeta {
-            negotiated_remote_reply_id: 0,
-            inbound_header_ident: 0,
-            seq,
-            advertised_reply_id: None,
-            reply_id_negotiate: false,
-            reply_id_ack: false,
-        },
-    }
+fn empty_icmp_reply_event(
+    seq: u16,
+    ack: Option<crate::net::framing_shim::ReplyIdNegotiation>,
+) -> PayloadEvent<'static> {
+    PayloadEvent::session_control_negotiation(0, 0, seq, SupportedProtocol::ICMP, ack)
 }
 
 #[inline]
@@ -83,9 +42,10 @@ fn send_local_session_control_reply(
         PayloadEvent::SessionControl { icmp, .. } => icmp.seq,
         _ => unreachable!("local session-control reply requires session-control event"),
     };
-    let reply_event = empty_icmp_reply_event(seq);
+    let ack = reply_id_ack_for_event(event);
+    let reply_event = empty_icmp_reply_event(seq, ack);
     let outbound =
-        match outbound_payload_event(&reply_event, route.icmp_header_id, false, Some(seq), None) {
+        match outbound_payload_event(&reply_event, route.icmp_header_id, false, Some(seq), ack) {
             Ok(outbound) => outbound,
             Err(e) => {
                 log_debug_dir!(
@@ -137,7 +97,7 @@ pub(crate) fn handle_c2u_session_control(
     event: &PayloadEvent<'_>,
 ) {
     match classify_c2u_session_control(cfg, event, sync_state, sync_cache) {
-        Ok(C2uSessionControlDecision::Consume) => {}
+        Ok(C2uSessionControlDecision::Forward) => {}
         Ok(C2uSessionControlDecision::ReplyLocally) => {
             let reply_route = default_reply_route.cloned().or_else(|| {
                 let dest = handles.listener_flow.outbound_destination()?;

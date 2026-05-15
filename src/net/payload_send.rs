@@ -65,16 +65,6 @@ pub(crate) fn outbound_payload_event<'a>(
         ));
     }
 
-    if let Some(meta) = icmp
-        && !event.is_user_payload()
-        && meta.reply_id_negotiation.is_some()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot encode reply-ID negotiation on non-user ICMP packet",
-        ));
-    }
-
     Ok(OutboundPayloadEvent {
         payload: event,
         icmp,
@@ -154,7 +144,7 @@ fn send_icmp_echo(
         PayloadEvent::SessionControl { .. } => (
             encode_icmp_tunnel_prefix(
                 IcmpTunnelFrameKind::SessionControl,
-                None,
+                meta.reply_id_negotiation,
                 0,
                 &mut shim_storage,
             )?,

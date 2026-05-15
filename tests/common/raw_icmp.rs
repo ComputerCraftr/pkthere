@@ -11,52 +11,46 @@ use std::sync::OnceLock;
 mod icmp_probe;
 
 pub fn require_raw_icmp_supported() -> io::Result<()> {
-    let has_raw_binary_capability = {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            linux_binary_has_raw_capability()
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        if linux_binary_has_raw_capability() {
+            return Ok(());
         }
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        {
-            setuid_binary_has_raw_capability()
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        if setuid_binary_has_raw_capability() {
+            return Ok(());
         }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "android",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        )))]
-        {
-            fallback_binary_has_raw_capability()
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        if fallback_binary_has_raw_capability() {
+            return Ok(());
         }
-    };
-
-    if !has_raw_binary_capability {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "raw ICMP test support unavailable (requires cap_net_raw, setuid root, or Administrator)",
-        ));
     }
 
-    RAW_ICMP_CAPABILITY
-        .get_or_init(icmp_probe::probe_raw_icmp_capability)
-        .as_ref()
-        .map(|_| ())
-        .map_err(|e| io::Error::new(e.kind(), e.to_string()))
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "raw ICMP test support unavailable (requires cap_net_raw, setuid root, or Administrator)",
+    ))
 }
-
-static RAW_ICMP_CAPABILITY: OnceLock<io::Result<()>> = OnceLock::new();
 
 static KERNEL_ECHO_SUPPORT: OnceLock<io::Result<()>> = OnceLock::new();
 

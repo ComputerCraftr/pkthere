@@ -50,7 +50,7 @@ impl U2cDecision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum C2uSessionControlDecision {
-    Consume,
+    Forward,
     ReplyLocally,
 }
 
@@ -239,10 +239,15 @@ pub(crate) fn classify_u2c(
 
     if !sync_icmp_enabled(cfg) {
         return if is_session_control {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ICMP session-control packet arrived while sync mode is disabled",
-            ))
+            match event {
+                PayloadEvent::SessionControl { icmp, .. } if icmp.advertised_reply_id.is_some() => {
+                    Ok(U2cDecision::ForwardSessionControl)
+                }
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ICMP session-control packet arrived while sync mode is disabled",
+                )),
+            }
         } else {
             Ok(U2cDecision::ForwardPayload)
         };
@@ -299,6 +304,9 @@ pub(crate) fn classify_c2u_session_control(
         PayloadEvent::SessionControl { data, .. } => data.dst_proto,
         _ => unreachable!("session-control classification requires a session-control event"),
     };
+    if icmp.advertised_reply_id.is_some() {
+        return Ok(C2uSessionControlDecision::ReplyLocally);
+    }
     if dst_proto == SupportedProtocol::ICMP {
         if !sync_icmp_enabled(cfg) {
             return Err(io::Error::new(
@@ -306,7 +314,7 @@ pub(crate) fn classify_c2u_session_control(
                 "ICMP session-control packet arrived while sync mode is disabled",
             ));
         }
-        Ok(C2uSessionControlDecision::Consume)
+        Ok(C2uSessionControlDecision::Forward)
     } else {
         Ok(C2uSessionControlDecision::ReplyLocally)
     }
@@ -422,6 +430,27 @@ mod tests {
                 seq,
                 advertised_reply_id: None,
                 reply_id_negotiate: false,
+                reply_id_ack: false,
+            },
+        }
+    }
+
+    fn test_reply_id_session_control_event(
+        seq: u16,
+        dst_proto: SupportedProtocol,
+        reply_id: u16,
+    ) -> PayloadEvent<'static> {
+        PayloadEvent::SessionControl {
+            data: crate::net::payload::PayloadData {
+                dst_proto,
+                bytes: &[],
+            },
+            icmp: IcmpPayloadMeta {
+                negotiated_remote_reply_id: reply_id,
+                inbound_header_ident: reply_id,
+                seq,
+                advertised_reply_id: Some(reply_id),
+                reply_id_negotiate: true,
                 reply_id_ack: false,
             },
         }
@@ -645,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn classify_c2u_session_control_consumes_for_icmp_bridge() {
+    fn classify_c2u_session_control_forwards_for_icmp_bridge() {
         let _guard = lock_sync_state();
         let mut cfg = test_config();
         cfg.listen_proto = SupportedProtocol::ICMP;
@@ -660,7 +689,27 @@ mod tests {
                 &mut cache
             )
             .unwrap(),
-            C2uSessionControlDecision::Consume
+            C2uSessionControlDecision::Forward
+        );
+    }
+
+    #[test]
+    fn classify_c2u_reply_id_session_control_replies_locally_for_icmp_bridge() {
+        let _guard = lock_sync_state();
+        let mut cfg = test_config();
+        cfg.listen_proto = SupportedProtocol::ICMP;
+        cfg.upstream_proto = SupportedProtocol::ICMP;
+        let shared = SharedSyncIcmpState::new(cfg.icmp_sync_pps);
+        let mut cache = shared.cache();
+        assert_eq!(
+            classify_c2u_session_control(
+                &cfg,
+                &test_reply_id_session_control_event(11, SupportedProtocol::ICMP, 2002),
+                &shared,
+                &mut cache
+            )
+            .unwrap(),
+            C2uSessionControlDecision::ReplyLocally
         );
     }
 
