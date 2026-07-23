@@ -3,8 +3,8 @@ use super::{
     SocketLeg, TransportAdmission, WirePacketAdmission, admit_packet, admit_wire_packet,
 };
 use crate::cli::{IcmpReplyIdRequest, SupportedProtocol};
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple};
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple};
 use crate::net::payload::PayloadEvent;
 use crate::worker_support::admission_test_support::{
     admission_spec, icmp_tunnel_packet, icmp_wire_spec, test_config, test_icmp_echo_packet,
@@ -15,8 +15,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[test]
 fn connected_icmp_cadence_uses_kernel_filtered_expected_peer() {
     let cfg = test_config(IcmpReplyIdRequest::Default);
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let mut spec = icmp_wire_spec(Some(FlowTuple::new(remote, local)), None);
     spec.socket.role = SocketLeg::UpstreamFacing;
     spec.socket.sock_type = Type::DGRAM;
@@ -38,7 +38,7 @@ fn connected_icmp_cadence_uses_kernel_filtered_expected_peer() {
     };
     assert_eq!(
         admitted.normalized_source,
-        Some(CanonicalAddr::from_v4(Ipv4Addr::LOCALHOST, 2002))
+        Some(LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 2002))
     );
     assert!(matches!(admitted.event, PayloadEvent::CadencePacket { .. }));
     assert!(admitted.lock_candidate.is_none());
@@ -184,14 +184,14 @@ fn wire_admission_dgram_accepts_independent_source_id_when_reply_id_matches_rece
         .expect("pending negotiation candidate");
     assert_eq!(
         lock.flow_key,
-        ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::new(127, 0, 0, 2),
-            ident: 0x2002,
-        }
+        ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+            Ipv4Addr::new(127, 0, 0, 2),
+            0x2002
+        ))
     );
     let inbound = lock.listener_flow.inbound.expect("inbound tuple");
-    assert_eq!(inbound.src.id, 0x2002);
-    assert_eq!(inbound.dst.id, 1001);
+    assert_eq!(inbound.src.id(), 0x2002);
+    assert_eq!(inbound.dst.id(), 1001);
     let outbound = lock.listener_flow.outbound.expect("outbound tuple");
-    assert_eq!(outbound.dst.id, 1001);
+    assert_eq!(outbound.dst.id(), 1001);
 }

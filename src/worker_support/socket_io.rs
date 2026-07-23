@@ -1,21 +1,14 @@
+use crate::net::managed_socket::ManagedSocket;
 use pkthere_socket_policy::ReceiveSyscall;
-use socket2::{SockAddr, Socket};
+use socket2::SockAddr;
 
 use std::io;
 use std::mem::MaybeUninit;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(windows)]
-use std::os::windows::io::AsRawSocket;
 use std::time::Duration;
-#[cfg(windows)]
-use windows_sys::Win32::Networking::WinSock::{
-    POLLRDNORM, SOCKET_ERROR, WSAEINTR, WSAGetLastError, WSAPOLLFD, WSAPoll,
-};
 
 #[inline]
 pub(crate) fn recv_packet(
-    sock: &Socket,
+    sock: &ManagedSocket,
     syscall: ReceiveSyscall,
     buf: &mut [MaybeUninit<u8>],
 ) -> io::Result<(usize, Option<SockAddr>)> {
@@ -25,71 +18,18 @@ pub(crate) fn recv_packet(
     }
 }
 
-#[cfg(unix)]
 #[inline]
-pub(crate) fn wait_socket_until_readable(sock: &Socket, timeout: Duration) -> io::Result<bool> {
-    loop {
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let mut pfd = libc::pollfd {
-            fd: sock.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
-        if rc > 0 {
-            return Ok((pfd.revents & libc::POLLIN) != 0);
-        }
-        if rc == 0 {
-            return Ok(false);
-        }
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(err);
-    }
-}
-
-#[cfg(windows)]
-#[inline]
-pub(crate) fn wait_socket_until_readable(sock: &Socket, timeout: Duration) -> io::Result<bool> {
-    loop {
-        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
-        let mut pfd = WSAPOLLFD {
-            fd: sock.as_raw_socket() as usize,
-            events: POLLRDNORM,
-            revents: 0,
-        };
-        let rc = unsafe { WSAPoll(&mut pfd, 1, timeout_ms) };
-        if rc > 0 {
-            return Ok((pfd.revents & POLLRDNORM) != 0);
-        }
-        if rc == 0 {
-            return Ok(false);
-        }
-        let err = unsafe { WSAGetLastError() };
-        if err == WSAEINTR {
-            continue;
-        }
-        if rc == SOCKET_ERROR {
-            return Err(io::Error::from_raw_os_error(err));
-        }
-        return Err(io::Error::other("unexpected WSAPoll return value"));
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-#[inline]
-pub(crate) fn wait_socket_until_readable(_sock: &Socket, _timeout: Duration) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "socket readiness waiting is not implemented on this platform",
-    ))
+pub(crate) fn wait_socket_until_readable(
+    sock: &ManagedSocket,
+    timeout: Duration,
+) -> io::Result<bool> {
+    sock.wait_until_readable(timeout)
 }
 
 #[cfg(test)]
 mod tests {
     use super::recv_packet;
+    use crate::net::managed_socket::ManagedSocket;
     use crate::recv_buf::RecvBuf;
     use pkthere_socket_policy::ReceiveSyscall;
     use socket2::Socket;
@@ -118,7 +58,7 @@ mod tests {
         .expect("bind sender");
         sender.send_to(b"x", recv_addr).expect("send packet");
 
-        let recv = Socket::from(recv);
+        let recv = ManagedSocket::from(Socket::from(recv));
         let mut buf = RecvBuf::<8>::new();
         let (len, source) =
             recv_packet(&recv, ReceiveSyscall::RecvFrom, buf.recv_buf_mut()).expect("recv packet");
@@ -138,7 +78,7 @@ mod tests {
         recv.connect(sender_addr).expect("connect recv socket");
         sender.send_to(b"x", recv_addr).expect("send packet");
 
-        let recv = Socket::from(recv);
+        let recv = ManagedSocket::from(Socket::from(recv));
         let mut buf = RecvBuf::<8>::new();
         let (len, source) =
             recv_packet(&recv, ReceiveSyscall::Recv, buf.recv_buf_mut()).expect("recv packet");

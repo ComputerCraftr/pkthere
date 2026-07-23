@@ -1,17 +1,19 @@
-use super::state::{ReresolveAction, decide_listener_reresolve, decide_upstream_reresolve};
+use super::state::{
+    ReresolveAction, SocketUpdateKind, decide_listener_reresolve, decide_upstream_reresolve,
+};
 use super::{SocketManager, SocketManagerInit};
 use crate::cli::{IcmpReplyIdRequest, ReresolveMode, SupportedProtocol, TimeoutAction::Drop};
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
+use crate::net::managed_socket::AssociationState;
 use crate::net::socket::make_socket;
 use pkthere_socket_policy::{
     IcmpPolicyIntent, SocketRole, listener_worker_socket_policy,
     resolve_socket_policy_with_icmp_intent,
 };
 use socket2::{Domain, Type};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::thread;
 
 fn make_mgr() -> SocketManager {
     make_mgr_with_slot(0)
@@ -41,12 +43,12 @@ fn make_mgr_with_slot(socket_slot: u32) -> SocketManager {
         listen_local_filter: actual_listen,
         listen_local_kernel_addr,
         listen_sock_type,
-        listen_target: actual_listen.addr.to_string(),
+        listen_target: actual_listen.to_socket_addr().to_string(),
         listen_proto: SupportedProtocol::UDP,
         listen_policy,
         listen_worker_socket_policy: listener_worker_socket_policy(1, false),
         listen_debug_unconnected: false,
-        upstream_remote_filter: CanonicalAddr::from_socket_addr(upstream_addr),
+        upstream_remote_filter: LogicalEndpoint::from_socket_addr(upstream_addr),
         upstream_target: upstream_addr.to_string(),
         upstream_source_id_request: IcmpReplyIdRequest::Default,
         upstream_reply_id_request: IcmpReplyIdRequest::Default,
@@ -98,103 +100,151 @@ fn reconnect_in_place_preserves_socket_slot_and_generation() {
 }
 
 #[test]
-fn client_setter_keeps_callers_stale() {
-    let mgr = Arc::new(make_mgr());
-    let v0 = mgr.get_version();
-
-    let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 11111);
-    let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 22222);
-
-    let a = {
-        let mgr = Arc::clone(&mgr);
-        thread::spawn(move || {
-            mgr.set_listener_remote_connected(
-                Some(ClientFlowKey::Udp(addr_a)),
-                SocketLegFlow::empty(),
-                true,
-                v0,
-            )
-        })
-    };
-    let b = {
-        let mgr = Arc::clone(&mgr);
-        thread::spawn(move || {
-            mgr.set_listener_remote_connected(
-                Some(ClientFlowKey::Udp(addr_b)),
-                SocketLegFlow::empty(),
-                false,
-                v0,
-            )
-        })
-    };
-
-    let ra = a.join().unwrap();
-    let rb = b.join().unwrap();
-
-    assert_eq!(ra, v0 + 1);
-    assert_eq!(rb, v0 + 1);
-    assert_eq!(mgr.get_version(), v0 + 2);
-}
-
-#[test]
 fn refresh_notices_raced_updates() {
     let mgr = make_mgr();
     let mut cached = mgr.refresh_handles();
     let v0 = cached.version;
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33333);
-    mgr.set_listener_remote_connected(
-        Some(ClientFlowKey::Udp(addr)),
+    mgr.establish_client_flow(
+        ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(addr)),
         SocketLegFlow::empty(),
         true,
+        addr,
         v0,
-    );
-    mgr.set_listener_remote_connected(
-        Some(ClientFlowKey::Udp(addr)),
-        SocketLegFlow::empty(),
-        false,
-        v0,
-    );
+    )
+    .expect("establish client flow");
+    mgr.clear_client_lock(v0 + 1).expect("clear client flow");
 
     assert_ne!(cached.version, mgr.get_version());
     cached = mgr.refresh_handles();
     assert_eq!(cached.version, mgr.get_version());
-    assert_eq!(cached.listener.flow, Some(ClientFlowKey::Udp(addr)));
-    assert!(!cached.listener.listener_connected);
+    assert_eq!(cached.listener.flow, None);
+    assert!(!cached.listener_connected());
 }
 
 #[test]
-fn cached_handles_keep_generation_consistent_immutable_metadata() {
+fn cached_handles_keep_immutable_metadata_and_share_socket_association() {
     let mgr = make_mgr();
     let old = mgr.refresh_handles();
     let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33333);
 
-    mgr.set_listener_remote_connected(
-        Some(ClientFlowKey::Udp(client)),
+    mgr.establish_client_flow(
+        ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(client)),
         SocketLegFlow::empty(),
         true,
+        client,
         old.version,
-    );
+    )
+    .expect("establish client flow");
     let fresh = mgr.refresh_handles();
 
     assert!(!Arc::ptr_eq(&old.listener, &fresh.listener));
     assert_eq!(old.listener.flow, None);
-    assert!(!old.listener.listener_connected);
-    assert_eq!(fresh.listener.flow, Some(ClientFlowKey::Udp(client)));
-    assert!(fresh.listener.listener_connected);
+    assert!(old.listener_connected());
+    assert_eq!(
+        fresh.listener.flow,
+        Some(ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(
+            client
+        )))
+    );
+    assert!(fresh.listener_connected());
     assert_eq!(old.listener.evidence_key, fresh.listener.evidence_key);
 }
 
 #[test]
-fn listener_reresolve_uses_canonical_refresh_rules() {
-    let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777), 8888);
+fn listener_reresolve_uses_logical_endpoint_refresh_rules() {
+    let prev = LogicalEndpoint::from_socket_addr_with_id(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
+        8888,
+    );
     let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 1234);
     let (fresh, action) = decide_listener_reresolve(prev, resolved);
 
     assert_eq!(action, ReresolveAction::ReplaceSocket);
-    assert_eq!(fresh.id, 8888);
-    assert_eq!(fresh.addr.port(), 8888);
-    assert_eq!(fresh.addr.ip(), resolved.ip());
+    assert_eq!(fresh.id(), 8888);
+    assert_eq!(fresh.ip(), resolved.ip());
+}
+
+#[test]
+fn unconnected_client_flow_publishes_metadata_without_socket_association() {
+    let mgr = make_mgr();
+    let before = mgr.get_version();
+    let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33334);
+    let key = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(client));
+
+    let published = mgr
+        .establish_client_flow(key, SocketLegFlow::empty(), false, client, before)
+        .expect("establish an explicitly unconnected client flow");
+    let handles = mgr.refresh_handles();
+
+    assert_eq!(published, before + 1);
+    assert_eq!(handles.listener.flow, Some(key));
+    assert!(!handles.listener_connected());
+}
+
+#[test]
+fn rejected_client_transaction_preserves_existing_flow_and_version() {
+    let mgr = make_mgr();
+    let first_client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33335);
+    let first_key = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(first_client));
+    let first_version = mgr
+        .establish_client_flow(
+            first_key,
+            SocketLegFlow::empty(),
+            true,
+            first_client,
+            mgr.get_version(),
+        )
+        .expect("establish connected client flow");
+    let rejected_client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33336);
+    let rejected_key = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(rejected_client));
+
+    assert!(
+        mgr.establish_client_flow(
+            rejected_key,
+            SocketLegFlow::empty(),
+            false,
+            rejected_client,
+            first_version,
+        )
+        .is_err()
+    );
+    let handles = mgr.refresh_handles();
+    assert_eq!(handles.version, first_version);
+    assert_eq!(handles.listener.flow, Some(first_key));
+    assert!(handles.listener_connected());
+}
+
+#[test]
+fn replacement_resets_association_epoch_and_advances_socket_generation() {
+    let mgr = make_mgr_with_slot(5);
+    let before = mgr.snapshot_state().upstream_evidence_key;
+    let replacement = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0))
+        .expect("bind IPv6 replacement upstream");
+    let replacement_addr = replacement.local_addr().expect("IPv6 replacement address");
+
+    let result = mgr
+        .reresolve_with_addresses(
+            true,
+            false,
+            "test cross-family replacement",
+            None,
+            Some(replacement_addr),
+        )
+        .expect("replace upstream socket across families");
+
+    assert_eq!(
+        result.upstream_update,
+        SocketUpdateKind::ReplacedCrossFamily
+    );
+    assert_eq!(result.handles.upstream.evidence_key.generation, 2);
+    assert_eq!(result.handles.upstream.evidence_key.socket_slot, 5);
+    assert_ne!(result.handles.upstream.evidence_key, before);
+    assert!(matches!(
+        result.handles.upstream_sock.association(),
+        AssociationState::Connected { epoch: 1, .. }
+    ));
 }
 
 #[test]
@@ -222,22 +272,22 @@ fn upstream_peer_update_applies_source_id_when_reply_id_is_unchanged() {
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     {
         let mut up = mgr.upstream_state.lock().unwrap();
-        up.upstream_remote_filter = CanonicalAddr::from_v4(Ipv4Addr::LOCALHOST, 9999);
+        up.upstream_remote_filter = LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 9999);
         up.upstream_flow = SocketLegFlow::new(
             Some(FlowTuple::new(
-                FlowEndpoint::new(ip, 9999),
-                FlowEndpoint::new(ip, 40001),
+                LogicalEndpoint::new(ip, 9999),
+                LogicalEndpoint::new(ip, 40001),
             )),
             Some(FlowTuple::new(
-                FlowEndpoint::new(ip, 40000),
-                FlowEndpoint::new(ip, 9999),
+                LogicalEndpoint::new(ip, 40000),
+                LogicalEndpoint::new(ip, 9999),
             )),
         );
     }
 
     mgr.set_upstream_peer_ids(7777, 9999, v0);
     let handles = mgr.refresh_handles();
-    assert_eq!(handles.upstream.upstream_remote_filter.id, 9999);
+    assert_eq!(handles.upstream.upstream_remote_filter.id(), 9999);
     assert_eq!(
         handles
             .upstream
@@ -245,7 +295,7 @@ fn upstream_peer_update_applies_source_id_when_reply_id_is_unchanged() {
             .inbound
             .expect("inbound flow")
             .src
-            .id,
+            .id(),
         7777
     );
     assert_eq!(
@@ -255,14 +305,17 @@ fn upstream_peer_update_applies_source_id_when_reply_id_is_unchanged() {
             .outbound
             .expect("outbound flow")
             .dst
-            .id,
+            .id(),
         9999
     );
 }
 
 #[test]
 fn upstream_same_family_connected_prefers_reconnect_when_policy_allows() {
-    let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
+    let prev = LogicalEndpoint::from_socket_addr_with_id(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444),
+        5555,
+    );
     let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 9999);
     let policy = resolve_socket_policy_with_icmp_intent(
         SocketRole::Upstream,
@@ -275,15 +328,17 @@ fn upstream_same_family_connected_prefers_reconnect_when_policy_allows() {
     );
     let (fresh, action) = decide_upstream_reresolve(prev, resolved, true, policy);
 
-    assert_eq!(fresh.id, 5555);
-    assert_eq!(fresh.addr.port(), 5555);
-    assert_eq!(fresh.addr.ip(), resolved.ip());
+    assert_eq!(fresh.id(), 5555);
+    assert_eq!(fresh.ip(), resolved.ip());
     assert_eq!(action, ReresolveAction::ReconnectInPlace);
 }
 
 #[test]
 fn upstream_raw_same_family_change_falls_back_to_replace() {
-    let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
+    let prev = LogicalEndpoint::from_socket_addr_with_id(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444),
+        5555,
+    );
     let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 9999);
     let policy = resolve_socket_policy_with_icmp_intent(
         SocketRole::Upstream,
@@ -301,7 +356,10 @@ fn upstream_raw_same_family_change_falls_back_to_replace() {
 
 #[test]
 fn upstream_unconnected_same_family_change_only_updates_metadata() {
-    let prev = CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444), 5555);
+    let prev = LogicalEndpoint::from_socket_addr_with_id(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4444),
+        5555,
+    );
     let resolved = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)), 9999);
     let policy = resolve_socket_policy_with_icmp_intent(
         SocketRole::Upstream,

@@ -1,12 +1,11 @@
 use super::client::ClientWorkerContext;
 use super::{CachedClientState, CachedSendRoute, PacketDisposition, PacketTraceId};
 use crate::cli::WorkerFlowMode;
+use crate::endpoint::LogicalEndpoint;
 use crate::flow_state::PendingIcmpClientLock;
 use crate::net::icmp_sequence::{IcmpSequenceCache, reset_sequence_state};
-use crate::net::params::CanonicalAddr;
 use crate::net::sock_mgr::SocketHandles;
 use crate::stats::StatsSink;
-use std::sync::Arc;
 
 const C2U: bool = true;
 
@@ -19,9 +18,9 @@ fn pending_session_control_reply_route(
     Some(
         CachedClientState::build_pending_session_control_reply_route(
             destination,
-            outbound.src.id,
-            outbound.src.ip,
-            inbound.dst.id,
+            outbound.src.id(),
+            outbound.src.ip(),
+            inbound.dst.id(),
         ),
     )
 }
@@ -60,7 +59,7 @@ pub(super) fn publish_client_lock(
     client_side_cache: &mut IcmpSequenceCache,
     upstream_side_cache: &mut IcmpSequenceCache,
     was_locked: &mut bool,
-    source: CanonicalAddr,
+    source: LogicalEndpoint,
     candidate: PendingIcmpClientLock,
     trace: PacketTraceId,
 ) -> bool {
@@ -73,6 +72,62 @@ pub(super) fn publish_client_lock(
     {
         super::log_packet_disposition(context.cfg, trace, PacketDisposition::DropFlowConflict);
         return false;
+    }
+
+    let client = listener_flow.inbound.map_or_else(
+        || source.to_socket_addr(),
+        |inbound| inbound.src.to_socket_addr(),
+    );
+    let connect_socket = context
+        .sock_mgr
+        .get_listener_worker_socket_policy()
+        .connects_after_lock(handles.listener.policy);
+    let managers = if context.cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
+        context
+            .all_sock_mgrs
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>()
+    } else {
+        vec![context.sock_mgr]
+    };
+    let mut established: Vec<&crate::net::sock_mgr::SocketManager> =
+        Vec::with_capacity(managers.len());
+    for manager in managers {
+        let previous_version = manager.get_version();
+        if let Err(error) = manager.establish_client_flow(
+            flow,
+            listener_flow,
+            connect_socket,
+            client,
+            previous_version,
+        ) {
+            for established_manager in established {
+                let version = established_manager.get_version();
+                if let Err(rollback_error) = established_manager.clear_client_lock(version) {
+                    log_warn_dir!(
+                        context.worker_id,
+                        C2U,
+                        "failed to roll back partial shared client lock: {}",
+                        rollback_error
+                    );
+                }
+            }
+            if context.cfg.worker_flow_mode == WorkerFlowMode::SingleFlow
+                && let Some(claims) = context.flow_claims
+            {
+                claims.release(flow, context.worker_pair_id);
+            }
+            log_warn_dir!(
+                context.worker_id,
+                C2U,
+                "client socket transition rejected pending lock for {}: {}",
+                source,
+                error
+            );
+            return false;
+        }
+        established.push(manager);
     }
 
     reset_sequence_state(
@@ -88,59 +143,25 @@ pub(super) fn publish_client_lock(
     context.flow_state.set_locked(true);
     context.flow_state.clear_pending_icmp_client_lock();
     *was_locked = true;
-
-    let source_socket_addr = listener_flow.inbound.map_or_else(
-        || source.as_sock_addr(),
-        |inbound| inbound.src.canonical().as_sock_addr(),
+    *handles = context.sock_mgr.refresh_handles();
+    log_info!(
+        "Locked to single client {} ({})",
+        source,
+        if handles.listener_connected() {
+            "connected"
+        } else {
+            "not connected"
+        }
     );
-    Arc::make_mut(&mut handles.listener).listener_connected = false;
-    if context.cfg.debug_behavior.client_unconnected {
-        log_info!("Locked to single client {} (not connected)", source);
-    } else if let Err(error) = handles.client_sock.connect(&source_socket_addr) {
-        log_warn!("connect client_sock to {} failed: {}", source, error);
-        log_info!("Locked to single client {} (not connected)", source);
-    } else {
-        Arc::make_mut(&mut handles.listener).listener_connected = true;
-        log_info!("Locked to single client {} (connected)", source);
-    }
-
-    handles.version = context.sock_mgr.set_listener_remote_connected(
-        Some(flow),
-        listener_flow,
-        handles.listener.listener_connected,
-        handles.version,
-    );
-    Arc::make_mut(&mut handles.listener).listener_flow = listener_flow;
     log_debug_dir!(
         context.cfg.debug_logs.handles,
         context.worker_id,
         C2U,
         "publish lock: flow={:?} connected={} ver={}",
         flow,
-        handles.listener.listener_connected,
+        handles.listener_connected(),
         handles.version
     );
-
-    if context.cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
-        for manager in context.all_sock_mgrs {
-            if !std::ptr::eq(manager.as_ref(), context.sock_mgr)
-                && let Err(error) = manager.set_client_sock_connected(
-                    Some(flow),
-                    listener_flow,
-                    handles.listener.listener_connected,
-                    &source_socket_addr,
-                    0,
-                )
-            {
-                log_warn_dir!(
-                    context.worker_id,
-                    C2U,
-                    "failed to publish shared client lock to worker pair: {}",
-                    error
-                );
-            }
-        }
-    }
     if let Ok(new_handles) = context.sock_mgr.reresolve(
         context.cfg.reresolve_mode.allow_upstream(),
         false,

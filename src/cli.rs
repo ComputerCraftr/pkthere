@@ -1,6 +1,7 @@
+use crate::endpoint::LogicalEndpoint;
 use crate::net::params::{
-    CanonicalAddr, MAX_SAFE_ICMP_IPV4_PAYLOAD, MAX_SAFE_ICMP_IPV6_PAYLOAD,
-    MAX_SAFE_UDP_IPV4_PAYLOAD, MAX_SAFE_UDP_IPV6_PAYLOAD,
+    MAX_SAFE_ICMP_IPV4_PAYLOAD, MAX_SAFE_ICMP_IPV6_PAYLOAD, MAX_SAFE_UDP_IPV4_PAYLOAD,
+    MAX_SAFE_UDP_IPV6_PAYLOAD,
 };
 use crate::net::socket::resolve_first;
 
@@ -153,13 +154,13 @@ pub(crate) struct RuntimeOptions {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RequestedConfig {
-    pub listen_request: CanonicalAddr, // CLI UDP port or ICMP listener id
+    pub listen_request: LogicalEndpoint, // CLI UDP port or ICMP listener id
     pub listener_source_id_request: IcmpReplyIdRequest, // ICMP listener outbound source-ID preference
     pub listener_reply_id_request: IcmpReplyIdRequest,  // ICMP listener reply-ID preference
     pub listen_proto: SupportedProtocol,                // UDP | ICMP
     pub listen_mode: ListenMode,                        // Fixed or Dynamic (:0)
     pub listen_str: String,                             // original --here host:port string
-    pub upstream_request: CanonicalAddr, // CLI remote UDP port or ICMP peer/listener id
+    pub upstream_request: LogicalEndpoint, // CLI remote UDP port or ICMP peer/listener id
     pub upstream_source_id_request: IcmpReplyIdRequest, // ICMP upstream outbound source-ID preference
     pub upstream_reply_id_request: IcmpReplyIdRequest,  // ICMP upstream reply-ID preference
     pub upstream_proto: SupportedProtocol,              // UDP | ICMP
@@ -183,13 +184,13 @@ impl DerefMut for RequestedConfig {
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeConfig {
-    pub listen: CanonicalAddr, // actual bound UDP port or ICMP local id
+    pub listen: LogicalEndpoint, // actual bound UDP port or ICMP local id
     pub listener_source_id_request: IcmpReplyIdRequest, // ICMP listener outbound source-ID preference
     pub listener_reply_id_request: IcmpReplyIdRequest,  // ICMP listener reply-ID preference
     pub listen_proto: SupportedProtocol,                // UDP | ICMP
     pub listen_mode: ListenMode,                        // Fixed or Dynamic (:0)
     pub listen_str: String,                             // original --here host:port string
-    pub upstream: CanonicalAddr,                        // remote UDP port or ICMP peer/listener id
+    pub upstream: LogicalEndpoint,                      // remote UDP port or ICMP peer/listener id
     pub upstream_source_id_request: IcmpReplyIdRequest, // ICMP upstream outbound source-ID preference
     pub upstream_reply_id_request: IcmpReplyIdRequest,  // ICMP upstream reply-ID preference
     pub upstream_proto: SupportedProtocol,              // UDP | ICMP
@@ -220,22 +221,24 @@ impl RuntimeConfig {
 
 pub(crate) fn realize_config(
     requested: RequestedConfig,
-    listen: CanonicalAddr,
+    listen: LogicalEndpoint,
 ) -> io::Result<RuntimeConfig> {
     if requested.listen_proto == SupportedProtocol::ICMP
         && requested.listen_mode == ListenMode::Fixed
-        && requested.listen_request.id != listen.id
+        && requested.listen_request.id() != listen.id()
     {
         return Err(io::Error::other(format!(
             "ICMP fixed-id listener requested id {} but socket local id is {}; use a raw-capable deployment or --here ICMP:host:0 for wildcard-learn mode",
-            requested.listen_request.id, listen.id
+            requested.listen_request.id(),
+            listen.id()
         )));
     }
 
-    if listen.addr == requested.upstream_request.addr {
+    if listen.to_socket_addr() == requested.upstream_request.to_socket_addr() {
         return Err(io::Error::other(format!(
             "Port conflict: listener address {} is identical to upstream destination address {}; they must be different to avoid loops",
-            listen.addr, requested.upstream_request.addr
+            listen.to_socket_addr(),
+            requested.upstream_request.to_socket_addr()
         )));
     }
 
@@ -330,10 +333,10 @@ fn parse_endpoint_target(s: &str, flag: &str) -> Result<ParsedEndpointTarget, St
 }
 
 #[inline]
-fn resolve_host_id(host: &str, id: u16, flag: &str) -> (String, CanonicalAddr) {
+fn resolve_host_id(host: &str, id: u16, flag: &str) -> (String, LogicalEndpoint) {
     let resolve_arg = format!("{host}:{id}");
     match resolve_first(&resolve_arg) {
-        Ok(sa) => (sa.to_string(), CanonicalAddr::from_socket_addr(sa)),
+        Ok(sa) => (sa.to_string(), LogicalEndpoint::from_socket_addr(sa)),
         Err(e) => {
             log_error!("{flag}: failed to resolve {resolve_arg}: {e}");
             process::exit(2)
@@ -710,7 +713,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
     }
     if debug_behavior.force_raw_icmp_wildcard_upstream
         && (upstream_proto != SupportedProtocol::ICMP
-            || upstream_request.id != 0
+            || upstream_request.id() != 0
             || upstream_reply_id_request.requested_socket_id() != 0)
     {
         log_error!(
@@ -731,7 +734,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
     let reresolve_secs = reresolve_secs.unwrap_or(DEFAULT_RERESOLVE_SECS);
     let reresolve_mode = reresolve_mode.unwrap_or(ReresolveMode::Upstream);
 
-    let absolute_max_payload = if listen_request.addr.is_ipv4() || upstream_request.addr.is_ipv4() {
+    let absolute_max_payload = if listen_request.ip().is_ipv4() || upstream_request.ip().is_ipv4() {
         if listen_proto == SupportedProtocol::ICMP || upstream_proto == SupportedProtocol::ICMP {
             MAX_SAFE_ICMP_IPV4_PAYLOAD
         } else {
@@ -750,7 +753,7 @@ pub(crate) fn parse_args() -> RequestedConfig {
         print_usage_and_exit(2);
     }
 
-    if upstream_proto == SupportedProtocol::UDP && upstream_request.id == 0 {
+    if upstream_proto == SupportedProtocol::UDP && upstream_request.id() == 0 {
         log_error!(
             "--there UDP:host:0 is invalid: UDP upstream requires a fixed remote destination port"
         );

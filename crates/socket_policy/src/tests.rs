@@ -911,6 +911,17 @@ fn listener_worker_socket_policy_limits_separate_state_to_kernel_flow_affinity()
     );
     assert!(shared.reuse_address);
     assert_eq!(shared.reuse_port, cfg!(unix));
+    let listener_udp = resolve_socket_policy_with_icmp_intent(
+        SocketRole::Listener,
+        SupportedProtocol::UDP,
+        Type::DGRAM,
+        TimeoutAction::Drop,
+        false,
+        Domain::IPV4,
+        IcmpPolicyIntent::default(),
+    );
+    assert!(!shared.connects_after_lock(listener_udp));
+    assert!(listener_worker_socket_policy(1, false).connects_after_lock(listener_udp));
 
     let separate = listener_worker_socket_policy(3, true);
     assert_eq!(

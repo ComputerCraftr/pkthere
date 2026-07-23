@@ -125,7 +125,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
                 handles
                     .listener
                     .policy
-                    .receive_syscall(handles.listener.listener_connected),
+                    .receive_syscall(handles.listener_connected()),
                 ReceivePacketContext {
                     cfg: context.cfg,
                     worker_id: context.worker_id,
@@ -148,7 +148,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
             }
             continue;
         }
-        if context.cfg.is_icmp_sync_enabled() && handles.listener.listener_connected {
+        if context.cfg.is_icmp_sync_enabled() && handles.listener_connected() {
             thread::sleep(UNLOCKED_SYNC_BACKOFF);
             continue;
         }
@@ -169,7 +169,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
             handles
                 .listener
                 .policy
-                .receive_syscall(handles.listener.listener_connected),
+                .receive_syscall(handles.listener_connected()),
             ReceivePacketContext {
                 cfg: context.cfg,
                 worker_id: context.worker_id,

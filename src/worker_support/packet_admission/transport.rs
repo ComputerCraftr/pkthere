@@ -2,13 +2,13 @@
 pub(crate) use super::rejection::record_rejection_stats;
 pub(crate) use super::rejection::{RejectedPacket, RejectionReason};
 use crate::cli::{IcmpReplyIdRequest, ListenMode, RuntimeConfig, SupportedProtocol};
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
 use crate::flow_state::PendingIcmpClientLock;
 use crate::net::framing_shim::{ReplyIdNegotiation, parse_icmp_reply_negotiation};
 #[cfg(test)]
 use crate::net::packet_headers::parse_packet_headers;
 use crate::net::packet_headers::{ParsedPacketHeaders, ReceiveParserKernel, SHIM_IS_DATA};
-use crate::net::params::CanonicalAddr;
 use crate::net::payload::{PayloadEvent, TunnelFlowIdentity};
 use crate::net::sock_mgr::SocketHandles;
 #[cfg(test)]
@@ -34,7 +34,7 @@ pub(crate) struct ReceiveSocketContext {
     pub(crate) parser: ReceiveParserKernel,
     pub(crate) policy: ResolvedSocketPolicy,
     pub(crate) connected: bool,
-    pub(crate) local_filter: CanonicalAddr,
+    pub(crate) local_filter: LogicalEndpoint,
     pub(crate) local_kernel_addr: SocketAddr,
     pub(crate) evidence_key: pkthere_socket_policy::SocketEvidenceKey,
 }
@@ -68,7 +68,7 @@ impl ReceiveSocketContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AdmissionStateContext {
     pub(crate) expected_inbound: Option<FlowTuple>,
-    pub(crate) expected_local: Option<FlowEndpoint>,
+    pub(crate) expected_local: Option<LogicalEndpoint>,
     pub(crate) locked_flow: Option<ClientFlowKey>,
     pub(crate) pending_icmp_client_lock: Option<PendingIcmpClientLock>,
 }
@@ -81,23 +81,21 @@ pub(crate) struct ReceiveContext {
 
 impl ReceiveContext {
     #[inline]
-    pub(crate) const fn local_filter(self) -> Option<CanonicalAddr> {
+    pub(crate) const fn local_filter(self) -> Option<LogicalEndpoint> {
         Some(self.socket.local_filter)
     }
 
     #[inline]
-    pub(crate) fn expected_remote(self) -> Option<CanonicalAddr> {
-        self.admission
-            .expected_inbound
-            .map(|flow| flow.src.canonical())
+    pub(crate) fn expected_remote(self) -> Option<LogicalEndpoint> {
+        self.admission.expected_inbound.map(|flow| flow.src)
     }
 
     #[inline]
     pub(crate) const fn expected_local_id(self) -> Option<u16> {
         match self.admission.expected_inbound {
-            Some(flow) => Some(flow.dst.id),
+            Some(flow) => Some(flow.dst.id()),
             None => match self.admission.expected_local {
-                Some(endpoint) => Some(endpoint.id),
+                Some(endpoint) => Some(endpoint.id()),
                 None => None,
             },
         }
@@ -121,7 +119,7 @@ pub(crate) fn upstream_receive_context(
             sock_type: handles.upstream.sock_type,
             parser: handles.upstream.parser,
             policy: handles.upstream.policy,
-            connected: handles.upstream.upstream_connected,
+            connected: handles.upstream_connected(),
             local_filter: handles.upstream.upstream_local_filter,
             local_kernel_addr: handles.upstream.upstream_local_kernel_addr,
             evidence_key: handles.upstream.evidence_key,
@@ -145,8 +143,10 @@ pub(crate) fn client_receive_context(
     let expected_local = if cfg.listen_proto == SupportedProtocol::ICMP {
         match (cfg.listen_mode, expected_inbound) {
             (ListenMode::Fixed, _) => Some(
-                FlowEndpoint::from_canonical(handles.listener.listen_local_filter)
-                    .with_id(cfg.listen.id),
+                handles
+                    .listener
+                    .listen_local_filter
+                    .with_id(cfg.listen.id()),
             ),
             (ListenMode::Dynamic, Some(flow)) => Some(flow.dst),
             (ListenMode::Dynamic, None) => None,
@@ -167,7 +167,7 @@ pub(crate) fn client_receive_context(
             sock_type: handles.listener.sock_type,
             parser: handles.listener.parser,
             policy: handles.listener.policy,
-            connected: handles.listener.listener_connected,
+            connected: handles.listener_connected(),
             local_filter: handles.listener.listen_local_filter,
             local_kernel_addr: handles.listener.listen_local_kernel_addr,
             evidence_key: handles.listener.evidence_key,
@@ -184,7 +184,7 @@ pub(crate) fn client_receive_context(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AdmittedWirePacket<'a> {
     pub(crate) trace: Option<crate::packet_trace::PacketTraceId>,
-    pub(crate) normalized_source: Option<CanonicalAddr>,
+    pub(crate) normalized_source: Option<LogicalEndpoint>,
     pub(crate) event: PayloadEvent<'a>,
     pub(crate) lock_candidate: Option<PendingIcmpClientLock>,
     pub(crate) pending_negotiation: Option<PendingIcmpClientLock>,
@@ -201,7 +201,7 @@ pub(crate) enum WirePacketAdmission<'a> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TransportPacket<'a> {
-    pub(crate) normalized_source: Option<CanonicalAddr>,
+    pub(crate) normalized_source: Option<LogicalEndpoint>,
     pub(crate) flow_identity: TunnelFlowIdentity,
     pub(crate) seq: u16,
     pub(crate) payload: &'a [u8],
@@ -241,7 +241,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
                 let src_port = socket_source
                     .and_then(|s| s.as_socket())
                     .map_or(0, |s| s.port());
-                let Some(dst_port) = spec.local_filter().map(|f| f.id) else {
+                let Some(dst_port) = spec.local_filter().map(LogicalEndpoint::id) else {
                     return TransportAdmission::Filtered(RejectedPacket {
                         normalized_source: None,
                         actual_dst_id: None,
@@ -252,7 +252,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
             } else {
                 let Some(udp) = parsed.udp else {
                     return TransportAdmission::Filtered(RejectedPacket {
-                        normalized_source: socket_source.and_then(CanonicalAddr::from_sock_addr),
+                        normalized_source: socket_source.and_then(LogicalEndpoint::from_sock_addr),
                         actual_dst_id: None,
                         reason: RejectionReason::MalformedIcmpHeader(None),
                     });
@@ -263,7 +263,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
         SupportedProtocol::ICMP => {
             let Some(icmp) = parsed.icmp else {
                 return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source: socket_source.and_then(CanonicalAddr::from_sock_addr),
+                    normalized_source: socket_source.and_then(LogicalEndpoint::from_sock_addr),
                     actual_dst_id: None,
                     reason: RejectionReason::MalformedIcmpHeader(parsed.icmp_malformed_reason),
                 });
@@ -272,7 +272,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
             let source_id = icmp
                 .identity
                 .source_id
-                .or_else(|| spec.expected_remote().map(|remote| remote.id))
+                .or_else(|| spec.expected_remote().map(|remote| remote.id()))
                 .or_else(|| {
                     socket_source
                         .and_then(SockAddr::as_socket)
@@ -305,7 +305,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
             }
             PeerSourceRequirement::SourceMetadata | PeerSourceRequirement::ConnectedKernel => {
                 match socket_source
-                    .and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, logical_src_id))
+                    .and_then(|s| LogicalEndpoint::from_sock_addr_with_id(s, logical_src_id))
                 {
                     Some(src) => Some(src),
                     None if spec.socket.evidence_policy().peer_source
@@ -331,7 +331,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
         if parsed_transport_has_ip(parsed)
             && parsed
                 .src_ip
-                .is_some_and(|src| normalized_source.is_some_and(|auth| src != auth.addr.ip()))
+                .is_some_and(|src| normalized_source.is_some_and(|auth| src != auth.ip()))
         {
             return TransportAdmission::Filtered(RejectedPacket {
                 normalized_source,
@@ -340,7 +340,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
             });
         }
         if let (Some(expected), Some(src)) = (spec.expected_remote(), normalized_source)
-            && src != expected
+            && !expected.matches_filter(src)
         {
             return TransportAdmission::Filtered(RejectedPacket {
                 normalized_source: Some(src),
@@ -433,7 +433,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
                 }
                 PeerSourceRequirement::SourceMetadata | PeerSourceRequirement::ConnectedKernel => {
                     match socket_source
-                        .and_then(|s| CanonicalAddr::from_sock_addr_with_id(s, logical_src_id))
+                        .and_then(|s| LogicalEndpoint::from_sock_addr_with_id(s, logical_src_id))
                     {
                         Some(src) => Some(src),
                         None if spec.socket.evidence_policy().peer_source
@@ -442,11 +442,11 @@ pub(crate) fn admit_packet_with_parsed<'a>(
                             spec.expected_remote().map(|expected| {
                                 let source_id =
                                     if icmp.shim_flags.is_none() && transport_payload.is_empty() {
-                                        expected.id
+                                        expected.id()
                                     } else {
                                         logical_src_id
                                     };
-                                CanonicalAddr::new(expected.addr, source_id)
+                                expected.with_id(source_id)
                             })
                         }
                         None => {
@@ -468,7 +468,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
                 && socket_source.is_none()
                 && spec.local_filter().is_some_and(|local| {
                     spec.expected_remote()
-                        .is_some_and(|remote| remote.addr.ip() == local.addr.ip())
+                        .is_some_and(|remote| remote.ip() == local.ip())
                 });
             if connected_reflected_negotiation
                 && reply_id_negotiation.is_some_and(|reply_id| {
@@ -507,7 +507,7 @@ pub(crate) fn admit_packet_with_parsed<'a>(
 
             if let (Some(expected), Some(src)) = (spec.expected_remote(), normalized_source) {
                 let matches_ip = icmp_remote_ip_matches(src, expected);
-                let matches_id = src.id == expected.id;
+                let matches_id = src.id() == expected.id();
 
                 if !matches_ip || (!matches_id && !is_handshake_or_debug) {
                     let reason = if matches_ip
@@ -751,7 +751,7 @@ fn decode_icmp_payload_event<'a>(
 fn is_valid_handshake_or_debug(
     spec: ReceiveContext,
     parsed: &ParsedPacketHeaders,
-    normalized_source: Option<CanonicalAddr>,
+    normalized_source: Option<LogicalEndpoint>,
     reply_id: Option<ReplyIdNegotiation>,
 ) -> bool {
     if spec.socket.proto != SupportedProtocol::ICMP {
@@ -777,23 +777,23 @@ fn is_valid_handshake_or_debug(
         };
         let src_ip = parsed
             .src_ip
-            .or_else(|| normalized_source.map(|s| s.addr.ip()));
+            .or_else(|| normalized_source.map(LogicalEndpoint::ip));
         let src_id = parsed.icmp.and_then(|icmp| icmp.identity.source_id);
 
-        let local_ip = local.addr.ip();
+        let local_ip = local.ip();
         let reflected_peer_ip = if local_ip.is_unspecified() {
-            spec.expected_remote().map(|remote| remote.addr.ip())
+            spec.expected_remote().map(LogicalEndpoint::ip)
         } else {
             Some(local_ip)
         };
         let source_matches_local = src_ip
             .zip(reflected_peer_ip)
             .is_some_and(|(source, expected)| source == expected)
-            && src_id.is_some_and(|id| id == local.id);
+            && src_id.is_some_and(|id| id == local.id());
         let connected_kernel_filtered_self = spec.socket.evidence_policy().peer_source
             == PeerSourceRequirement::ConnectedKernel
             && src_ip.is_none()
-            && src_id.is_some_and(|id| id == local.id);
+            && src_id.is_some_and(|id| id == local.id());
 
         if source_matches_local || connected_kernel_filtered_self {
             return reply_id.is_some_and(|reply_id| {
@@ -847,7 +847,7 @@ fn event_advertised_reply_id(event: &PayloadEvent<'_>) -> Option<u16> {
 #[inline]
 fn pending_matches_user_event(
     pending: PendingIcmpClientLock,
-    src: CanonicalAddr,
+    src: LogicalEndpoint,
     event: &PayloadEvent<'_>,
 ) -> bool {
     let PayloadEvent::UserPayload {
@@ -862,60 +862,57 @@ fn pending_matches_user_event(
         return false;
     }
     pending.listener_flow.inbound.is_some_and(|flow| {
-        icmp_remote_ip_matches(src, flow.src.canonical())
-            && flow.src.id == icmp.flow_identity().remote_source_id
-            && flow.dst.id == icmp.inbound_header_ident()
+        icmp_remote_ip_matches(src, flow.src)
+            && flow.src.id() == icmp.flow_identity().remote_source_id
+            && flow.dst.id() == icmp.inbound_header_ident()
     })
 }
 
 #[inline]
 fn build_client_lock_candidate(
-    src: CanonicalAddr,
-    listen_local_recv: CanonicalAddr,
+    src: LogicalEndpoint,
+    listen_local_recv: LogicalEndpoint,
     listener_source_id_request: IcmpReplyIdRequest,
     listen_proto: SupportedProtocol,
     event: &PayloadEvent<'_>,
 ) -> Option<PendingIcmpClientLock> {
     let flow_key = client_flow_key_from_event(src, listen_proto, event)?;
     let remote = match listen_proto {
-        SupportedProtocol::UDP => FlowEndpoint::from_canonical(src),
+        SupportedProtocol::UDP => src,
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             }
             | PayloadEvent::SessionControl { icmp, .. } => {
-                FlowEndpoint::from_canonical(src).with_id(icmp.flow_identity().remote_source_id)
+                src.with_id(icmp.flow_identity().remote_source_id)
             }
             _ => return None,
         },
     };
     let inbound_local = match listen_proto {
-        SupportedProtocol::UDP => FlowEndpoint::from_canonical(listen_local_recv),
+        SupportedProtocol::UDP => listen_local_recv,
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             }
             | PayloadEvent::SessionControl { icmp, .. } => {
-                FlowEndpoint::from_canonical(listen_local_recv).with_id(icmp.inbound_header_ident())
+                listen_local_recv.with_id(icmp.inbound_header_ident())
             }
             _ => return None,
         },
     };
     let outbound_local = match listen_proto {
-        SupportedProtocol::UDP => FlowEndpoint::from_canonical(listen_local_recv),
+        SupportedProtocol::UDP => listen_local_recv,
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..
             }
-            | PayloadEvent::SessionControl { icmp, .. } => {
-                FlowEndpoint::from_canonical(listen_local_recv).with_id(
-                    match listener_source_id_request.resolved_reply_id(icmp.inbound_header_ident())
-                    {
-                        Some(id) => id,
-                        None => icmp.inbound_header_ident(),
-                    },
-                )
-            }
+            | PayloadEvent::SessionControl { icmp, .. } => listen_local_recv.with_id(
+                match listener_source_id_request.resolved_reply_id(icmp.inbound_header_ident()) {
+                    Some(id) => id,
+                    None => icmp.inbound_header_ident(),
+                },
+            ),
             _ => return None,
         },
     };
@@ -933,10 +930,10 @@ fn build_client_lock_candidate(
 
 #[inline]
 fn outbound_remote_for_event(
-    remote: FlowEndpoint,
+    remote: LogicalEndpoint,
     listen_proto: SupportedProtocol,
     event: &PayloadEvent<'_>,
-) -> FlowEndpoint {
+) -> LogicalEndpoint {
     if listen_proto != SupportedProtocol::ICMP {
         return remote;
     }
@@ -957,12 +954,12 @@ fn outbound_remote_for_event(
 
 #[inline]
 fn client_flow_key_from_event(
-    src: CanonicalAddr,
+    src: LogicalEndpoint,
     listen_proto: SupportedProtocol,
     event: &PayloadEvent<'_>,
 ) -> Option<ClientFlowKey> {
     match listen_proto {
-        SupportedProtocol::UDP => Some(ClientFlowKey::Udp(src.addr)),
+        SupportedProtocol::UDP => Some(ClientFlowKey::Udp(src)),
         SupportedProtocol::ICMP => match event {
             PayloadEvent::UserPayload {
                 icmp: Some(icmp), ..

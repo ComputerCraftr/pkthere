@@ -164,7 +164,7 @@ fn emit_local_session_control_reply(
     };
     let send_res = send_payload(
         &handles.client_sock,
-        handles.listener.listener_connected,
+        handles.listener_connected(),
         &route.dest_sa,
         handles.listener.policy.send_policy,
         route.source_ip,
@@ -176,7 +176,7 @@ fn emit_local_session_control_reply(
         &reply_event,
         crate::net::session::SendOutcome {
             result: &send_res,
-            socket_connected: handles.listener.listener_connected,
+            socket_connected: handles.listener_connected(),
             destination: &route.dest_sa,
             disconnect: None,
             trace,
@@ -236,9 +236,9 @@ mod tests {
         session_control_reply_id_for_route, store_sync_payload,
     };
     use crate::cli::{SupportedProtocol, TimeoutAction};
-    use crate::flow_key::{FlowEndpoint, FlowTuple, SocketLegFlow};
+    use crate::endpoint::LogicalEndpoint;
+    use crate::flow_key::{FlowTuple, SocketLegFlow};
     use crate::net::framing_shim::ReplyIdNegotiation;
-    use crate::net::params::CanonicalAddr;
     use crate::net::payload::PayloadEvent;
     use crate::net::sock_mgr::{ListenerMetadata, SocketHandles, UpstreamMetadata};
     use crate::worker_support::cache::CachedClientState;
@@ -251,23 +251,17 @@ mod tests {
     use std::sync::Arc;
 
     fn test_handles() -> SocketHandles {
-        let upstream_remote = CanonicalAddr::new(
+        let upstream_remote = LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4444)),
             4444,
         );
-        let upstream_local = CanonicalAddr::new(
+        let upstream_local = LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555)),
             5555,
         );
         let upstream_flow = SocketLegFlow::new(
-            Some(FlowTuple::new(
-                FlowEndpoint::from_canonical(upstream_remote),
-                FlowEndpoint::from_canonical(upstream_local),
-            )),
-            Some(FlowTuple::new(
-                FlowEndpoint::from_canonical(upstream_local),
-                FlowEndpoint::from_canonical(upstream_remote),
-            )),
+            Some(FlowTuple::new(upstream_remote, upstream_local)),
+            Some(FlowTuple::new(upstream_local, upstream_remote)),
         );
         let listen_policy = resolve_socket_policy_with_icmp_intent(
             SocketRole::Listener,
@@ -291,7 +285,7 @@ mod tests {
             ListenerMetadata {
                 flow: None,
                 listener_flow: SocketLegFlow::empty(),
-                listen_local_filter: CanonicalAddr::new(
+                listen_local_filter: LogicalEndpoint::from_socket_addr_with_id(
                     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
                     3333,
                 ),
@@ -304,7 +298,6 @@ mod tests {
                     0,
                     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3333)),
                 ),
-                listener_connected: false,
                 sock_type: Type::DGRAM,
                 policy: listen_policy,
                 parser: crate::net::packet_headers::select_packet_parser(
@@ -318,11 +311,11 @@ mod tests {
             UpstreamMetadata {
                 upstream_remote_filter: upstream_remote,
                 upstream_local_filter: upstream_local,
-                upstream_local_kernel_addr: upstream_local.addr,
+                upstream_local_kernel_addr: upstream_local.to_socket_addr(),
                 evidence_key: crate::net::sock_mgr::SocketEvidenceKey::initial(
                     SocketRole::Upstream,
                     0,
-                    upstream_local.addr,
+                    upstream_local.to_socket_addr(),
                 ),
                 upstream_flow,
                 sock_type: Type::DGRAM,
@@ -333,7 +326,6 @@ mod tests {
                     upstream_policy,
                 )
                 .expect("upstream parser"),
-                upstream_connected: true,
             },
             udp_socket(),
             0,
@@ -366,7 +358,7 @@ mod tests {
     fn local_session_control_reply_route_uses_destination_peer_id_for_raw_listener() {
         let mut handles = test_handles();
         Arc::make_mut(&mut handles.listener).sock_type = Type::RAW;
-        let dest = CanonicalAddr::new(
+        let dest = LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
             9999,
         );
@@ -384,7 +376,7 @@ mod tests {
     #[test]
     fn local_session_control_reply_route_uses_realized_listen_id_for_dgram_listener() {
         let handles = test_handles();
-        let dest = CanonicalAddr::new(
+        let dest = LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)),
             9999,
         );
@@ -402,7 +394,7 @@ mod tests {
     #[test]
     fn session_control_ack_advertises_reply_id_not_source_id() {
         let route = CachedClientState::build_pending_session_control_reply_route(
-            CanonicalAddr::new(
+            LogicalEndpoint::from_socket_addr_with_id(
                 SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40001)),
                 40001,
             ),

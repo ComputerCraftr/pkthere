@@ -1,12 +1,12 @@
 use crate::cli::RuntimeConfig;
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use socket2::SockAddr;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Clone, Debug)]
 pub(crate) struct CachedSendRoute {
-    pub(crate) dest: CanonicalAddr,
+    pub(crate) dest: LogicalEndpoint,
     pub(crate) dest_sa: SockAddr,
     pub(crate) icmp_header_id: u16,
     pub(crate) source_endpoint_id: Option<u16>,
@@ -45,32 +45,32 @@ impl CachedClientState {
     fn build_send_route(
         c2u: bool,
         handles: &SocketHandles,
-        dest: CanonicalAddr,
+        dest: LogicalEndpoint,
     ) -> CachedSendRoute {
         CachedSendRoute {
             dest,
-            dest_sa: dest.as_sock_addr(),
-            icmp_header_id: dest.id,
+            dest_sa: dest.to_sock_addr(),
+            icmp_header_id: dest.id(),
             source_endpoint_id: if c2u {
                 handles
                     .upstream
                     .upstream_flow
                     .outbound
-                    .map(|flow| flow.src.id)
+                    .map(|flow| flow.src.id())
             } else {
                 handles
                     .listener
                     .listener_flow
                     .outbound
-                    .map(|flow| flow.src.id)
+                    .map(|flow| flow.src.id())
             },
             advertised_reply_id: None,
             source_ip: if c2u {
-                Some(handles.upstream.upstream_local_filter.addr.ip())
+                Some(handles.upstream.upstream_local_filter.ip())
             } else {
                 match handles.listener.listener_flow.outbound {
-                    Some(flow) => Some(flow.src.ip),
-                    None => Some(handles.listener.listen_local_filter.addr.ip()),
+                    Some(flow) => Some(flow.src.ip()),
+                    None => Some(handles.listener.listen_local_filter.ip()),
                 }
             },
         }
@@ -79,39 +79,39 @@ impl CachedClientState {
     #[inline]
     pub(crate) fn build_local_session_control_reply_route(
         handles: &SocketHandles,
-        dest: CanonicalAddr,
+        dest: LogicalEndpoint,
     ) -> CachedSendRoute {
         CachedSendRoute {
             dest,
-            dest_sa: dest.as_sock_addr(),
-            icmp_header_id: dest.id,
+            dest_sa: dest.to_sock_addr(),
+            icmp_header_id: dest.id(),
             source_endpoint_id: handles
                 .listener
                 .listener_flow
                 .outbound
-                .map(|flow| flow.src.id),
+                .map(|flow| flow.src.id()),
             advertised_reply_id: Some(match handles.listener.listener_flow.inbound {
-                Some(flow) => flow.dst.id,
-                None => handles.listener.listen_local_filter.id,
+                Some(flow) => flow.dst.id(),
+                None => handles.listener.listen_local_filter.id(),
             }),
             source_ip: Some(match handles.listener.listener_flow.outbound {
-                Some(flow) => flow.src.ip,
-                None => handles.listener.listen_local_filter.addr.ip(),
+                Some(flow) => flow.src.ip(),
+                None => handles.listener.listen_local_filter.ip(),
             }),
         }
     }
 
     #[inline]
     pub(crate) fn build_pending_session_control_reply_route(
-        dest: CanonicalAddr,
+        dest: LogicalEndpoint,
         source_endpoint_id: u16,
         source_ip: IpAddr,
         advertised_reply_id: u16,
     ) -> CachedSendRoute {
         CachedSendRoute {
             dest,
-            dest_sa: dest.as_sock_addr(),
-            icmp_header_id: dest.id,
+            dest_sa: dest.to_sock_addr(),
+            icmp_header_id: dest.id(),
             source_endpoint_id: Some(source_endpoint_id),
             advertised_reply_id: Some(advertised_reply_id),
             source_ip: Some(source_ip),
@@ -149,9 +149,10 @@ impl CachedClientState {
         } else {
             let remote = match handles.listener.listener_flow.outbound_destination() {
                 Some(dest) => dest,
-                None => {
-                    CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), 0)
-                }
+                None => LogicalEndpoint::from_socket_addr_with_id(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                    0,
+                ),
             };
             Self {
                 c2u,
@@ -205,9 +206,9 @@ impl CachedClientState {
                 handles.version,
                 handles.listener.listener_flow,
                 handles.listener.listen_local_kernel_addr,
-                handles.listener.listener_connected,
+                handles.listener_connected(),
                 handles.upstream.upstream_remote_filter,
-                handles.upstream.upstream_connected
+                handles.upstream_connected()
             );
         }
     }
@@ -220,8 +221,8 @@ mod tests {
         DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
         RuntimeOptions, SupportedProtocol, TimeoutAction, WorkerFlowMode,
     };
-    use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
-    use crate::net::params::CanonicalAddr;
+    use crate::endpoint::LogicalEndpoint;
+    use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
     use crate::net::sock_mgr::{ListenerMetadata, UpstreamMetadata};
     use crate::worker_support::test_support::udp_socket;
     use pkthere_socket_policy::{
@@ -233,7 +234,7 @@ mod tests {
 
     fn test_config(lp: SupportedProtocol, up: SupportedProtocol) -> RuntimeConfig {
         RuntimeConfig {
-            listen: CanonicalAddr::new(
+            listen: LogicalEndpoint::from_socket_addr_with_id(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
                 8888,
             ),
@@ -242,7 +243,7 @@ mod tests {
             listen_proto: lp,
             listen_mode: ListenMode::Fixed,
             listen_str: String::from("127.0.0.1:8888"),
-            upstream: CanonicalAddr::new(
+            upstream: LogicalEndpoint::from_socket_addr_with_id(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
                 9999,
             ),
@@ -273,19 +274,17 @@ mod tests {
     }
 
     fn test_handles() -> SocketHandles {
-        let upstream_local =
-            CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777), 7777);
-        let upstream_remote =
-            CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999), 9999);
+        let upstream_local = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
+            7777,
+        );
+        let upstream_remote = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
+            9999,
+        );
         let upstream_flow = SocketLegFlow::new(
-            Some(FlowTuple::new(
-                FlowEndpoint::from_canonical(upstream_remote),
-                FlowEndpoint::from_canonical(upstream_local),
-            )),
-            Some(FlowTuple::new(
-                FlowEndpoint::from_canonical(upstream_local),
-                FlowEndpoint::from_canonical(upstream_remote),
-            )),
+            Some(FlowTuple::new(upstream_remote, upstream_local)),
+            Some(FlowTuple::new(upstream_local, upstream_remote)),
         );
         let listen_policy = resolve_socket_policy_with_icmp_intent(
             SocketRole::Listener,
@@ -309,7 +308,7 @@ mod tests {
             ListenerMetadata {
                 flow: None,
                 listener_flow: SocketLegFlow::empty(),
-                listen_local_filter: CanonicalAddr::new(
+                listen_local_filter: LogicalEndpoint::from_socket_addr_with_id(
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
                     8888,
                 ),
@@ -319,7 +318,6 @@ mod tests {
                     0,
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
                 ),
-                listener_connected: false,
                 sock_type: Type::DGRAM,
                 policy: listen_policy,
                 parser: crate::net::packet_headers::select_packet_parser(
@@ -333,11 +331,11 @@ mod tests {
             UpstreamMetadata {
                 upstream_remote_filter: upstream_remote,
                 upstream_local_filter: upstream_local,
-                upstream_local_kernel_addr: upstream_local.addr,
+                upstream_local_kernel_addr: upstream_local.to_socket_addr(),
                 evidence_key: crate::net::sock_mgr::SocketEvidenceKey::initial(
                     SocketRole::Upstream,
                     0,
-                    upstream_local.addr,
+                    upstream_local.to_socket_addr(),
                 ),
                 upstream_flow,
                 sock_type: Type::DGRAM,
@@ -348,7 +346,6 @@ mod tests {
                     upstream_policy,
                 )
                 .expect("upstream parser"),
-                upstream_connected: true,
             },
             udp_socket(),
             0,
@@ -357,24 +354,15 @@ mod tests {
 
     #[test]
     fn client_flow_key_compares_udp_and_icmp_explicitly() {
-        let udp_a =
-            ClientFlowKey::Udp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8888)));
-        let udp_b =
-            ClientFlowKey::Udp(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999)));
-        let icmp_a = ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::LOCALHOST,
-            ident: 11,
-        };
-        let icmp_b = ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::LOCALHOST,
-            ident: 22,
-        };
-        let icmp_c = ClientFlowKey::IcmpV6 {
-            ip: Ipv6Addr::LOCALHOST,
-            ident: 11,
-            flowinfo: 0,
-            scope_id: 0,
-        };
+        let udp_a = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8888),
+        )));
+        let udp_b = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999),
+        )));
+        let icmp_a = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 11));
+        let icmp_b = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 22));
+        let icmp_c = ClientFlowKey::Icmp(LogicalEndpoint::from_v6(Ipv6Addr::LOCALHOST, 11, 0, 0));
         assert_ne!(udp_a, udp_b);
         assert_ne!(icmp_a, icmp_b);
         assert_ne!(icmp_a, icmp_c);
@@ -384,23 +372,22 @@ mod tests {
     fn cached_session_control_reply_route_is_built_from_listener_outbound_tuple() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
         let mut handles = test_handles();
-        let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
-        let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
+        let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
+        let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
         let listener = Arc::make_mut(&mut handles.listener);
         listener.listener_flow = SocketLegFlow::new(
             Some(FlowTuple::new(remote, local)),
             Some(FlowTuple::new(local, remote)),
         );
-        listener.flow = Some(ClientFlowKey::Udp(SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            5555,
-        ))));
+        listener.flow = Some(ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555)),
+        )));
 
         let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
         let reply_route = cache
             .session_control_reply_route
             .expect("reply route exists");
-        assert_eq!(reply_route.dest.id, 5555);
+        assert_eq!(reply_route.dest.id(), 5555);
         assert_eq!(reply_route.icmp_source_id(), 8888);
         assert_eq!(reply_route.icmp_advertised_reply_id(), 8888);
     }
@@ -408,7 +395,7 @@ mod tests {
     #[test]
     fn pending_session_control_reply_route_keeps_source_and_reply_ids_distinct() {
         let route = CachedClientState::build_pending_session_control_reply_route(
-            CanonicalAddr::new(
+            LogicalEndpoint::from_socket_addr_with_id(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40001),
                 40001,
             ),
@@ -444,8 +431,8 @@ mod tests {
         let mut handles = test_handles();
         let listener = Arc::make_mut(&mut handles.listener);
         listener.sock_type = Type::RAW;
-        let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
-        let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+        let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
+        let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
         listener.listener_flow = SocketLegFlow::new(
             Some(FlowTuple::new(remote, local)),
             Some(FlowTuple::new(local, remote)),
@@ -469,11 +456,15 @@ mod tests {
         let upstream = Arc::make_mut(&mut handles.upstream);
         upstream.sock_type = Type::RAW;
         // Our "Source Port" (local ID) is 7777
-        upstream.upstream_local_filter =
-            CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), 7777);
+        upstream.upstream_local_filter = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            7777,
+        );
         // Our "Destination Port" (remote ID) is 9999
-        upstream.upstream_remote_filter =
-            CanonicalAddr::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), 9999);
+        upstream.upstream_remote_filter = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            9999,
+        );
 
         let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
 
@@ -490,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_raw_icmp_uses_canonical_remote_id() {
+    fn upstream_raw_icmp_uses_logical_remote_id() {
         let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
         let mut handles = test_handles();
         Arc::make_mut(&mut handles.upstream).sock_type = Type::RAW;

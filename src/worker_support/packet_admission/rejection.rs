@@ -1,6 +1,6 @@
 use crate::cli::RuntimeConfig;
+use crate::endpoint::LogicalEndpoint;
 use crate::net::packet_headers::IcmpMalformedReason;
-use crate::net::params::CanonicalAddr;
 use crate::worker_support::packet_admission::{ReceiveContext, SocketLeg};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub(crate) enum RejectionReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RejectedPacket {
-    pub(crate) normalized_source: Option<CanonicalAddr>,
+    pub(crate) normalized_source: Option<LogicalEndpoint>,
     pub(crate) actual_dst_id: Option<u16>,
     pub(crate) reason: RejectionReason,
 }
@@ -66,7 +66,7 @@ pub(crate) fn log_rejected_packet(
             expected_local_id
         ),
         RejectionReason::UnexpectedLocalReceiveId => {
-            let actual_src_id = rejected.normalized_source.map(|s| s.id);
+            let actual_src_id = rejected.normalized_source.map(LogicalEndpoint::id);
             crate::log_debug_dir!(
                 cfg.debug_logs.drops,
                 worker_id,

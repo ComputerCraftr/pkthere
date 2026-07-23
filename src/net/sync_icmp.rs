@@ -53,8 +53,8 @@ mod tests {
         DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeOptions,
         SupportedProtocol, TimeoutAction, WorkerFlowMode,
     };
+    use crate::endpoint::LogicalEndpoint;
     use crate::net::icmp_sequence::{SharedIcmpSequenceState, reset_sequence_state};
-    use crate::net::params::CanonicalAddr;
     use crate::net::payload::{
         C2uSessionControlDecision, PayloadEvent, U2cDecision, allocate_send_sequence,
         classify_c2u_session_control_event, classify_u2c_event,
@@ -73,8 +73,8 @@ mod tests {
         }
     }
 
-    fn localhost_canonical(id: u16) -> CanonicalAddr {
-        CanonicalAddr::new(
+    fn localhost_endpoint(id: u16) -> LogicalEndpoint {
+        LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, id)),
             id,
         )
@@ -82,13 +82,13 @@ mod tests {
 
     fn test_config() -> RuntimeConfig {
         RuntimeConfig {
-            listen: localhost_canonical(0),
+            listen: localhost_endpoint(0),
             listener_source_id_request: IcmpReplyIdRequest::Default,
             listener_reply_id_request: IcmpReplyIdRequest::Default,
             listen_proto: SupportedProtocol::UDP,
             listen_mode: ListenMode::Dynamic,
             listen_str: String::from("UDP:127.0.0.1:0"),
-            upstream: localhost_canonical(0),
+            upstream: localhost_endpoint(0),
             upstream_source_id_request: IcmpReplyIdRequest::Default,
             upstream_reply_id_request: IcmpReplyIdRequest::Default,
             upstream_proto: SupportedProtocol::ICMP,

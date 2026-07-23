@@ -1,5 +1,6 @@
 use super::{CachedClientState, PacketContext, SequenceContext};
 use crate::cli::RuntimeConfig;
+use crate::endpoint::LogicalEndpoint;
 use crate::flow_state::{FlowRuntimeState, ReplyIdHandshakeAck};
 use crate::net::icmp_sequence::{IcmpSequenceCache, SharedIcmpSequenceState, reset_sequence_state};
 use crate::net::payload::{
@@ -107,7 +108,7 @@ pub(crate) fn send_user_payload_event(
         );
     }
     let source_id = cache.route.icmp_source_id();
-    let local_reply_id = handles.upstream.upstream_local_filter.id;
+    let local_reply_id = handles.upstream.upstream_local_filter.id();
     let reply_id_negotiation =
         reply_id_negotiation_for_c2u(event, flow_state.upstream_reply_id_acked(), local_reply_id);
     if let Some(reply_id_negotiation) = reply_id_negotiation
@@ -172,7 +173,7 @@ pub(crate) fn send_user_payload_event(
             )?;
             let send_res = send_payload(
                 &handles.upstream_sock,
-                handles.upstream.upstream_connected,
+                handles.upstream_connected(),
                 &cache.route.dest_sa,
                 handles.upstream.policy.send_policy,
                 cache.route.source_ip,
@@ -184,7 +185,7 @@ pub(crate) fn send_user_payload_event(
                 &control_event,
                 crate::net::session::SendOutcome {
                     result: &send_res,
-                    socket_connected: handles.upstream.upstream_connected,
+                    socket_connected: handles.upstream_connected(),
                     destination: &cache.route.dest_sa,
                     disconnect: None,
                     trace: None,
@@ -214,7 +215,7 @@ pub(crate) fn send_payload_event_now(
     let reply_id_negotiation = reply_id_negotiation_for_c2u(
         event,
         context.flow_state.upstream_reply_id_acked(),
-        handles.upstream.upstream_local_filter.id,
+        handles.upstream.upstream_local_filter.id(),
     );
     let outbound = match outbound_payload_event(
         event,
@@ -244,7 +245,7 @@ pub(crate) fn send_payload_event_now(
     };
     let send_res = send_payload(
         &handles.upstream_sock,
-        handles.upstream.upstream_connected,
+        handles.upstream_connected(),
         &cache.route.dest_sa,
         handles.upstream.policy.send_policy,
         cache.route.source_ip,
@@ -256,7 +257,7 @@ pub(crate) fn send_payload_event_now(
         event,
         crate::net::session::SendOutcome {
             result: &send_res,
-            socket_connected: handles.upstream.upstream_connected,
+            socket_connected: handles.upstream_connected(),
             destination: &cache.route.dest_sa,
             disconnect: None,
             trace,
@@ -294,7 +295,7 @@ pub(crate) fn send_sync_payload_or_cadence(
             .listener
             .listener_flow
             .outbound_destination()
-            .map(|peer_addr| peer_addr.id)
+            .map(LogicalEndpoint::id)
         else {
             log_debug_dir!(
                 cfg.debug_logs.drops,
@@ -309,7 +310,7 @@ pub(crate) fn send_sync_payload_or_cadence(
     };
 
     let source_id = cache.route.icmp_source_id();
-    let local_reply_id = handles.upstream.upstream_local_filter.id;
+    let local_reply_id = handles.upstream.upstream_local_filter.id();
     let reply_id_negotiation =
         reply_id_negotiation_for_c2u(&event, flow_state.upstream_reply_id_acked(), local_reply_id);
     if let Some(reply_id_negotiation) = reply_id_negotiation
@@ -364,7 +365,7 @@ pub(crate) fn send_sync_payload_or_cadence(
             )?;
             let send_res = send_payload(
                 &handles.upstream_sock,
-                handles.upstream.upstream_connected,
+                handles.upstream_connected(),
                 &cache.route.dest_sa,
                 handles.upstream.policy.send_policy,
                 cache.route.source_ip,
@@ -376,7 +377,7 @@ pub(crate) fn send_sync_payload_or_cadence(
                 &control_event,
                 crate::net::session::SendOutcome {
                     result: &send_res,
-                    socket_connected: handles.upstream.upstream_connected,
+                    socket_connected: handles.upstream_connected(),
                     destination: &cache.route.dest_sa,
                     disconnect: None,
                     trace: None,
@@ -408,7 +409,7 @@ pub(crate) fn send_sync_payload_or_cadence(
     };
     let send_res = send_payload(
         &handles.upstream_sock,
-        handles.upstream.upstream_connected,
+        handles.upstream_connected(),
         &cache.route.dest_sa,
         handles.upstream.policy.send_policy,
         cache.route.source_ip,
@@ -420,7 +421,7 @@ pub(crate) fn send_sync_payload_or_cadence(
         &event,
         crate::net::session::SendOutcome {
             result: &send_res,
-            socket_connected: handles.upstream.upstream_connected,
+            socket_connected: handles.upstream_connected(),
             destination: &cache.route.dest_sa,
             disconnect: None,
             trace,
@@ -451,7 +452,7 @@ pub(crate) fn observe_reply_id_ack(
         _ => return ObserveAckResult::NotAck,
     };
     if explicit_reply_id_ack(icmp) {
-        if icmp.inbound_header_ident() == handles.upstream.upstream_local_filter.id {
+        if icmp.inbound_header_ident() == handles.upstream.upstream_local_filter.id() {
             let peer_reply_id = match icmp.reply_id_negotiation() {
                 Some(negotiation) => negotiation.reply_id,
                 None => icmp.flow_identity().remote_source_id,
@@ -524,7 +525,7 @@ pub(crate) fn observe_reply_id_ack(
                 cfg.debug_logs.drops,
                 "[reply_id_ack] c2u=false filtered ACK before handshake: observed_ack_destination_id={} expected_ack_destination_id={} peer_source_id={} peer_reply_id={:?}",
                 icmp.inbound_header_ident(),
-                handles.upstream.upstream_local_filter.id,
+                handles.upstream.upstream_local_filter.id(),
                 icmp.flow_identity().remote_source_id,
                 icmp.reply_id_negotiation()
                     .map(|negotiation| negotiation.reply_id)
@@ -610,7 +611,7 @@ fn debug_kernel_echo_self_handshake_ack(
     let PayloadEvent::SessionControl { icmp, .. } = event else {
         return false;
     };
-    reflected_kernel_echo_negotiation_matches(icmp, handles.upstream.upstream_local_filter.id)
+    reflected_kernel_echo_negotiation_matches(icmp, handles.upstream.upstream_local_filter.id())
 }
 
 #[inline]
@@ -683,9 +684,9 @@ mod tests {
     use super::ObserveAckResult;
     use super::{UserPayloadRoute, observe_reply_id_ack, record_user_payload_route};
     use crate::cli::SupportedProtocol;
+    use crate::endpoint::LogicalEndpoint;
     use crate::flow_key::SocketLegFlow;
     use crate::flow_state::FlowRuntimeState;
-    use crate::net::params::CanonicalAddr;
     use crate::net::payload::BufferedPayload;
     use crate::net::payload::PayloadEvent;
     use crate::net::sock_mgr::{ListenerMetadata, SocketHandles, UpstreamMetadata};
@@ -701,10 +702,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn test_handles() -> SocketHandles {
-        let upstream_remote =
-            CanonicalAddr::new(SocketAddr::from_str("127.0.0.1:4444").unwrap(), 4444);
-        let upstream_local =
-            CanonicalAddr::new(SocketAddr::from_str("127.0.0.1:5555").unwrap(), 5555);
+        let upstream_remote = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::from_str("127.0.0.1:4444").unwrap(),
+            4444,
+        );
+        let upstream_local = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::from_str("127.0.0.1:5555").unwrap(),
+            5555,
+        );
         let listen_policy = resolve_socket_policy_with_icmp_intent(
             SocketRole::Listener,
             SupportedProtocol::UDP,
@@ -723,8 +728,10 @@ mod tests {
             Domain::IPV4,
             IcmpPolicyIntent::default(),
         );
-        let listen_local_filter =
-            CanonicalAddr::new(SocketAddr::from_str("127.0.0.1:3333").unwrap(), 3333);
+        let listen_local_filter = LogicalEndpoint::from_socket_addr_with_id(
+            SocketAddr::from_str("127.0.0.1:3333").unwrap(),
+            3333,
+        );
         SocketHandles::new(
             ListenerMetadata {
                 flow: None,
@@ -736,7 +743,6 @@ mod tests {
                     0,
                     SocketAddr::from_str("127.0.0.1:3333").unwrap(),
                 ),
-                listener_connected: false,
                 sock_type: Type::DGRAM,
                 policy: listen_policy,
                 parser: crate::net::packet_headers::select_packet_parser(
@@ -750,11 +756,11 @@ mod tests {
             UpstreamMetadata {
                 upstream_remote_filter: upstream_remote,
                 upstream_local_filter: upstream_local,
-                upstream_local_kernel_addr: upstream_local.addr,
+                upstream_local_kernel_addr: upstream_local.to_socket_addr(),
                 evidence_key: crate::net::sock_mgr::SocketEvidenceKey::initial(
                     SocketRole::Upstream,
                     0,
-                    upstream_local.addr,
+                    upstream_local.to_socket_addr(),
                 ),
                 upstream_flow: SocketLegFlow::empty(),
                 sock_type: Type::DGRAM,
@@ -765,7 +771,6 @@ mod tests {
                     upstream_policy,
                 )
                 .expect("upstream parser"),
-                upstream_connected: false,
             },
             Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap(),
             0,
@@ -800,7 +805,7 @@ mod tests {
             bytes: &[],
             icmp: crate::net::payload::IcmpPayloadMeta::new(
                 5555,
-                handles.upstream.upstream_local_filter.id,
+                handles.upstream.upstream_local_filter.id(),
                 1,
                 Some(crate::net::framing_shim::ReplyIdNegotiation {
                     reply_id: 5555,
@@ -845,7 +850,7 @@ mod tests {
         };
         let event = PayloadEvent::user_payload_plain(SupportedProtocol::UDP, b"hello");
         flow_state.begin_upstream_reply_id_handshake(
-            handles.upstream.upstream_local_filter.id,
+            handles.upstream.upstream_local_filter.id(),
             100,
             BufferedPayload::from_event(&event, Some(buffered_trace)),
         );
@@ -855,7 +860,7 @@ mod tests {
             bytes: &[],
             icmp: crate::net::payload::IcmpPayloadMeta::new(
                 7777,
-                handles.upstream.upstream_local_filter.id,
+                handles.upstream.upstream_local_filter.id(),
                 1,
                 Some(crate::net::framing_shim::ReplyIdNegotiation {
                     reply_id: 9999,

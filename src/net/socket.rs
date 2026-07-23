@@ -1,6 +1,7 @@
 use crate::cli::{SupportedProtocol, TimeoutAction};
+use crate::endpoint::LogicalEndpoint;
 use crate::net::icmp_support::choose_upstream_icmp_ids;
-use crate::net::params::CanonicalAddr;
+use crate::net::managed_socket::ManagedSocket;
 use pkthere_socket_policy::{
     IcmpPolicyIntent, ListenerSocketSetupPolicy, ListenerWorkerSocketPolicy,
     ResolvedIcmpSocketPolicy, ResolvedSocketPolicy, SocketCreateSpec, SocketCreationPolicy,
@@ -13,20 +14,18 @@ use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::net::{SocketAddr, ToSocketAddrs};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ListenerEndpointIdentity {
-    logical_local: CanonicalAddr,
+    logical_local: LogicalEndpoint,
     kernel_addr: SocketAddr,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct UpstreamEndpointIdentity {
-    local_filter: CanonicalAddr,
-    remote_filter: CanonicalAddr,
+    local_filter: LogicalEndpoint,
+    remote_filter: LogicalEndpoint,
     local_kernel_addr: SocketAddr,
 }
 
@@ -52,9 +51,9 @@ fn resolve_listener_endpoint_identity(
 ) -> ListenerEndpointIdentity {
     let kernel_id = effective_kernel_id(requested_bind.port(), kernel_local_sa, policy.icmp);
     let logical_local = if requested_bind.port() == 0 {
-        CanonicalAddr::new(requested_bind, kernel_id)
+        LogicalEndpoint::from_socket_addr_with_id(requested_bind, kernel_id)
     } else {
-        CanonicalAddr::from_socket_addr(requested_bind)
+        LogicalEndpoint::from_socket_addr(requested_bind)
     };
 
     ListenerEndpointIdentity {
@@ -104,8 +103,8 @@ fn resolve_upstream_endpoint_identity(
     } else {
         (actual_local_sa.port(), planned_remote_id)
     };
-    let local_filter = CanonicalAddr::new(actual_local_sa, local_id);
-    let remote_filter = CanonicalAddr::new(remote_addr, remote_id);
+    let local_filter = LogicalEndpoint::from_socket_addr_with_id(actual_local_sa, local_id);
+    let remote_filter = LogicalEndpoint::from_socket_addr_with_id(remote_addr, remote_id);
 
     log_debug!(
         debug_handles,
@@ -176,8 +175,8 @@ pub(crate) fn make_socket(
     debug_unconnected: bool,
     allow_debug_kernel_echo_self_handshake: bool,
 ) -> io::Result<(
-    Socket,
-    CanonicalAddr,
+    ManagedSocket,
+    LogicalEndpoint,
     SocketAddr,
     Type,
     ResolvedSocketPolicy,
@@ -218,7 +217,7 @@ pub(crate) fn make_socket(
     let identity = resolve_listener_endpoint_identity(bind_addr, kernel_local_sa, policy);
 
     Ok((
-        sock,
+        ManagedSocket::new(sock),
         identity.logical_local,
         identity.kernel_addr,
         sock_type,
@@ -322,7 +321,7 @@ fn resolve_route_local_ip(dest: SocketAddr) -> io::Result<IpAddr> {
 /// Create and connect a socket suitable for forwarding data to `dest`.
 #[derive(Clone, Copy)]
 pub(crate) struct UpstreamSocketRequest {
-    pub(crate) dest: CanonicalAddr,
+    pub(crate) dest: LogicalEndpoint,
     pub(crate) proto: SupportedProtocol,
     pub(crate) req_local_id: u16,
     pub(crate) timeout_act: TimeoutAction,
@@ -335,9 +334,9 @@ pub(crate) struct UpstreamSocketRequest {
 pub(crate) fn make_upstream_socket_for(
     request: UpstreamSocketRequest,
 ) -> io::Result<(
-    Socket,
-    CanonicalAddr,
-    CanonicalAddr,
+    ManagedSocket,
+    LogicalEndpoint,
+    LogicalEndpoint,
     SocketAddr,
     Type,
     ResolvedSocketPolicy,
@@ -352,10 +351,10 @@ pub(crate) fn make_upstream_socket_for(
         allow_debug_kernel_echo_self_handshake,
         debug_handles,
     } = request;
-    let domain = Domain::for_address(dest.addr);
+    let domain = dest.domain();
     let is_icmp = proto == SupportedProtocol::ICMP;
     let force_raw_wildcard =
-        is_icmp && force_raw_wildcard_icmp && dest.id == 0 && req_local_id == 0;
+        is_icmp && force_raw_wildcard_icmp && dest.id() == 0 && req_local_id == 0;
     if force_raw_wildcard_icmp && !force_raw_wildcard {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -364,7 +363,7 @@ pub(crate) fn make_upstream_socket_for(
     }
 
     let creation =
-        upstream_socket_creation_policy(proto, domain, dest.id, req_local_id, force_raw_wildcard);
+        upstream_socket_creation_policy(proto, domain, dest.id(), req_local_id, force_raw_wildcard);
     let (sock, created) = create_socket_from_policy(creation).map_err(|err| {
         if force_raw_wildcard {
             io::Error::new(
@@ -385,7 +384,7 @@ pub(crate) fn make_upstream_socket_for(
         sock_type,
         timeout_act,
         debug_unconnected,
-        Domain::for_address(dest.addr),
+        dest.domain(),
         IcmpPolicyIntent {
             disable_disjoint_ids: force_raw_wildcard || allow_debug_kernel_echo_self_handshake,
             allow_debug_kernel_echo_self_handshake,
@@ -395,8 +394,8 @@ pub(crate) fn make_upstream_socket_for(
     // Resolve any IDs needed before connect/bind. ICMP DGRAM wildcard stays
     // at 0 here so the kernel can assign the concrete ping-socket ID.
     let (planned_local_id, planned_remote_id) =
-        resolve_upstream_pre_socket_ids(req_local_id, dest.id, policy, debug_handles);
-    let final_dest = CanonicalAddr::new(dest.addr, planned_remote_id);
+        resolve_upstream_pre_socket_ids(req_local_id, dest.id(), policy, debug_handles);
+    let final_dest = dest.with_id(planned_remote_id);
     let should_connect = policy.reuse.starts_connected();
 
     set_best_effort_socket_buffers(&sock);
@@ -416,17 +415,14 @@ pub(crate) fn make_upstream_socket_for(
             };
             sock.bind(&SockAddr::from(SocketAddr::new(bind_ip, bind_id)))?;
         }
-        // Connect
-        let dest_sa = final_dest.as_sock_addr();
-        sock.connect(&dest_sa)?;
     } else {
         // Bind to get a local address/port assigned for unconnected paths.
         // Without this, send_to/recv_from sockets can retain port 0 until the
         // first outbound send, which breaks stats identity, admission checks,
         // and debug tests that inject traffic at the published local address.
-        let bind_ip = resolve_route_local_ip(dest.addr)?;
+        let bind_ip = resolve_route_local_ip(dest.to_socket_addr())?;
         let kernel_bind_id =
-            if is_icmp && sock_type == Type::DGRAM && req_local_id == 0 && dest.id == 0 {
+            if is_icmp && sock_type == Type::DGRAM && req_local_id == 0 && dest.id() == 0 {
                 0
             } else {
                 planned_local_id
@@ -437,6 +433,13 @@ pub(crate) fn make_upstream_socket_for(
             _ => return Err(io::Error::other("RAW bind IP family mismatch")),
         };
         sock.bind(&SockAddr::from(bind_addr))?;
+    }
+
+    apply_post_bind_policy(&sock, socket_post_bind_policy(created.path))?;
+    let sock = ManagedSocket::new(sock);
+    if should_connect {
+        sock.connect_unconnected(final_dest.to_socket_addr())
+            .map_err(io::Error::other)?;
     }
 
     let actual_local_sa = sock
@@ -450,10 +453,8 @@ pub(crate) fn make_upstream_socket_for(
         ));
     }
 
-    apply_post_bind_policy(&sock, socket_post_bind_policy(created.path))?;
-
     let identity = resolve_upstream_endpoint_identity(
-        dest.addr,
+        dest.to_socket_addr(),
         planned_local_id,
         planned_remote_id,
         actual_local_sa,
@@ -489,102 +490,6 @@ pub(crate) const fn family_changed(a: SocketAddr, b: SocketAddr) -> bool {
         (a, b),
         (SocketAddr::V4(_), SocketAddr::V4(_)) | (SocketAddr::V6(_), SocketAddr::V6(_))
     )
-}
-
-/// Disconnect a connected UDP socket so it returns to wildcard receive state.
-///
-/// macOS/*BSD man page: datagram sockets may dissolve the association by
-/// connecting to an invalid address (NULL or AF_UNSPEC). The error
-/// EAFNOSUPPORT may be harmlessly returned; consider it success.
-#[cfg(unix)]
-pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
-    let fd = sock.as_raw_fd();
-
-    // --- macOS / iOS / *BSD: AF_UNSPEC is sufficient. ---
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-    ))]
-    {
-        // sockaddr WITH sa_len on these platforms
-        let addr = libc::sockaddr {
-            sa_len: std::mem::size_of::<libc::sockaddr>() as u8,
-            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
-            sa_data: [0; 14],
-        };
-        let rc = connect_with_raw_sockaddr(fd, &addr, addr.sa_len as libc::socklen_t);
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = io::Error::last_os_error();
-        if matches!(err.raw_os_error(), Some(code) if code == libc::EAFNOSUPPORT) {
-            // macOS/*BSD man page: harmless when disconnecting UDP
-            Ok(())
-        } else {
-            Err(err)
-        }
-    }
-
-    // --- Linux/Android: AF_UNSPEC is the standard way; no sa_len field. ---
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly",
-    )))]
-    {
-        let addr = libc::sockaddr {
-            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
-            sa_data: [0; 14],
-        };
-        let rc = connect_with_raw_sockaddr(
-            fd,
-            &addr,
-            std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
-        );
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-#[cfg(unix)]
-fn connect_with_raw_sockaddr(
-    fd: std::os::fd::RawFd,
-    addr: &libc::sockaddr,
-    len: libc::socklen_t,
-) -> libc::c_int {
-    unsafe { libc::connect(fd, addr as *const libc::sockaddr, len) }
-}
-
-/// Windows: disconnect a UDP socket by connecting to INADDR_ANY/IN6ADDR_ANY and port 0.
-#[cfg(windows)]
-pub(crate) fn disconnect_socket(sock: &Socket) -> io::Result<()> {
-    let local = sock.local_addr()?;
-    let any_std = match local.as_socket() {
-        Some(SocketAddr::V6(_)) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-    };
-    // Winsock treats connect(INADDR_ANY/IN6ADDR_ANY:0) as clearing the UDP peer
-    let any = SockAddr::from(any_std);
-    sock.connect(&any)
-}
-
-/// Fallback: not supported on this platform.
-#[cfg(all(not(unix), not(windows)))]
-pub(crate) fn disconnect_socket(_sock: &Socket) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "Function disconnect_socket is not supported on this OS",
-    ))
 }
 
 #[cfg(test)]

@@ -36,14 +36,21 @@ impl FlowClaimTable {
 #[cfg(test)]
 mod tests {
     use super::FlowClaimTable;
+    use crate::endpoint::LogicalEndpoint;
     use crate::flow_key::ClientFlowKey;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn distinct_flows_can_be_claimed_by_distinct_workers() {
         let claims = FlowClaimTable::new();
-        let a = ClientFlowKey::Udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1000));
-        let b = ClientFlowKey::Udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001));
+        let a = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1000,
+        )));
+        let b = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1001,
+        )));
         assert!(claims.try_claim(a, 0));
         assert!(claims.try_claim(b, 1));
     }
@@ -51,7 +58,10 @@ mod tests {
     #[test]
     fn same_flow_is_claimed_by_only_one_worker() {
         let claims = FlowClaimTable::new();
-        let flow = ClientFlowKey::Udp(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1000));
+        let flow = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            1000,
+        )));
         assert!(claims.try_claim(flow, 0));
         assert!(!claims.try_claim(flow, 1));
         claims.release(flow, 0);

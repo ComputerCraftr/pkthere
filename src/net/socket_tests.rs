@@ -4,7 +4,7 @@ use super::{
     resolve_upstream_pre_socket_ids,
 };
 use crate::cli::{SupportedProtocol, TimeoutAction::Drop};
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
 use pkthere_socket_policy::{
     IcmpPolicyIntent, ResolvedSocketPolicy, SocketRole, listener_worker_socket_policy,
     resolve_socket_policy_with_icmp_intent,
@@ -29,7 +29,7 @@ fn test_policy(
     )
 }
 
-fn upstream_request(dest: CanonicalAddr, proto: SupportedProtocol) -> UpstreamSocketRequest {
+fn upstream_request(dest: LogicalEndpoint, proto: SupportedProtocol) -> UpstreamSocketRequest {
     UpstreamSocketRequest {
         dest,
         proto,
@@ -71,7 +71,7 @@ fn listener_endpoint_identity_resolves_udp_dynamic_port() {
 
     assert_eq!(
         identity.logical_local,
-        CanonicalAddr::from_socket_addr(kernel)
+        LogicalEndpoint::from_socket_addr(kernel)
     );
     assert_eq!(identity.kernel_addr, kernel);
 }
@@ -89,7 +89,7 @@ fn listener_endpoint_identity_ignores_untrusted_raw_kernel_id() {
 
     assert_eq!(
         identity.logical_local,
-        CanonicalAddr::from_socket_addr(requested)
+        LogicalEndpoint::from_socket_addr(requested)
     );
     assert_eq!(identity.kernel_addr, kernel);
 }
@@ -105,7 +105,10 @@ fn listener_endpoint_identity_preserves_wildcard_raw_listener_id() {
         test_policy(SocketRole::Listener, SupportedProtocol::ICMP, Type::RAW),
     );
 
-    assert_eq!(identity.logical_local, CanonicalAddr::new(requested, 0));
+    assert_eq!(
+        identity.logical_local,
+        LogicalEndpoint::from_socket_addr_with_id(requested, 0)
+    );
     assert_eq!(identity.kernel_addr, kernel);
 }
 
@@ -124,11 +127,11 @@ fn upstream_endpoint_identity_resolves_udp_dynamic_local_port() {
 
     assert_eq!(
         identity.local_filter,
-        CanonicalAddr::from_socket_addr(actual_local)
+        LogicalEndpoint::from_socket_addr(actual_local)
     );
     assert_eq!(
         identity.remote_filter,
-        CanonicalAddr::from_socket_addr(remote)
+        LogicalEndpoint::from_socket_addr(remote)
     );
     assert_eq!(identity.local_kernel_addr, actual_local);
 }
@@ -148,8 +151,8 @@ fn upstream_icmp_dgram_wildcard_defers_then_collapses_to_kernel_id() {
     let actual_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5678);
     let identity = resolve_upstream_endpoint_identity(remote, 0, 0, actual_local, policy, false);
 
-    assert_eq!(identity.local_filter.id, 5678);
-    assert_eq!(identity.remote_filter.id, 5678);
+    assert_eq!(identity.local_filter.id(), 5678);
+    assert_eq!(identity.remote_filter.id(), 5678);
     assert_eq!(identity.local_kernel_addr.port(), 5678);
 }
 
@@ -192,8 +195,8 @@ fn raw_icmp_endpoint_identity_falls_back_when_kernel_reports_zero_id() {
     let identity =
         resolve_upstream_endpoint_identity(remote, 1202, 1101, actual_local, policy, false);
 
-    assert_eq!(identity.local_filter.id, 1202);
-    assert_eq!(identity.remote_filter.id, 1101);
+    assert_eq!(identity.local_filter.id(), 1202);
+    assert_eq!(identity.remote_filter.id(), 1101);
     assert_eq!(identity.local_kernel_addr.port(), actual_local.port());
 }
 
@@ -223,8 +226,8 @@ fn upstream_endpoint_identity_ignores_untrusted_raw_kernel_id() {
     let identity =
         resolve_upstream_endpoint_identity(remote, 1202, 1101, actual_local, policy, false);
 
-    assert_eq!(identity.local_filter.id, 1202);
-    assert_eq!(identity.remote_filter.id, 1101);
+    assert_eq!(identity.local_filter.id(), 1202);
+    assert_eq!(identity.remote_filter.id(), 1101);
     assert_eq!(identity.local_kernel_addr.port(), actual_local.port());
 }
 
@@ -235,7 +238,7 @@ fn test_make_upstream_socket_local_id_assigned() {
     // ICMP datagram sockets are not the default connected path.
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     let (dest, proto) = (
-        CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)),
+        LogicalEndpoint::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9)),
         SupportedProtocol::UDP,
     );
 
@@ -243,7 +246,7 @@ fn test_make_upstream_socket_local_id_assigned() {
     // ICMP datagram sockets are the normal connected upstream path.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     let (dest, proto) = (
-        CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
+        LogicalEndpoint::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)),
         SupportedProtocol::ICMP,
     );
 
@@ -258,12 +261,13 @@ fn test_make_upstream_socket_local_id_assigned() {
     );
     if proto == SupportedProtocol::ICMP && cfg!(any(target_os = "linux", target_os = "android")) {
         assert_eq!(
-            local.id, remote.id,
+            local.id(),
+            remote.id(),
             "DGRAM wildcard ICMP should be collapsed when concrete or still deferred"
         );
     } else {
-        assert_ne!(remote.id, 0, "Remote canonical ID should be nonzero");
-        assert_ne!(local.id, 0, "Local canonical ID should be assigned");
+        assert_ne!(remote.id(), 0, "remote logical ID should be nonzero");
+        assert_ne!(local.id(), 0, "local logical ID should be assigned");
     }
     let policy = resolve_socket_policy_with_icmp_intent(
         SocketRole::Upstream,
@@ -280,13 +284,14 @@ fn test_make_upstream_socket_local_id_assigned() {
     #[cfg(not(any(target_os = "macos")))]
     assert_eq!(
         sock.local_addr().unwrap().as_socket().unwrap().port(),
-        local.id
+        local.id()
     );
 }
 
 #[test]
 fn debug_forced_raw_wildcard_upstream_uses_collapsed_ids_when_available() {
-    let dest = CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let dest =
+        LogicalEndpoint::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
     let result = make_upstream_socket_for(UpstreamSocketRequest {
         force_raw_wildcard_icmp: true,
         ..upstream_request(dest, SupportedProtocol::ICMP)
@@ -298,8 +303,8 @@ fn debug_forced_raw_wildcard_upstream_uses_collapsed_ids_when_available() {
     };
 
     assert_eq!(sock_type, Type::RAW);
-    assert_ne!(local.id, 0);
-    assert_eq!(local.id, remote.id);
+    assert_ne!(local.id(), 0);
+    assert_eq!(local.id(), remote.id());
     let icmp_policy = policy.icmp.expect("ICMP policy");
     assert!(
         !icmp_policy.can_honor_disjoint_ids(),
@@ -313,14 +318,15 @@ fn debug_forced_raw_wildcard_upstream_uses_collapsed_ids_when_available() {
 
 #[test]
 fn connected_udp_upstream_local_identity_is_concrete_immediately() {
-    let dest = CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
+    let dest =
+        LogicalEndpoint::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
     let (_sock, local, _remote, _local_kernel_addr, sock_type, connected) =
         make_upstream_socket_for(upstream_request(dest, SupportedProtocol::UDP))
             .expect("connected udp upstream socket");
     assert_eq!(sock_type, Type::DGRAM);
     assert!(connected.reuse.starts_connected());
     assert!(
-        !local.addr.ip().is_unspecified(),
+        !local.ip().is_unspecified(),
         "Connected UDP upstream local identity should be concrete immediately"
     );
 }
@@ -340,11 +346,11 @@ fn udp_listener_reports_logical_and_kernel_identity() {
     .expect("udp listener socket");
 
     assert_eq!(sock_type, Type::DGRAM);
-    assert_eq!(logical, CanonicalAddr::from_socket_addr(kernel));
-    assert_eq!(logical.addr.ip(), listen_addr.ip());
+    assert_eq!(logical, LogicalEndpoint::from_socket_addr(kernel));
+    assert_eq!(logical.ip(), listen_addr.ip());
     assert_eq!(kernel.ip(), listen_addr.ip());
-    assert!(!logical.addr.ip().is_unspecified());
-    assert_ne!(logical.id, 0);
+    assert!(!logical.ip().is_unspecified());
+    assert_ne!(logical.id(), 0);
 }
 
 #[test]
@@ -357,12 +363,14 @@ fn upstream_connectedness_matches_platform_policy() {
 
     for proto in protocols {
         let dest = match proto {
-            SupportedProtocol::UDP => {
-                CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9))
-            }
-            SupportedProtocol::ICMP => {
-                CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            }
+            SupportedProtocol::UDP => LogicalEndpoint::from_socket_addr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                9,
+            )),
+            SupportedProtocol::ICMP => LogicalEndpoint::from_socket_addr(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+            )),
         };
 
         let (_sock, _local, _remote, _local_kernel_addr, sock_type, connected_policy) =
@@ -373,7 +381,7 @@ fn upstream_connectedness_matches_platform_policy() {
             sock_type,
             Drop,
             false,
-            Domain::for_address(dest.addr),
+            dest.domain(),
             IcmpPolicyIntent::default(),
         );
         assert_eq!(
@@ -386,7 +394,8 @@ fn upstream_connectedness_matches_platform_policy() {
 
 #[test]
 fn debug_unconnected_forces_otherwise_connected_upstream_unconnected() {
-    let dest = CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
+    let dest =
+        LogicalEndpoint::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9));
     let (_sock, _local, _remote, _local_kernel_addr, _sock_type, connected) =
         make_upstream_socket_for(UpstreamSocketRequest {
             debug_unconnected: true,
@@ -404,7 +413,7 @@ fn debug_unconnected_upstream_binds_a_concrete_local_port() {
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => return,
         Err(err) => panic!("bind UDP probe socket: {err}"),
     };
-    let dest = CanonicalAddr::from_socket_addr(probe.local_addr().expect("probe UDP local addr"));
+    let dest = LogicalEndpoint::from_socket_addr(probe.local_addr().expect("probe UDP local addr"));
     let (_sock, local, _remote, local_kernel_addr, _sock_type, connected) =
         make_upstream_socket_for(UpstreamSocketRequest {
             debug_unconnected: true,
@@ -412,13 +421,14 @@ fn debug_unconnected_upstream_binds_a_concrete_local_port() {
         })
         .expect("debug unconnected upstream socket");
     assert!(!connected.reuse.starts_connected());
-    assert_ne!(local.addr.port(), 0);
+    assert_ne!(local.id(), 0);
     assert_ne!(local_kernel_addr.port(), 0);
 }
 
 #[test]
 fn kernel_echo_self_handshake_policy_disables_disjoint_ids() {
-    let dest = CanonicalAddr::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
+    let dest =
+        LogicalEndpoint::from_socket_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
     let (_, _, _, _, _, policy) = make_upstream_socket_for(UpstreamSocketRequest {
         allow_debug_kernel_echo_self_handshake: true,
         ..upstream_request(dest, SupportedProtocol::ICMP)
@@ -444,7 +454,7 @@ fn fixed_collapsed_icmp_upstream_preserves_requested_ping_id() {
         .port();
     drop(id_allocator);
 
-    let destination = CanonicalAddr::new(
+    let destination = LogicalEndpoint::from_socket_addr_with_id(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), requested_id),
         requested_id,
     );
@@ -456,8 +466,8 @@ fn fixed_collapsed_icmp_upstream_preserves_requested_ping_id() {
         .expect("create fixed collapsed ICMP DGRAM upstream");
 
     assert_eq!(socket_type, Type::DGRAM);
-    assert_eq!(local.id, requested_id);
-    assert_eq!(remote.id, requested_id);
+    assert_eq!(local.id(), requested_id);
+    assert_eq!(remote.id(), requested_id);
     if kernel_local.port() != 0 {
         assert_eq!(kernel_local.port(), requested_id);
     }
@@ -470,7 +480,7 @@ fn unconnected_kernel_echo_wildcard_uses_platform_socket_mode_and_logical_id() {
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
     ] {
-        let dest = CanonicalAddr::from_socket_addr(SocketAddr::new(destination_ip, 0));
+        let dest = LogicalEndpoint::from_socket_addr(SocketAddr::new(destination_ip, 0));
         let result = make_upstream_socket_for(UpstreamSocketRequest {
             debug_unconnected: true,
             allow_debug_kernel_echo_self_handshake: true,
@@ -504,10 +514,10 @@ fn unconnected_kernel_echo_wildcard_uses_platform_socket_mode_and_logical_id() {
         );
         assert!(!policy.reuse.starts_connected());
         assert!(!local_kernel_addr.ip().is_unspecified());
-        assert_ne!(local.id, 0);
-        assert_eq!(remote.id, local.id);
+        assert_ne!(local.id(), 0);
+        assert_eq!(remote.id(), local.id());
         if socket_type == Type::DGRAM && local_kernel_addr.port() != 0 {
-            assert_eq!(local.id, local_kernel_addr.port());
+            assert_eq!(local.id(), local_kernel_addr.port());
         } else if socket_type == Type::RAW {
             assert_eq!(local_kernel_addr.port(), 0);
         }

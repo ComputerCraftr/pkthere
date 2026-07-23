@@ -416,6 +416,18 @@ impl ListenerWorkerSocketPolicy {
             ListenerWorkerDistribution::UnsupportedSeparateState
         )
     }
+
+    /// Whether each listener socket should establish a kernel peer association
+    /// after the logical client flow locks.
+    ///
+    /// Shared-state worker sockets retain source metadata and enforce the
+    /// shared flow in admission because multiple reused listeners cannot
+    /// portably associate with the same peer.
+    #[inline]
+    pub const fn connects_after_lock(self, socket_policy: ResolvedSocketPolicy) -> bool {
+        socket_policy.reuse.connects_after_lock()
+            && !matches!(self.distribution, ListenerWorkerDistribution::SharedState)
+    }
 }
 
 #[inline]

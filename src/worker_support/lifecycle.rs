@@ -239,7 +239,7 @@ pub(crate) fn run_watchdog_thread(
                         let ver = match mgr.clear_client_lock(prev) {
                             Ok(v) => v,
                             Err(e) => {
-                                log_error!("watchdog disconnect_socket failed: {}", e);
+                                log_error!("watchdog client-lock cleanup failed: {}", e);
                                 exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
                                 return;
                             }

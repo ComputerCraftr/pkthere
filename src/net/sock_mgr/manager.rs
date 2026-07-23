@@ -1,16 +1,14 @@
 use crate::cli::{IcmpReplyIdRequest, SupportedProtocol, TimeoutAction};
+use crate::endpoint::LogicalEndpoint;
 use crate::flow_key::{ClientFlowKey, SocketLegFlow};
 use crate::net::icmp_support::choose_upstream_icmp_ids;
+use crate::net::managed_socket::AssociationState;
 use crate::net::packet_headers::select_packet_parser;
-use crate::net::params::CanonicalAddr;
 use crate::net::socket::{
-    UpstreamSocketRequest, disconnect_socket, family_changed, make_socket,
-    make_upstream_socket_for, resolve_first,
+    UpstreamSocketRequest, family_changed, make_socket, make_upstream_socket_for, resolve_first,
 };
 use pkthere_socket_policy::SocketEvidenceKey;
 use pkthere_socket_policy::{ListenerWorkerSocketPolicy, ResolvedSocketPolicy, SocketRole};
-use socket2::SockAddr;
-
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering as AtomOrdering};
@@ -86,14 +84,14 @@ impl SocketManager {
     fn normalized_upstream_local_after_getsockname(
         &self,
         requested_local_id: u16,
-        remote: CanonicalAddr,
+        remote: LogicalEndpoint,
         actual_local_addr: SocketAddr,
         policy: ResolvedSocketPolicy,
-    ) -> CanonicalAddr {
+    ) -> LogicalEndpoint {
         let id = if let Some(icmp_policy) = policy.icmp {
             choose_upstream_icmp_ids(
                 requested_local_id,
-                remote.id,
+                remote.id(),
                 actual_local_addr.port(),
                 icmp_policy,
                 self.debug_handles,
@@ -102,7 +100,50 @@ impl SocketManager {
         } else {
             actual_local_addr.port()
         };
-        CanonicalAddr::new(actual_local_addr, id)
+        LogicalEndpoint::from_socket_addr_with_id(actual_local_addr, id)
+    }
+
+    fn replace_listener_after_transition_failure(
+        &self,
+        state: &mut ClientListenState,
+        operation: &'static str,
+    ) -> io::Result<()> {
+        let (replacement, logical_local, kernel_addr, socket_type, policy) = make_socket(
+            state.listen_local_filter.to_socket_addr(),
+            self.listen_proto,
+            1000,
+            self.listen_worker_socket_policy,
+            self.timeout_action,
+            self.listen_debug_unconnected,
+            self.upstream_icmp_kernel_echo_self_handshake,
+        )?;
+        let parser = select_packet_parser(
+            self.listen_proto,
+            socket2::Domain::for_address(kernel_addr),
+            policy,
+        )?;
+        state.sock = replacement;
+        state.listen_local_filter = logical_local;
+        state.listen_local_kernel_addr = kernel_addr;
+        state.evidence_key = state.evidence_key.replacement(kernel_addr);
+        state.sock_type = socket_type;
+        state.policy = policy;
+        state.parser = parser;
+        state.flow = None;
+        state.listener_flow = SocketLegFlow::empty();
+        if self.debug_handles {
+            log_debug!(
+                true,
+                "socket-evidence {}",
+                socket_evidence_json(
+                    state.evidence_key,
+                    operation,
+                    &self.listen_target,
+                    kernel_addr,
+                )
+            );
+        }
+        Ok(())
     }
 
     pub fn new(init: SocketManagerInit) -> io::Result<Self> {
@@ -197,7 +238,6 @@ impl SocketManager {
                     evidence_key: listen_evidence_key,
                     flow: None,
                     listener_flow: SocketLegFlow::empty(),
-                    listener_connected: listen_policy.reuse.starts_connected(),
                     sock_type: listen_sock_type,
                     policy: listen_policy,
                     parser: listen_parser,
@@ -219,7 +259,6 @@ impl SocketManager {
                         upstream_source_id_request,
                         upstream_remote,
                     ),
-                    upstream_connected: upstream_policy.reuse.starts_connected(),
                     sock_type: upstream_sock_type,
                     policy: upstream_policy,
                     parser: upstream_parser,
@@ -259,87 +298,85 @@ impl SocketManager {
         }
     }
 
-    /// Whether the listener socket is currently connected to a client.
-    #[inline]
-    pub fn get_listener_connected(&self) -> bool {
-        self.client_listen.lock().unwrap().listener_connected
-    }
-
-    /// Update the locked client address/connected state and publish a new version.
-    ///
-    /// Returns `prev_ver + 1` so callers with a stale cached version stay stale
-    /// and will refresh on the next hot-path check, even if other updates raced
-    /// and advanced the global version further.
-    #[inline]
-    pub fn set_listener_remote_connected(
+    /// Establish a client flow transaction. Socket association succeeds before
+    /// any flow metadata or version becomes visible.
+    pub fn establish_client_flow(
         &self,
-        flow: Option<ClientFlowKey>,
+        flow: ClientFlowKey,
         listener_flow: SocketLegFlow,
-        listener_connected: bool,
-        prev_ver: u64,
-    ) -> u64 {
-        let mut cl_guard = self.client_listen.lock().unwrap();
-        cl_guard.flow = flow;
-        cl_guard.listener_flow = listener_flow;
-        cl_guard.listener_connected = listener_connected;
-        self.publish_version(true);
-        prev_ver + 1
-    }
-
-    /// Update the locked client address and connect the listener socket.
-    #[inline]
-    pub fn set_client_sock_connected(
-        &self,
-        flow: Option<ClientFlowKey>,
-        listener_flow: SocketLegFlow,
-        listener_connected: bool,
-        client_sa: &SockAddr,
+        connect_socket: bool,
+        client: SocketAddr,
         prev_ver: u64,
     ) -> io::Result<u64> {
         let mut cl_guard = self.client_listen.lock().unwrap();
-        cl_guard.flow = flow;
-        cl_guard.listener_flow = listener_flow;
-        cl_guard.listener_connected = listener_connected;
-        self.publish_version(true);
-        if listener_connected {
-            cl_guard.sock.connect(client_sa)?;
+        if !connect_socket && cl_guard.sock.is_connected() {
+            return Err(io::Error::other(
+                "listener policy requested an unconnected lock on an associated socket",
+            ));
         }
+        if connect_socket && let Err(transition_error) = cl_guard.sock.connect_unconnected(client) {
+            self.replace_listener_after_transition_failure(
+                &mut cl_guard,
+                "replace-after-connect-failure",
+            )
+            .map_err(|replacement_error| {
+                io::Error::other(format!(
+                    "listener connect failed ({transition_error}); replacement also failed: {replacement_error}"
+                ))
+            })?;
+            self.publish_version(true);
+            return Err(io::Error::other(transition_error));
+        }
+        cl_guard.flow = Some(flow);
+        cl_guard.listener_flow = listener_flow;
+        self.publish_version(true);
         Ok(prev_ver + 1)
     }
 
-    /// Update the locked client address and disconnect the listener socket.
-    #[inline]
-    pub fn set_client_sock_disconnected(
+    /// Reconcile a connected-send `EDESTADDRREQ` observation with kernel state.
+    /// Metadata is unchanged because the flow remains valid for `send_to`.
+    pub fn reconcile_client_destination_required(
         &self,
-        flow: Option<ClientFlowKey>,
-        listener_flow: SocketLegFlow,
-        listener_connected: bool,
+        observed: AssociationState,
         prev_ver: u64,
     ) -> io::Result<u64> {
-        let mut cl_guard = self.client_listen.lock().unwrap();
-        cl_guard.flow = flow;
-        cl_guard.listener_flow = listener_flow;
-        cl_guard.listener_connected = listener_connected;
-        self.publish_version(true);
-        if !listener_connected {
-            // Use a clone because the original may not be marked as connected.
-            disconnect_socket(&cl_guard.sock.try_clone()?)?;
+        let cl_guard = self.client_listen.lock().unwrap();
+        let changed = cl_guard
+            .sock
+            .reconcile_destination_required(observed)
+            .map_err(io::Error::other)?;
+        if changed {
+            self.publish_version(true);
+            Ok(prev_ver + 1)
+        } else {
+            Ok(prev_ver)
         }
-        Ok(prev_ver + 1)
     }
 
     #[inline]
     pub fn clear_client_lock(&self, prev_ver: u64) -> io::Result<u64> {
-        if self.get_listener_connected() {
-            self.set_client_sock_disconnected(None, SocketLegFlow::empty(), false, prev_ver)
-        } else {
-            Ok(self.set_listener_remote_connected(None, SocketLegFlow::empty(), false, prev_ver))
+        let mut cl_guard = self.client_listen.lock().unwrap();
+        if cl_guard.sock.is_connected()
+            && let Err(disconnect_error) = cl_guard.sock.disconnect_connected()
+        {
+            log_warn!(
+                "listener disconnect failed ({}); replacing listener socket",
+                disconnect_error
+            );
+            self.replace_listener_after_transition_failure(
+                &mut cl_guard,
+                "replace-after-disconnect-failure",
+            )?;
         }
+        cl_guard.flow = None;
+        cl_guard.listener_flow = SocketLegFlow::empty();
+        self.publish_version(true);
+        Ok(prev_ver + 1)
     }
 
     /// Current listener local filter address.
     #[inline]
-    pub fn get_listen_addr(&self) -> CanonicalAddr {
+    pub fn get_listen_addr(&self) -> LogicalEndpoint {
         self.client_listen.lock().unwrap().listen_local_filter
     }
 
@@ -347,16 +384,16 @@ impl SocketManager {
     #[inline]
     pub fn get_client_dest(&self) -> (Option<ClientFlowKey>, bool, SupportedProtocol) {
         let cl = self.client_listen.lock().unwrap();
-        (cl.flow, cl.listener_connected, self.listen_proto)
+        (cl.flow, cl.sock.is_connected(), self.listen_proto)
     }
 
     /// Snapshot the current upstream destination and protocol.
     #[inline]
-    pub fn get_upstream_dest(&self) -> (CanonicalAddr, bool, SupportedProtocol) {
+    pub fn get_upstream_dest(&self) -> (LogicalEndpoint, bool, SupportedProtocol) {
         let up = self.upstream_state.lock().unwrap();
         (
             up.upstream_remote_filter,
-            up.upstream_connected,
+            up.sock.is_connected(),
             self.upstream_proto,
         )
     }
@@ -365,10 +402,15 @@ impl SocketManager {
     pub fn snapshot_state(&self) -> SocketStateSnapshot {
         let cl = self.client_listen.lock().unwrap();
         let up = self.upstream_state.lock().unwrap();
+        #[cfg(debug_assertions)]
+        {
+            cl.sock.assert_kernel_association();
+            up.sock.assert_kernel_association();
+        }
         SocketStateSnapshot {
             locked_flow: cl.flow,
             listener_flow: cl.listener_flow,
-            listener_connected: cl.listener_connected,
+            listener_connected: cl.sock.is_connected(),
             client_proto: self.listen_proto,
             listen_local_filter: cl.listen_local_filter,
             listen_local_kernel_addr: cl.listen_local_kernel_addr,
@@ -380,7 +422,7 @@ impl SocketManager {
             upstream_local_kernel_addr: up.upstream_local_kernel_addr,
             upstream_evidence_key: up.evidence_key,
             upstream_flow: up.upstream_flow,
-            upstream_connected: up.upstream_connected,
+            upstream_connected: up.sock.is_connected(),
             upstream_proto: self.upstream_proto,
             upstream_sock_type: up.sock_type,
             upstream_policy: up.policy,
@@ -394,12 +436,12 @@ impl SocketManager {
     ) -> io::Result<ReresolveResult<UpstreamMetadata>> {
         let mut up_guard = self.upstream_state.lock().unwrap();
         let prev_addr = up_guard.upstream_remote_filter;
-        let prev_connected = up_guard.upstream_connected;
+        let prev_connected = up_guard.sock.is_connected();
         let prev_policy = up_guard.policy;
         let (fresh, action) = match endpoint_override {
             Some(addr) => decide_upstream_endpoint_update(
                 prev_addr,
-                CanonicalAddr::from_socket_addr(addr),
+                LogicalEndpoint::from_socket_addr(addr),
                 prev_connected,
                 prev_policy,
             ),
@@ -412,11 +454,12 @@ impl SocketManager {
         };
 
         let changed = action != ReresolveAction::NoChange;
-        let fam_flip = changed && family_changed(prev_addr.addr, fresh.addr);
+        let fam_flip =
+            changed && family_changed(prev_addr.to_socket_addr(), fresh.to_socket_addr());
 
         match action {
             ReresolveAction::NoChange => Ok(ReresolveResult {
-                sock: up_guard.sock.try_clone()?,
+                sock: up_guard.sock.clone(),
                 metadata: Arc::clone(&up_guard.metadata),
                 update: SocketUpdateKind::Unchanged,
             }),
@@ -444,7 +487,7 @@ impl SocketManager {
                     );
                 }
                 Ok(ReresolveResult {
-                    sock: up_guard.sock.try_clone()?,
+                    sock: up_guard.sock.clone(),
                     metadata: Arc::clone(&up_guard.metadata),
                     update: SocketUpdateKind::MetadataUpdated,
                 })
@@ -454,8 +497,8 @@ impl SocketManager {
                     "{context}: upstream {} (IP changed; upstream socket reconnected)",
                     fresh
                 );
-                if let Err(reconnect_err) = disconnect_socket(&up_guard.sock)
-                    .and_then(|_| up_guard.sock.connect(&fresh.as_sock_addr()))
+                if let Err(reconnect_err) =
+                    up_guard.sock.reconnect_connected(fresh.to_socket_addr())
                 {
                     log_info!(
                         "{context}: upstream {} reconnect failed ({}); replacing socket",
@@ -500,9 +543,8 @@ impl SocketManager {
                         self.upstream_source_id_request,
                         upstream_remote_filter,
                     );
-                    up_guard.upstream_connected = new_policy.reuse.starts_connected();
                     up_guard.evidence_key = new_evidence_key;
-                    up_guard.sock = new_sock.try_clone()?;
+                    up_guard.sock = new_sock.clone();
                     up_guard.sock_type = new_type;
                     up_guard.policy = new_policy;
                     up_guard.parser = new_parser;
@@ -550,7 +592,6 @@ impl SocketManager {
                     self.upstream_source_id_request,
                     fresh,
                 );
-                up_guard.upstream_connected = true;
                 if self.debug_handles {
                     log_debug!(
                         true,
@@ -564,7 +605,7 @@ impl SocketManager {
                     );
                 }
                 Ok(ReresolveResult {
-                    sock: up_guard.sock.try_clone()?,
+                    sock: up_guard.sock.clone(),
                     metadata: Arc::clone(&up_guard.metadata),
                     update: SocketUpdateKind::ReconnectedInPlace,
                 })
@@ -613,9 +654,8 @@ impl SocketManager {
                     self.upstream_source_id_request,
                     upstream_remote_filter,
                 );
-                up_guard.upstream_connected = new_policy.reuse.starts_connected();
                 up_guard.evidence_key = new_evidence_key;
-                up_guard.sock = new_sock.try_clone()?;
+                up_guard.sock = new_sock.clone();
                 up_guard.sock_type = new_type;
                 up_guard.policy = new_policy;
                 up_guard.parser = new_parser;
@@ -652,23 +692,24 @@ impl SocketManager {
         let mut cl_guard = self.client_listen.lock().unwrap();
         let prev_listen = cl_guard.listen_local_filter;
         let (fresh, action) = match endpoint_override {
-            Some(addr) => {
-                decide_listener_endpoint_update(prev_listen, CanonicalAddr::from_socket_addr(addr))
-            }
+            Some(addr) => decide_listener_endpoint_update(
+                prev_listen,
+                LogicalEndpoint::from_socket_addr(addr),
+            ),
             None => decide_listener_reresolve(prev_listen, resolve_first(&self.listen_target)?),
         };
 
         match action {
             ReresolveAction::NoChange => Ok(ReresolveResult {
-                sock: cl_guard.sock.try_clone()?,
+                sock: cl_guard.sock.clone(),
                 metadata: Arc::clone(&cl_guard.metadata),
                 update: SocketUpdateKind::Unchanged,
             }),
             ReresolveAction::ReplaceSocket => {
                 log_info!("{context}: listen {} (listener swapped)", fresh);
-                let (new_sock, local_canonical, listen_local_kernel_addr, new_type, new_policy) =
+                let (new_sock, logical_local, listen_local_kernel_addr, new_type, new_policy) =
                     make_socket(
-                        fresh.addr,
+                        fresh.to_socket_addr(),
                         self.listen_proto,
                         1000,
                         self.listen_worker_socket_policy,
@@ -683,13 +724,12 @@ impl SocketManager {
                 )?;
                 let new_evidence_key = cl_guard.evidence_key.replacement(listen_local_kernel_addr);
 
-                cl_guard.listen_local_filter = local_canonical;
+                cl_guard.listen_local_filter = logical_local;
                 cl_guard.listen_local_kernel_addr = listen_local_kernel_addr;
                 cl_guard.flow = None;
                 cl_guard.listener_flow = SocketLegFlow::empty();
-                cl_guard.listener_connected = new_policy.reuse.starts_connected();
                 cl_guard.evidence_key = new_evidence_key;
-                cl_guard.sock = new_sock.try_clone()?;
+                cl_guard.sock = new_sock.clone();
                 cl_guard.sock_type = new_type;
                 cl_guard.policy = new_policy;
                 cl_guard.parser = new_parser;
@@ -708,7 +748,10 @@ impl SocketManager {
                 Ok(ReresolveResult {
                     sock: new_sock,
                     metadata: Arc::clone(&cl_guard.metadata),
-                    update: if family_changed(prev_listen.addr, local_canonical.addr) {
+                    update: if family_changed(
+                        prev_listen.to_socket_addr(),
+                        logical_local.to_socket_addr(),
+                    ) {
                         SocketUpdateKind::ReplacedCrossFamily
                     } else {
                         SocketUpdateKind::Replaced
@@ -761,7 +804,7 @@ impl SocketManager {
         } else {
             let cl = self.client_listen.lock().unwrap();
             (
-                cl.sock.try_clone()?,
+                cl.sock.clone(),
                 Arc::clone(&cl.metadata),
                 SocketUpdateKind::Unchanged,
             )
@@ -773,7 +816,7 @@ impl SocketManager {
         } else {
             let up = self.upstream_state.lock().unwrap();
             (
-                up.sock.try_clone()?,
+                up.sock.clone(),
                 Arc::clone(&up.metadata),
                 SocketUpdateKind::Unchanged,
             )
@@ -811,9 +854,9 @@ impl SocketManager {
 
         SocketHandles {
             listener: Arc::clone(&cl.metadata),
-            client_sock: cl.sock.try_clone().expect("clone client socket"),
+            client_sock: cl.sock.clone(),
             upstream: Arc::clone(&up.metadata),
-            upstream_sock: up.sock.try_clone().expect("clone upstream socket"),
+            upstream_sock: up.sock.clone(),
             version: self.get_version(),
         }
     }
@@ -822,22 +865,21 @@ impl SocketManager {
     pub fn set_upstream_peer_ids(&self, source_id: u16, reply_id: u16, prev_ver: u64) -> u64 {
         let mut up_guard = self.upstream_state.lock().unwrap();
         let mut changed = false;
-        if up_guard.upstream_remote_filter.id != reply_id {
-            up_guard.upstream_remote_filter.id = reply_id;
-            up_guard.upstream_remote_filter.addr.set_port(reply_id);
+        if up_guard.upstream_remote_filter.id() != reply_id {
+            up_guard.upstream_remote_filter = up_guard.upstream_remote_filter.with_id(reply_id);
             changed = true;
         }
         if let Some(mut inbound) = up_guard.upstream_flow.inbound
-            && inbound.src.id != source_id
+            && inbound.src.id() != source_id
         {
-            inbound.src.id = source_id;
+            inbound.src = inbound.src.with_id(source_id);
             up_guard.upstream_flow.inbound = Some(inbound);
             changed = true;
         }
         if let Some(mut outbound) = up_guard.upstream_flow.outbound
-            && outbound.dst.id != reply_id
+            && outbound.dst.id() != reply_id
         {
-            outbound.dst.id = reply_id;
+            outbound.dst = outbound.dst.with_id(reply_id);
             up_guard.upstream_flow.outbound = Some(outbound);
             changed = true;
         }

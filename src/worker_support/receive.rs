@@ -4,10 +4,10 @@ use super::packet_admission::{
 };
 use super::{PacketTraceId, admit_received_packet_with_dump, recv_packet};
 use crate::cli::RuntimeConfig;
+use crate::net::managed_socket::ManagedSocket;
 use crate::recv_buf::RecvBuf;
 use crate::stats::StatsShard;
 use pkthere_socket_policy::ReceiveSyscall;
-use socket2::Socket;
 use std::io;
 
 pub(crate) struct PacketReceiver<const CAPACITY: usize> {
@@ -35,7 +35,7 @@ impl<const CAPACITY: usize> PacketReceiver<CAPACITY> {
 
     pub(crate) fn receive<'a>(
         &'a mut self,
-        socket: &Socket,
+        socket: &ManagedSocket,
         syscall: ReceiveSyscall,
         context: ReceivePacketContext<'_>,
     ) -> io::Result<Option<(usize, AdmittedWirePacket<'a>)>> {

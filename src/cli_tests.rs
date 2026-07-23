@@ -3,12 +3,12 @@ use super::{
     RequestedConfig, ReresolveMode, RuntimeOptions, SupportedProtocol, TimeoutAction,
     WorkerFlowMode, parse_endpoint_target, realize_config,
 };
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 
 fn requested_icmp_listener(id: u16) -> RequestedConfig {
     RequestedConfig {
-        listen_request: CanonicalAddr::new(
+        listen_request: LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, id)),
             id,
         ),
@@ -21,7 +21,7 @@ fn requested_icmp_listener(id: u16) -> RequestedConfig {
             ListenMode::Fixed
         },
         listen_str: format!("127.0.0.1:{id}"),
-        upstream_request: CanonicalAddr::new(
+        upstream_request: LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)),
             9,
         ),
@@ -55,8 +55,8 @@ fn requested_icmp_listener(id: u16) -> RequestedConfig {
 fn realize_config_rejects_port_conflict() {
     let mut cfg = requested_icmp_listener(0);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
-    cfg.upstream_request = CanonicalAddr::new(addr, 8888);
-    let listen = CanonicalAddr::new(addr, 8888);
+    cfg.upstream_request = LogicalEndpoint::from_socket_addr_with_id(addr, 8888);
+    let listen = LogicalEndpoint::from_socket_addr_with_id(addr, 8888);
 
     let res = realize_config(cfg, listen);
     assert!(res.is_err());
@@ -67,7 +67,7 @@ fn realize_config_rejects_port_conflict() {
 fn realize_config_moves_every_runtime_option_unchanged() {
     let requested = requested_icmp_listener(0);
     let expected = requested.options.clone();
-    let listen = CanonicalAddr::new(
+    let listen = LogicalEndpoint::from_socket_addr_with_id(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
         4242,
     );
@@ -80,7 +80,7 @@ fn realize_config_moves_every_runtime_option_unchanged() {
 #[test]
 fn realize_config_rejects_fixed_id_listener_mismatch() {
     let requested = requested_icmp_listener(4242);
-    let listen = CanonicalAddr::new(
+    let listen = LogicalEndpoint::from_socket_addr_with_id(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
         1111,
     );
@@ -95,7 +95,7 @@ fn realize_config_rejects_fixed_id_listener_mismatch() {
 #[test]
 fn realize_config_rejects_fixed_id_listener_with_zero_realized_id() {
     let requested = requested_icmp_listener(4242);
-    let listen = CanonicalAddr::new(
+    let listen = LogicalEndpoint::from_socket_addr_with_id(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4242)),
         0,
     );
@@ -111,12 +111,12 @@ fn realize_config_rejects_fixed_id_listener_with_zero_realized_id() {
 #[test]
 fn realize_config_accepts_wildcard_listener_with_dynamic_realized_id() {
     let requested = requested_icmp_listener(0);
-    let listen = CanonicalAddr::new(
+    let listen = LogicalEndpoint::from_socket_addr_with_id(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
         7777,
     );
     let runtime = realize_config(requested, listen).expect("wildcard listener must realize");
-    assert_eq!(runtime.listen.id, 7777);
+    assert_eq!(runtime.listen.id(), 7777);
     assert_eq!(runtime.listen_mode, ListenMode::Dynamic);
     assert_eq!(
         runtime.listener_reply_id_request,
@@ -128,12 +128,12 @@ fn realize_config_accepts_wildcard_listener_with_dynamic_realized_id() {
 fn realize_config_preserves_explicit_listener_reply_id() {
     let mut requested = requested_icmp_listener(1001);
     requested.listener_reply_id_request = IcmpReplyIdRequest::Fixed(2002);
-    let listen = CanonicalAddr::new(
+    let listen = LogicalEndpoint::from_socket_addr_with_id(
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001)),
         1001,
     );
     let runtime = realize_config(requested, listen).expect("reply id must realize");
-    assert_eq!(runtime.listen.id, 1001);
+    assert_eq!(runtime.listen.id(), 1001);
     assert_eq!(
         runtime.listener_reply_id_request,
         IcmpReplyIdRequest::Fixed(2002)

@@ -71,7 +71,7 @@ pub(crate) fn run_upstream_to_client_thread(context: UpstreamWorkerContext<'_>) 
             handles
                 .upstream
                 .policy
-                .receive_syscall(handles.upstream.upstream_connected),
+                .receive_syscall(handles.upstream_connected()),
             ReceivePacketContext {
                 cfg,
                 worker_id,
@@ -162,7 +162,7 @@ pub(crate) fn run_upstream_to_client_thread(context: UpstreamWorkerContext<'_>) 
                     let reply_id = reply_id_negotiation_for_u2c_listener_reply(
                         &event,
                         cfg.listener_reply_id_request
-                            .resolved_reply_id(handles.listener.listen_local_filter.id),
+                            .resolved_reply_id(handles.listener.listen_local_filter.id()),
                     )
                     .filter(|_| cfg.listen_proto == crate::cli::SupportedProtocol::ICMP);
                     if !decision.should_send() {
@@ -224,7 +224,7 @@ pub(crate) fn run_upstream_to_client_thread(context: UpstreamWorkerContext<'_>) 
                         };
                         send_payload(
                             &handles.client_sock,
-                            handles.listener.listener_connected,
+                            handles.listener_connected(),
                             &cache.route.dest_sa,
                             handles.listener.policy.send_policy,
                             cache.route.source_ip,
@@ -237,7 +237,7 @@ pub(crate) fn run_upstream_to_client_thread(context: UpstreamWorkerContext<'_>) 
                         &event,
                         SendOutcome {
                             result: &send_res,
-                            socket_connected: handles.listener.listener_connected,
+                            socket_connected: handles.listener_connected(),
                             destination: &cache.route.dest_sa,
                             disconnect: Some((&mut handles, sock_mgr)),
                             trace: Some(trace),

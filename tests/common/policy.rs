@@ -17,6 +17,8 @@ use syn::visit::Visit;
 
 #[path = "portable_policy.rs"]
 mod portable_policy;
+#[path = "socket_authority_policy.rs"]
+mod socket_authority_policy;
 
 const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
 const MAX_FACADE_LINES: usize = 200;
@@ -35,6 +37,8 @@ pub(crate) enum PolicyKind {
     ForbiddenAllow,
     LoopbackAlias,
     UnconditionalDebug,
+    RetiredEndpointAuthority,
+    SocketLifecycleAuthority,
 }
 
 impl PolicyKind {
@@ -45,6 +49,8 @@ impl PolicyKind {
             Self::ForbiddenAllow => "forbidden allow attribute",
             Self::LoopbackAlias => "forbidden loopback alias",
             Self::UnconditionalDebug => "unconditional debug emission",
+            Self::RetiredEndpointAuthority => "retired endpoint authority",
+            Self::SocketLifecycleAuthority => "socket lifecycle authority violation",
         }
     }
 }
@@ -191,6 +197,13 @@ pub fn assert_protocol_helpers_do_not_emit_unrequested_debug_logs() {
         &[PolicyKind::UnconditionalDebug],
         &["src/net/payload.rs", "src/net/socket.rs"],
     );
+}
+
+pub fn assert_endpoint_and_socket_authority_is_centralized() {
+    assert_no_findings(&[
+        PolicyKind::RetiredEndpointAuthority,
+        PolicyKind::SocketLifecycleAuthority,
+    ]);
 }
 
 pub fn assert_legacy_text_scanners_are_forbidden() {
@@ -387,6 +400,14 @@ impl<'a> AstCollector<'a> {
                 detail: "the body contains a syntactically self-directed call".to_string(),
             });
         }
+        self.findings
+            .extend(socket_authority_policy::analyze_function(
+                self.path,
+                &name,
+                self.test_depth != 0,
+                self.cfg_domain(),
+                block,
+            ));
         if self.drop_impl_depth == 0 || name != "drop" {
             self.functions.push(FunctionRecord {
                 path: self.path.to_string(),
@@ -461,6 +482,41 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
             });
         }
         syn::visit::visit_item_use(self, item);
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if item.ident != "SocketStateSnapshot" {
+            for field in &item.fields {
+                if field.ident.as_ref().is_some_and(|ident| {
+                    ident == "listener_connected" || ident == "upstream_connected"
+                }) {
+                    self.findings.push(PolicyFinding {
+                        kind: PolicyKind::SocketLifecycleAuthority,
+                        path: self.path.to_string(),
+                        line: line(field.span()),
+                        item: item.ident.to_string(),
+                        cfg_domain: self.cfg_domain(),
+                        detail: "live connection state must come from ManagedSocket association"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident == "CanonicalAddr" || ident == "FlowEndpoint" {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::RetiredEndpointAuthority,
+                path: self.path.to_string(),
+                line: line(ident.span()),
+                item: ident.to_string(),
+                cfg_domain: self.cfg_domain(),
+                detail: "LogicalEndpoint is the sole logical address authority".to_string(),
+            });
+        }
+        syn::visit::visit_ident(self, ident);
     }
 
     fn visit_macro(&mut self, item: &'ast syn::Macro) {

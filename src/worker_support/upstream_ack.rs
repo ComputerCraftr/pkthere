@@ -17,17 +17,17 @@ fn update_upstream_peer_ids(
     peer_source_id: u16,
     peer_reply_id: u16,
 ) -> bool {
-    let changed = handles.upstream.upstream_remote_filter.id != peer_reply_id
+    let changed = handles.upstream.upstream_remote_filter.id() != peer_reply_id
         || handles
             .upstream
             .upstream_flow
             .inbound
-            .is_some_and(|flow| flow.src.id != peer_source_id)
+            .is_some_and(|flow| flow.src.id() != peer_source_id)
         || handles
             .upstream
             .upstream_flow
             .outbound
-            .is_some_and(|flow| flow.dst.id != peer_reply_id);
+            .is_some_and(|flow| flow.dst.id() != peer_reply_id);
     if context.cfg.upstream_proto != SupportedProtocol::ICMP || !changed {
         return false;
     }

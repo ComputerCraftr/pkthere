@@ -167,7 +167,7 @@ pub(super) fn process_client_packet(
         );
         return;
     }
-    if handles.listener.listener_connected {
+    if handles.listener_connected() {
         log_packet_disposition(context.cfg, trace, PacketDisposition::DropNoActiveFlow);
         return;
     }

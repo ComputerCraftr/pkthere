@@ -2,6 +2,7 @@
 mod logging;
 mod cli;
 mod diagnostics;
+mod endpoint;
 mod flow_claim;
 mod flow_key;
 mod flow_state;
@@ -95,21 +96,21 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
         } else {
             log_info!(
                 "ICMP listener mode: wildcard-learn (listen id {}, requested client reply id {:?})",
-                cfg.listen.id,
+                cfg.listen.id(),
                 cfg.listener_reply_id_request
             );
         }
     } else if cfg.listen_proto == SupportedProtocol::ICMP {
         log_info!(
             "ICMP listener mode: fixed-id (listen id {}, requested client reply id {:?})",
-            cfg.listen.id,
+            cfg.listen.id(),
             cfg.listener_reply_id_request
         );
     }
     if cfg.upstream_proto == SupportedProtocol::UDP {
         log_info!(
             "UDP upstream destination: fixed remote port {}",
-            cfg.upstream.id
+            cfg.upstream.id()
         );
     }
     if cfg.upstream_proto == SupportedProtocol::ICMP {
@@ -119,8 +120,8 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
         ) && matches!(
             cfg.upstream_reply_id_request,
             cli::IcmpReplyIdRequest::Default
-        ) && snapshot.upstream_local_filter.id
-            == snapshot.upstream_remote_filter.id;
+        ) && snapshot.upstream_local_filter.id()
+            == snapshot.upstream_remote_filter.id();
         log_info!(
             "ICMP upstream mode: {} (local id {}, remote id {})",
             if dynamic_icmp_upstream {
@@ -128,8 +129,8 @@ fn print_startup(cfg: &RuntimeConfig, sock_mgr: &SocketManager) {
             } else {
                 "fixed remote peer/listener id"
             },
-            snapshot.upstream_local_filter.id,
-            snapshot.upstream_remote_filter.id
+            snapshot.upstream_local_filter.id(),
+            snapshot.upstream_remote_filter.id()
         );
     }
     let client_after_lock_connected = !cfg.debug_behavior.client_unconnected
@@ -205,7 +206,7 @@ fn main() -> io::Result<()> {
     // Listener for the local client (this may require root for low ports)
     let (client_sock, actual_listen, listen_local_kernel_addr, listen_sock_type, listen_capability) =
         make_socket(
-            requested_cfg.listen_request.addr,
+            requested_cfg.listen_request.to_socket_addr(),
             requested_cfg.listen_proto,
             1000,
             listener_worker_socket_policy,
@@ -221,14 +222,16 @@ fn main() -> io::Result<()> {
     if requested_cfg.listen_proto == SupportedProtocol::ICMP
         && let crate::cli::IcmpReplyIdRequest::Fixed(source_id) =
             requested_cfg.listener_source_id_request
-        && source_id != actual_listen.id
+        && source_id != actual_listen.id()
         && !listen_capability
             .icmp
             .is_some_and(|policy| policy.can_honor_disjoint_ids())
     {
         return Err(io::Error::other(format!(
             "ICMP listener requested independent listen/source ids {} -> {} but socket type {:?} cannot preserve disjoint ICMP ids; use a raw-capable deployment",
-            actual_listen.id, source_id, listen_sock_type
+            actual_listen.id(),
+            source_id,
+            listen_sock_type
         )));
     }
 
@@ -268,7 +271,7 @@ fn main() -> io::Result<()> {
     for worker_slot in 1..worker_count {
         let (extra_sock, _, extra_listen_kernel, extra_sock_type, extra_listen_capability) =
             make_socket(
-                cfg.listen.addr,
+                cfg.listen.to_socket_addr(),
                 cfg.listen_proto,
                 1000,
                 listener_worker_socket_policy,

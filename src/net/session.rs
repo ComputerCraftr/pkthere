@@ -7,7 +7,6 @@ use crate::worker_support::{PacketDisposition, log_packet_send_disposition};
 use socket2::SockAddr;
 
 use std::io;
-use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) struct SendOutcome<'a, 'b> {
@@ -70,7 +69,7 @@ pub(crate) fn handle_send_result(
 
             if !*res
                 && let Some((handles, sock_mgr)) = disconnect_ctx
-                && handles.listener.listener_connected
+                && handles.listener_connected()
             {
                 let prev_ver = handles.version;
                 log_warn_dir!(
@@ -78,16 +77,18 @@ pub(crate) fn handle_send_result(
                     c2u,
                     "send_payload error (EDESTADDRREQ); disconnecting client socket"
                 );
-                Arc::make_mut(&mut handles.listener).listener_connected = false;
-                handles.version = match sock_mgr.set_client_sock_disconnected(
-                    handles.listener.flow,
-                    handles.listener.listener_flow,
-                    false,
-                    prev_ver,
-                ) {
+                let observed_association = handles.client_sock.association();
+                handles.version = match sock_mgr
+                    .reconcile_client_destination_required(observed_association, prev_ver)
+                {
                     Ok(v) => v,
                     Err(e) => {
-                        log_warn_dir!(worker_id, c2u, "disconnect_socket failed: {}", e);
+                        log_warn_dir!(
+                            worker_id,
+                            c2u,
+                            "destination-required reconciliation failed: {}",
+                            e
+                        );
                         prev_ver
                     }
                 };

@@ -4,11 +4,12 @@ use crate::net::framing_shim::{
     ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, ReplyIdNegotiation,
     encode_icmp_tunnel_prefix_with_source,
 };
+use crate::net::managed_socket::ManagedSocket;
 use crate::net::packet_headers::WireIcmpIdentity;
 use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 pub(crate) use pkthere_socket_policy::{IcmpChecksumMode, IpHeaderMode, SocketSendPolicy};
 use pkthere_wire::checksum::{checksum16_bytes, checksum16_header, checksum16_header_parts};
-use socket2::{SockAddr, Socket};
+use socket2::SockAddr;
 use std::io::{self, IoSlice};
 use std::mem::MaybeUninit;
 use std::net::IpAddr;
@@ -71,7 +72,7 @@ pub(crate) fn outbound_payload_event<'a>(
 }
 
 pub(crate) fn send_payload(
-    sock: &Socket,
+    sock: &ManagedSocket,
     sock_connected: bool,
     dest_sa: &SockAddr,
     send_policy: SocketSendPolicy,
@@ -94,7 +95,7 @@ pub(crate) fn send_payload(
 
 #[inline]
 fn send_payload_once(
-    sock: &Socket,
+    sock: &ManagedSocket,
     sock_connected: bool,
     dest_sa: &SockAddr,
     send_policy: SocketSendPolicy,
@@ -125,7 +126,7 @@ fn send_payload_once(
 }
 
 fn send_icmp_echo(
-    sock: &Socket,
+    sock: &ManagedSocket,
     sock_connected: bool,
     dest_sa: &SockAddr,
     send_policy: SocketSendPolicy,
