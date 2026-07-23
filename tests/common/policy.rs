@@ -15,8 +15,13 @@ use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 
+#[path = "policy_syntax.rs"]
+mod policy_syntax;
 #[path = "portable_policy.rs"]
 mod portable_policy;
+#[path = "socket_authority_policy.rs"]
+mod socket_authority_policy;
+use policy_syntax::{attr_is_test_context, cfg_fragments, path_string, use_tree_has_glob};
 
 const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
 const MAX_FACADE_LINES: usize = 200;
@@ -35,6 +40,8 @@ pub(crate) enum PolicyKind {
     ForbiddenAllow,
     LoopbackAlias,
     UnconditionalDebug,
+    RetiredEndpointAuthority,
+    SocketLifecycleAuthority,
 }
 
 impl PolicyKind {
@@ -45,6 +52,8 @@ impl PolicyKind {
             Self::ForbiddenAllow => "forbidden allow attribute",
             Self::LoopbackAlias => "forbidden loopback alias",
             Self::UnconditionalDebug => "unconditional debug emission",
+            Self::RetiredEndpointAuthority => "retired endpoint authority",
+            Self::SocketLifecycleAuthority => "socket lifecycle authority violation",
         }
     }
 }
@@ -193,6 +202,13 @@ pub fn assert_protocol_helpers_do_not_emit_unrequested_debug_logs() {
     );
 }
 
+pub fn assert_endpoint_and_socket_authority_is_centralized() {
+    assert_no_findings(&[
+        PolicyKind::RetiredEndpointAuthority,
+        PolicyKind::SocketLifecycleAuthority,
+    ]);
+}
+
 pub fn assert_legacy_text_scanners_are_forbidden() {
     let forbidden_names = [
         ["sanitize_rust_", "source"].concat(),
@@ -276,6 +292,7 @@ pub fn assert_portable_build_configuration() {
 
 fn analyze_rust_source(path: &str, source: &str) -> ParsedSource {
     let file = parse_file(path, source);
+    let socket_aliases = socket_authority_policy::socket_type_aliases(&file);
     let top_level_items = file
         .items
         .iter()
@@ -291,7 +308,7 @@ fn analyze_rust_source(path: &str, source: &str) -> ParsedSource {
             ),
         })
         .collect();
-    let mut collector = AstCollector::new(path);
+    let mut collector = AstCollector::new(path, socket_aliases);
     collector.visit_file(&file);
     ParsedSource {
         findings: collector.findings,
@@ -338,10 +355,11 @@ struct AstCollector<'a> {
     cfg_stack: Vec<String>,
     test_depth: usize,
     drop_impl_depth: usize,
+    socket_aliases: BTreeSet<String>,
 }
 
 impl<'a> AstCollector<'a> {
-    fn new(path: &'a str) -> Self {
+    fn new(path: &'a str, socket_aliases: BTreeSet<String>) -> Self {
         Self {
             path,
             findings: Vec::new(),
@@ -349,6 +367,7 @@ impl<'a> AstCollector<'a> {
             cfg_stack: Vec::new(),
             test_depth: 0,
             drop_impl_depth: 0,
+            socket_aliases,
         }
     }
 
@@ -373,7 +392,13 @@ impl<'a> AstCollector<'a> {
         fragments.join(" && ")
     }
 
-    fn record_function(&mut self, ident: &syn::Ident, block: &syn::Block, is_method: bool) {
+    fn record_function(
+        &mut self,
+        ident: &syn::Ident,
+        inputs: &syn::punctuated::Punctuated<syn::FnArg, syn::Token![,]>,
+        block: &syn::Block,
+        is_method: bool,
+    ) {
         let name = ident.to_string();
         let mut recursion = RecursionVisitor::new(&name, is_method);
         recursion.visit_block(block);
@@ -387,6 +412,16 @@ impl<'a> AstCollector<'a> {
                 detail: "the body contains a syntactically self-directed call".to_string(),
             });
         }
+        self.findings
+            .extend(socket_authority_policy::analyze_function(
+                self.path,
+                &name,
+                self.test_depth != 0,
+                self.cfg_domain(),
+                inputs,
+                &self.socket_aliases,
+                block,
+            ));
         if self.drop_impl_depth == 0 || name != "drop" {
             self.functions.push(FunctionRecord {
                 path: self.path.to_string(),
@@ -463,6 +498,50 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
         syn::visit::visit_item_use(self, item);
     }
 
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if item.ident != "SocketStateSnapshot" {
+            for field in &item.fields {
+                if field.ident.as_ref().is_some_and(|ident| {
+                    ident == "listener_connected" || ident == "upstream_connected"
+                }) {
+                    self.findings.push(PolicyFinding {
+                        kind: PolicyKind::SocketLifecycleAuthority,
+                        path: self.path.to_string(),
+                        line: line(field.span()),
+                        item: item.ident.to_string(),
+                        cfg_domain: self.cfg_domain(),
+                        detail: "live connection state must come from ManagedSocket association"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        if let Some(finding) =
+            socket_authority_policy::analyze_enum(self.path, self.cfg_domain(), item)
+        {
+            self.findings.push(finding);
+        }
+        syn::visit::visit_item_enum(self, item);
+    }
+
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if ident == "CanonicalAddr" || ident == "FlowEndpoint" {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::RetiredEndpointAuthority,
+                path: self.path.to_string(),
+                line: line(ident.span()),
+                item: ident.to_string(),
+                cfg_domain: self.cfg_domain(),
+                detail: "LogicalEndpoint is the sole logical address authority".to_string(),
+            });
+        }
+        syn::visit::visit_ident(self, ident);
+    }
+
     fn visit_macro(&mut self, item: &'ast syn::Macro) {
         if item
             .path
@@ -524,14 +603,14 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         let state = self.enter_attrs(&item.attrs);
-        self.record_function(&item.sig.ident, &item.block, false);
+        self.record_function(&item.sig.ident, &item.sig.inputs, &item.block, false);
         syn::visit::visit_item_fn(self, item);
         self.leave_attrs(state);
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         let state = self.enter_attrs(&item.attrs);
-        self.record_function(&item.sig.ident, &item.block, true);
+        self.record_function(&item.sig.ident, &item.sig.inputs, &item.block, true);
         syn::visit::visit_impl_item_fn(self, item);
         self.leave_attrs(state);
     }
@@ -539,7 +618,7 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
         let state = self.enter_attrs(&item.attrs);
         if let Some(block) = &item.default {
-            self.record_function(&item.sig.ident, block, true);
+            self.record_function(&item.sig.ident, &item.sig.inputs, block, true);
         }
         syn::visit::visit_trait_item_fn(self, item);
         self.leave_attrs(state);
@@ -775,6 +854,11 @@ fn build_surface_paths(inventory: &WorkspaceInventory) -> Vec<PathBuf> {
     }
     paths.push(inventory.repo_root.join("Cross.toml"));
     paths.push(inventory.repo_root.join(".github/workflows/rust.yml"));
+    paths.push(
+        inventory
+            .repo_root
+            .join("docker/alpine/portable_builder.Dockerfile"),
+    );
     paths.push(inventory.repo_root.join("docker/rust_build/Dockerfile"));
     paths.extend(
         inventory
@@ -814,60 +898,6 @@ fn collect_extensions(root: &Path, extensions: &[&str], output: &mut Vec<PathBuf
             }
         }
     }
-}
-
-fn cfg_fragments(attrs: &[syn::Attribute]) -> Vec<String> {
-    attrs
-        .iter()
-        .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
-        .map(|attr| attr.meta.to_token_stream().to_string())
-        .collect()
-}
-
-fn attr_is_test_context(attr: &syn::Attribute) -> bool {
-    if attr
-        .path()
-        .segments
-        .last()
-        .is_some_and(|segment| segment.ident == "test")
-    {
-        return true;
-    }
-    (attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
-        && token_stream_has_ident(attr.meta.to_token_stream(), "test")
-}
-
-fn token_stream_has_ident(stream: proc_macro2::TokenStream, expected: &str) -> bool {
-    let mut pending = stream.into_iter().collect::<Vec<_>>();
-    while let Some(token) = pending.pop() {
-        match token {
-            proc_macro2::TokenTree::Ident(ident) if ident == expected => return true,
-            proc_macro2::TokenTree::Group(group) => pending.extend(group.stream()),
-            _ => {}
-        }
-    }
-    false
-}
-
-fn use_tree_has_glob(tree: &syn::UseTree) -> bool {
-    let mut pending = vec![tree];
-    while let Some(tree) = pending.pop() {
-        match tree {
-            syn::UseTree::Glob(_) => return true,
-            syn::UseTree::Group(group) => pending.extend(group.items.iter()),
-            syn::UseTree::Path(path) => pending.push(&path.tree),
-            syn::UseTree::Name(_) | syn::UseTree::Rename(_) => {}
-        }
-    }
-    false
-}
-
-fn path_string(path: &syn::Path) -> String {
-    path.segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect::<Vec<_>>()
-        .join("::")
 }
 
 fn parse_file(path: &str, source: &str) -> syn::File {

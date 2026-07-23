@@ -5,9 +5,9 @@ use crate::cli::{
     DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
     RuntimeOptions, SupportedProtocol, TimeoutAction, WorkerFlowMode,
 };
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple, SocketLegFlow};
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
 use crate::net::packet_headers::select_packet_parser;
-use crate::net::params::CanonicalAddr;
 use pkthere_socket_policy::{IcmpPolicyIntent, SocketRole, resolve_socket_policy_with_icmp_intent};
 use socket2::{Domain, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -54,13 +54,13 @@ pub(crate) fn admission_spec(
     proto: SupportedProtocol,
     sock_type: Type,
     evidence_policy: ReceiveEvidencePolicy,
-    expected_remote: Option<CanonicalAddr>,
+    expected_remote: Option<LogicalEndpoint>,
     expected_local_id: Option<u16>,
     local_filter_ip: Option<IpAddr>,
 ) -> ReceiveContext {
-    let expected_remote_endpoint = expected_remote.map(FlowEndpoint::from_canonical);
+    let expected_remote_endpoint = expected_remote;
     let socket_is_ipv4 = match (expected_remote, local_filter_ip) {
-        (Some(remote), _) => remote.addr.is_ipv4(),
+        (Some(remote), _) => remote.ip().is_ipv4(),
         (None, Some(ip)) => ip.is_ipv4(),
         (None, None) => true,
     };
@@ -71,11 +71,11 @@ pub(crate) fn admission_spec(
         None => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
 
-    let expected_local = expected_local_id.map(|id| FlowEndpoint::new(local_ip, id));
+    let expected_local = expected_local_id.map(|id| LogicalEndpoint::new(local_ip, id));
     let expected_inbound = expected_remote_endpoint.map(|remote| {
         let local = match expected_local {
             Some(local) => local,
-            None => FlowEndpoint::new(local_ip, 0),
+            None => LogicalEndpoint::new(local_ip, 0),
         };
         FlowTuple::new(remote, local)
     });
@@ -97,9 +97,9 @@ pub(crate) fn admission_spec(
     );
     policy.receive_evidence.connected = evidence_policy;
     policy.receive_evidence.unconnected = evidence_policy;
-    let local_filter = expected_local
-        .map(FlowEndpoint::canonical)
-        .unwrap_or_else(|| CanonicalAddr::new(SocketAddr::new(local_ip, 0), 0));
+    let local_filter = expected_local.unwrap_or_else(|| {
+        LogicalEndpoint::from_socket_addr_with_id(SocketAddr::new(local_ip, 0), 0)
+    });
     ReceiveContext {
         socket: ReceiveSocketContext {
             role,
@@ -118,14 +118,14 @@ pub(crate) fn admission_spec(
             policy,
             connected: false,
             local_filter,
-            local_kernel_addr: local_filter.addr,
+            local_kernel_addr: local_filter.to_socket_addr(),
             evidence_key: pkthere_socket_policy::SocketEvidenceKey::initial(
                 match role {
                     SocketLeg::ClientFacing => SocketRole::Listener,
                     SocketLeg::UpstreamFacing => SocketRole::Upstream,
                 },
                 0,
-                local_filter.addr,
+                local_filter.to_socket_addr(),
             ),
         },
         admission: AdmissionStateContext {
@@ -139,7 +139,7 @@ pub(crate) fn admission_spec(
 
 pub(crate) fn test_config(listener_reply_id_request: IcmpReplyIdRequest) -> RuntimeConfig {
     RuntimeConfig {
-        listen: CanonicalAddr::new(
+        listen: LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001)),
             1001,
         ),
@@ -148,7 +148,7 @@ pub(crate) fn test_config(listener_reply_id_request: IcmpReplyIdRequest) -> Runt
         listen_proto: SupportedProtocol::ICMP,
         listen_mode: ListenMode::Fixed,
         listen_str: String::from("test-listen"),
-        upstream: CanonicalAddr::new(
+        upstream: LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9000)),
             9000,
         ),
@@ -252,7 +252,7 @@ pub(crate) fn icmp_wire_spec(
                 .expect("test ICMP packet parser"),
             policy,
             connected: false,
-            local_filter: CanonicalAddr::from_v4(Ipv4Addr::LOCALHOST, 1001),
+            local_filter: LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 1001),
             local_kernel_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             evidence_key: pkthere_socket_policy::SocketEvidenceKey::initial(
                 SocketRole::Listener,
@@ -262,7 +262,7 @@ pub(crate) fn icmp_wire_spec(
         },
         admission: AdmissionStateContext {
             expected_inbound,
-            expected_local: Some(FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001)),
+            expected_local: Some(LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001)),
             locked_flow,
             pending_icmp_client_lock: None,
         },
@@ -270,14 +270,14 @@ pub(crate) fn icmp_wire_spec(
 }
 
 pub(crate) fn pending_icmp_lock_candidate() -> crate::flow_state::PendingIcmpClientLock {
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let inbound_local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let outbound_local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3003);
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let inbound_local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let outbound_local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3003);
     crate::flow_state::PendingIcmpClientLock {
-        flow_key: ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::new(127, 0, 0, 2),
-            ident: 0x2002,
-        },
+        flow_key: ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+            Ipv4Addr::new(127, 0, 0, 2),
+            0x2002,
+        )),
         listener_flow: SocketLegFlow::new(
             Some(FlowTuple::new(remote, inbound_local)),
             Some(FlowTuple::new(outbound_local, remote)),

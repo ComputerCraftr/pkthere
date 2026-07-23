@@ -6,8 +6,9 @@ pub use platform::{
 };
 
 use pkthere_wire::SupportedProtocol;
-use pkthere_wire::packet_headers::ReceiveHeaderMode;
+use pkthere_wire::packet_headers::{IpVersion, ReceiveHeaderMode};
 use socket2::{Domain, Protocol, Type};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeoutAction {
@@ -26,6 +27,48 @@ pub enum SocketCreationPath {
     Datagram,
     RawIcmp,
     WindowsProtocolZeroCapture,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerVerification {
+    RequirePeerAddr,
+    ConnectSuccess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedSocketDomain(pub Domain);
+
+impl fmt::Display for UnsupportedSocketDomain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "unsupported socket domain: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedSocketDomain {}
+
+pub fn ip_version_for_domain(domain: Domain) -> Result<IpVersion, UnsupportedSocketDomain> {
+    if domain == Domain::IPV4 {
+        Ok(IpVersion::V4)
+    } else if domain == Domain::IPV6 {
+        Ok(IpVersion::V6)
+    } else {
+        Err(UnsupportedSocketDomain(domain))
+    }
+}
+
+pub fn peer_verification(
+    protocol: SupportedProtocol,
+    socket_type: Type,
+    path: SocketCreationPath,
+) -> PeerVerification {
+    if matches!(protocol, SupportedProtocol::ICMP)
+        && socket_type == Type::DGRAM
+        && matches!(path, SocketCreationPath::Datagram)
+    {
+        PeerVerification::ConnectSuccess
+    } else {
+        PeerVerification::RequirePeerAddr
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -415,6 +458,18 @@ impl ListenerWorkerSocketPolicy {
             self.distribution,
             ListenerWorkerDistribution::UnsupportedSeparateState
         )
+    }
+
+    /// Whether each listener socket should establish a kernel peer association
+    /// after the logical client flow locks.
+    ///
+    /// Shared-state worker sockets retain source metadata and enforce the
+    /// shared flow in admission because multiple reused listeners cannot
+    /// portably associate with the same peer.
+    #[inline]
+    pub const fn connects_after_lock(self, socket_policy: ResolvedSocketPolicy) -> bool {
+        socket_policy.reuse.connects_after_lock()
+            && !matches!(self.distribution, ListenerWorkerDistribution::SharedState)
     }
 }
 

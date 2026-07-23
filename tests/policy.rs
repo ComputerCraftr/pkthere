@@ -56,6 +56,11 @@ fn retired_text_scanners_cannot_return() {
 }
 
 #[test]
+fn endpoint_and_socket_authority_is_centralized() {
+    policy::assert_endpoint_and_socket_authority_is_centralized();
+}
+
+#[test]
 fn test_harness_lifecycle_boundaries_are_centralized() {
     harness_policy::assert_test_harness_lifecycle_boundaries();
 }
@@ -110,7 +115,8 @@ fn native_ci_uses_shared_raw_capability_and_test_runners() {
     assert!(workflow.contains("taplo check"));
     assert!(workflow.contains("prettier@3.9.6 --check"));
     for (job, next_job, timeout_minutes) in [
-        ("quality", Some("test"), 30),
+        ("quality", Some("miri-production-units"), 30),
+        ("miri-production-units", Some("test"), 30),
         ("test", Some("stress-release"), 30),
         ("stress-release", Some("aarch64-musl"), 15),
         ("aarch64-musl", Some("alpine-socket-reality"), 30),
@@ -129,6 +135,21 @@ fn native_ci_uses_shared_raw_capability_and_test_runners() {
             "CI job {job} must retain its deadlock timeout of {timeout_minutes} minutes"
         );
     }
+
+    assert!(
+        workflow.contains(
+            "cargo miri test --locked\n          -p pkthere\n          -p pkthere-wire\n          -p pkthere-socket-policy\n          --lib --bins -- --nocapture"
+        ),
+        "Miri must run every compatible production unit target without a test-name filter"
+    );
+    assert!(
+        !workflow.contains("net::managed_socket::receive_tests -- --nocapture"),
+        "Miri must not regress to a filtered receive-only invocation"
+    );
+    assert!(
+        !workflow.contains("cargo miri test --locked --workspace"),
+        "Miri must not include OS/process-backed harness packages that the interpreter cannot execute"
+    );
     assert_eq!(
         workflow.matches("uses: actions/upload-artifact@").count(),
         3,
@@ -138,6 +159,11 @@ fn native_ci_uses_shared_raw_capability_and_test_runners() {
         workflow.matches("if: always()").count(),
         3,
         "all artifact uploads must run after success or failure"
+    );
+    assert!(
+        workflow.contains("${{ matrix.app_source }}")
+            && workflow.contains("${{ matrix.test_app }}"),
+        "native CI evidence must retain the exact ordinary and privileged executables"
     );
 
     let test_manifest = include_str!("../docker/alpine/pkthere_harness/test_manifest.py");

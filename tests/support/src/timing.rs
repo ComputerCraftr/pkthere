@@ -65,5 +65,8 @@ pub const SOCKET_REALITY_RECEIVE_WAIT: Duration = Duration::from_secs(1);
 /// Standard duration for stress tests.
 pub const STRESS_TEST_DURATION: Duration = Duration::from_secs(20);
 
+/// Additional time for stress replies already admitted by the forwarder to drain.
+pub const STRESS_DRAIN_WAIT: Duration = Duration::from_secs(1);
+
 /// Short pause between stress-test send bursts.
 pub const STRESS_SEND_PAUSE: Duration = Duration::from_micros(50);

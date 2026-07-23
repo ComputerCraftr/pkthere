@@ -2,7 +2,6 @@ use super::client_dispatch::{process_client_packet, process_sync_packet};
 use super::{
     CachedClientState, GlobalSyncPacer, PacketContext, PacketReceiver, ReceivePacketContext,
     SocketLeg, client_receive_context, refresh_lock_and_sync_state, send_sync_payload_or_cadence,
-    wait_socket_until_readable,
 };
 use crate::cli::RuntimeConfig;
 use crate::flow_claim::FlowClaimTable;
@@ -10,9 +9,11 @@ use crate::flow_state::FlowRuntimeState;
 use crate::net::icmp_sequence::SharedIcmpSequenceState;
 use crate::net::params::MAX_WIRE_PAYLOAD;
 use crate::net::sock_mgr::SocketManager;
+use crate::runtime_support::FATAL_EXIT;
 use crate::stats::{StatsShard, StatsSink};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomOrdering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ pub(crate) struct ClientWorkerContext<'a> {
     pub(crate) sync_pacer: Option<&'a GlobalSyncPacer>,
     pub(crate) flow_claims: Option<&'a FlowClaimTable>,
     pub(crate) worker_pair_id: usize,
+    pub(crate) exit_code_set: &'a AtomicU32,
 }
 
 fn handle_receive_error(context: &ClientWorkerContext<'_>, error: io::Error) {
@@ -41,6 +43,10 @@ fn handle_receive_error(context: &ClientWorkerContext<'_>, error: io::Error) {
         context.stats.drop_err(C2U);
         thread::sleep(RECEIVE_ERROR_BACKOFF);
     }
+}
+
+pub(super) fn request_fatal_exit_after_client_lock_failure(exit_code_set: &AtomicU32) {
+    exit_code_set.store(FATAL_EXIT, AtomOrdering::Relaxed);
 }
 
 pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
@@ -104,7 +110,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
                 }
                 continue;
             }
-            match wait_socket_until_readable(&handles.client_sock, pacer.poll_wait()) {
+            match handles.client_sock.wait_until_readable(pacer.poll_wait()) {
                 Ok(false) => continue,
                 Ok(true) => {}
                 Err(error) => {
@@ -125,7 +131,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
                 handles
                     .listener
                     .policy
-                    .receive_syscall(handles.listener.listener_connected),
+                    .receive_syscall(handles.listener_connected()),
                 ReceivePacketContext {
                     cfg: context.cfg,
                     worker_id: context.worker_id,
@@ -148,7 +154,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
             }
             continue;
         }
-        if context.cfg.is_icmp_sync_enabled() && handles.listener.listener_connected {
+        if context.cfg.is_icmp_sync_enabled() && handles.listener_connected() {
             thread::sleep(UNLOCKED_SYNC_BACKOFF);
             continue;
         }
@@ -169,7 +175,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
             handles
                 .listener
                 .policy
-                .receive_syscall(handles.listener.listener_connected),
+                .receive_syscall(handles.listener_connected()),
             ReceivePacketContext {
                 cfg: context.cfg,
                 worker_id: context.worker_id,
@@ -186,7 +192,7 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
                     context.worker_id,
                     length
                 );
-                process_client_packet(
+                if let Err(error) = process_client_packet(
                     &context,
                     &mut handles,
                     &mut cache,
@@ -194,7 +200,16 @@ pub(crate) fn run_client_to_upstream_thread(context: ClientWorkerContext<'_>) {
                     &mut upstream_side_cache,
                     &mut was_locked,
                     admitted,
-                );
+                ) {
+                    log_error_dir!(
+                        context.worker_id,
+                        C2U,
+                        "fatal client-lock transaction failure: {}",
+                        error
+                    );
+                    request_fatal_exit_after_client_lock_failure(context.exit_code_set);
+                    return;
+                }
             }
             Ok(None) => {}
             Err(error) => handle_receive_error(&context, error),

@@ -1,18 +1,16 @@
+use crate::net::managed_socket::ManagedSendResult;
 use crate::net::payload::PayloadEvent;
 use crate::net::sock_mgr::{SocketHandles, SocketManager};
-use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 use crate::packet_trace::PacketTraceId;
 use crate::worker_support::PacketContext;
 use crate::worker_support::{PacketDisposition, log_packet_send_disposition};
 use socket2::SockAddr;
 
 use std::io;
-use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) struct SendOutcome<'a, 'b> {
-    pub(crate) result: &'a io::Result<bool>,
-    pub(crate) socket_connected: bool,
+    pub(crate) result: &'a io::Result<ManagedSendResult>,
     pub(crate) destination: &'a SockAddr,
     pub(crate) disconnect: Option<(&'b mut SocketHandles, &'b SocketManager)>,
     pub(crate) trace: Option<PacketTraceId>,
@@ -46,7 +44,6 @@ pub(crate) fn handle_send_result(
     } = context;
     let SendOutcome {
         result: send_res,
-        socket_connected: sock_connected,
         destination: dest_sa,
         disconnect: disconnect_ctx,
         trace,
@@ -68,34 +65,21 @@ pub(crate) fn handle_send_result(
                 stats.send_add(c2u, event.payload_len() as u64, t_recv, t_send);
             }
 
-            if !*res
+            if res.association_changed()
                 && let Some((handles, sock_mgr)) = disconnect_ctx
-                && handles.listener.listener_connected
             {
                 let prev_ver = handles.version;
                 log_warn_dir!(
                     worker_id,
                     c2u,
-                    "send_payload error (EDESTADDRREQ); disconnecting client socket"
+                    "send_payload recovered from EDESTADDRREQ with an unconnected send"
                 );
-                Arc::make_mut(&mut handles.listener).listener_connected = false;
-                handles.version = match sock_mgr.set_client_sock_disconnected(
-                    handles.listener.flow,
-                    handles.listener.listener_flow,
-                    false,
-                    prev_ver,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log_warn_dir!(worker_id, c2u, "disconnect_socket failed: {}", e);
-                        prev_ver
-                    }
-                };
+                handles.version = sock_mgr.publish_client_association_change();
                 log_debug_dir!(
                     cfg.debug_logs.handles,
                     worker_id,
                     c2u,
-                    "publish disconnect: addr={:?} ver {}->{}",
+                    "publish managed association change: addr={:?} ver {}->{}",
                     handles.listener.flow,
                     prev_ver,
                     handles.version
@@ -111,11 +95,11 @@ pub(crate) fn handle_send_result(
                             PacketDisposition::ReplySessionControl
                         }
                     },
-                    !*res,
+                    res.used_unconnected_send(),
                 );
             }
             HandledSendOutcome::Sent {
-                retried_unconnected: !*res,
+                retried_unconnected: res.association_changed(),
             }
         }
         Err(e) => {
@@ -123,12 +107,7 @@ pub(crate) fn handle_send_result(
                 cfg.debug_logs.drops,
                 worker_id,
                 c2u,
-                "send_payload error ({} on dest_sa '{:?}'): {}",
-                if sock_connected && e.raw_os_error() != Some(DEST_ADDR_REQUIRED) {
-                    "send"
-                } else {
-                    "send_to"
-                },
+                "managed socket send error (dest_sa '{:?}'): {}",
                 dest_sa.as_socket(),
                 e
             );
@@ -182,13 +161,11 @@ mod tests {
             flow_state: &flow_state,
         };
         let event = PayloadEvent::user_payload_plain(SupportedProtocol::UDP, &[]);
-        let err_res: io::Result<bool> = Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "test error",
-        ));
+        let err_res: io::Result<crate::net::managed_socket::ManagedSendResult> = Err(
+            io::Error::new(io::ErrorKind::PermissionDenied, "test error"),
+        );
         let outcome = SendOutcome {
             result: &err_res,
-            socket_connected: false,
             destination: &SockAddr::from(SocketAddr::from_str("127.0.0.1:0").unwrap()),
             disconnect: None,
             trace: Some(PacketTraceId {

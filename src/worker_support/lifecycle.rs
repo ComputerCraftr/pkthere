@@ -139,6 +139,7 @@ fn apply_listener_rebind_reset(
     if !summary.listener_replaced() {
         return;
     }
+    let _transaction_guard = flow_states[worker_pair].client_lock_transaction();
     let reset = flow_states[worker_pair].reset();
     if let Some(trace) = reset.and_then(|payload| payload.buffered_trace) {
         log_packet_disposition(cfg, trace, PacketDisposition::HandshakeResetDrop);
@@ -214,6 +215,10 @@ pub(crate) fn run_watchdog_thread(
             }
             match cfg.on_timeout {
                 TimeoutAction::Drop => {
+                    let _transaction_guard = flow_state.client_lock_transaction();
+                    if !flow_state.is_locked() {
+                        continue;
+                    }
                     let locked_flow = sock_mgrs[idx].get_client_dest().0;
                     if handshake_timed_out {
                         log_warn!(
@@ -236,10 +241,10 @@ pub(crate) fn run_watchdog_thread(
                         };
                     for mgr in managers_to_clear {
                         let prev = mgr.get_version();
-                        let ver = match mgr.clear_client_lock(prev) {
+                        let ver = match mgr.clear_client_lock() {
                             Ok(v) => v,
                             Err(e) => {
-                                log_error!("watchdog disconnect_socket failed: {}", e);
+                                log_error!("watchdog client-lock cleanup failed: {}", e);
                                 exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
                                 return;
                             }

@@ -3,8 +3,8 @@ use super::{
     SocketLeg, TransportAdmission, WirePacketAdmission, admit_packet, admit_wire_packet,
 };
 use crate::cli::{IcmpReplyIdRequest, SupportedProtocol};
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple};
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple};
 use crate::net::payload::PayloadEvent;
 use crate::worker_support::admission_test_support::{
     admission_spec, icmp_tunnel_packet, icmp_wire_spec, test_config,
@@ -19,8 +19,8 @@ fn connected_kernel_filter_evidence_scopes_reflected_negotiation_policy() {
     let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut v4_spec = icmp_wire_spec(
         Some(FlowTuple::new(
-            FlowEndpoint::new(v4, 1001),
-            FlowEndpoint::new(v4, 1001),
+            LogicalEndpoint::new(v4, 1001),
+            LogicalEndpoint::new(v4, 1001),
         )),
         None,
     );
@@ -63,7 +63,7 @@ fn connected_kernel_filter_evidence_scopes_reflected_negotiation_policy() {
     ));
 
     let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
-    let local_v6 = FlowEndpoint::new(v6, 1001);
+    let local_v6 = LogicalEndpoint::new(v6, 1001);
     let mut v6_spec = icmp_wire_spec(Some(FlowTuple::new(local_v6, local_v6)), None);
     v6_spec.socket.role = SocketLeg::UpstreamFacing;
     v6_spec.socket.policy.receive_evidence.unconnected = ReceiveEvidencePolicy {
@@ -84,7 +84,7 @@ fn connected_kernel_filter_evidence_scopes_reflected_negotiation_policy() {
         .as_mut()
         .expect("ICMP policy")
         .id_capability = pkthere_socket_policy::IcmpSocketIdCapability::FixedCollapsedId;
-    v6_spec.socket.local_filter = CanonicalAddr::from_v6(Ipv6Addr::LOCALHOST, 1001, 0, 0);
+    v6_spec.socket.local_filter = LogicalEndpoint::from_v6(Ipv6Addr::LOCALHOST, 1001, 0, 0);
     v6_spec.admission.expected_local = Some(local_v6);
     assert!(matches!(
         admit_wire_packet(false, &cfg, v6_spec, &packet, None),
@@ -98,10 +98,9 @@ fn connected_kernel_filter_evidence_scopes_reflected_negotiation_policy() {
     ));
 
     let mut locked_self_payload = v4_spec;
-    locked_self_payload.admission.locked_flow = Some(ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::LOCALHOST,
-        ident: 1001,
-    });
+    locked_self_payload.admission.locked_flow = Some(ClientFlowKey::Icmp(
+        LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 1001),
+    ));
     assert!(matches!(
         admit_wire_packet(false, &cfg, locked_self_payload, &user_payload, None),
         WirePacketAdmission::Accepted(_)
@@ -151,8 +150,8 @@ fn wire_admission_accepts_disjoint_session_control_ack_source_and_reply_ids() {
     let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let mut spec = icmp_wire_spec(
         Some(FlowTuple::new(
-            FlowEndpoint::new(v4, 9999),
-            FlowEndpoint::new(v4, 40001),
+            LogicalEndpoint::new(v4, 9999),
+            LogicalEndpoint::new(v4, 40001),
         )),
         None,
     );
@@ -238,29 +237,22 @@ fn icmp_ipv6_raw_admission_preserves_metadata_scope_when_available() {
     packet[40] = 128;
     packet[44..46].copy_from_slice(&1001u16.to_be_bytes());
 
-    let source = SocketAddr::new(
-        IpAddr::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+    let source = LogicalEndpoint::from_socket_addr(SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
         0,
-    )
-    .into();
-    let mut source = CanonicalAddr::from_sock_addr(&source).unwrap();
-    if let SocketAddr::V6(v6) = &mut source.addr {
-        v6.set_scope_id(7);
-    }
+        0,
+        7,
+    )));
 
-    let admitted = match admit_packet(spec, &packet, Some(&source.addr.into())) {
+    let admitted = match admit_packet(spec, &packet, Some(&source.to_sock_addr())) {
         TransportAdmission::Accepted(admitted) => admitted,
         other => panic!("unexpected admission: {other:?}"),
     };
     let actual_source = admitted.normalized_source.unwrap();
     assert_eq!(
-        actual_source.addr.ip(),
+        actual_source.ip(),
         IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))
     );
-    if let SocketAddr::V6(v6) = actual_source.addr {
-        assert_eq!(v6.scope_id(), 7);
-    } else {
-        panic!("expected IPv6 source");
-    }
-    assert_eq!(actual_source.id, 1001);
+    assert_eq!(actual_source.scope_id(), 7);
+    assert_eq!(actual_source.id(), 1001);
 }

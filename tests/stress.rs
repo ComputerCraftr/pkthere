@@ -3,13 +3,19 @@ use pkthere_test_support::matrix::spawn_upstream_echo_or_skip;
 use pkthere_test_support::network::{bind_udp_client, localhost_addr, udp_listen_arg};
 use pkthere_test_support::runtime_asserts::expect_session_stats_json;
 use pkthere_test_support::timing::{
-    MAX_WAIT_SECS, STATS_WAIT_MS, STRESS_SEND_PAUSE, STRESS_TEST_DURATION,
+    MAX_WAIT_SECS, RETRY_RECV_WAIT_MS, STATS_WAIT_MS, STRESS_DRAIN_WAIT, STRESS_SEND_PAUSE,
+    STRESS_TEST_DURATION,
 };
 
 use socket2::Domain;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Instant;
+
+const STRESS_SEND_BURST_PACKETS: u64 = 8;
+const STRESS_MAX_IN_FLIGHT_PACKETS: u64 = 32;
 
 #[test]
 #[ignore = "long-running release stress owner; invoked exactly by native release-stress CI"]
@@ -59,16 +65,23 @@ fn stress_test_ipv4_case(proto: &str) {
         .send(&payload)
         .expect("send to forwarder (IPv4)");
 
-    let end = Instant::now() + STRESS_TEST_DURATION;
-    let mut sent = 0u64;
+    let send_deadline = Instant::now() + STRESS_TEST_DURATION;
+    let receive_deadline = send_deadline + STRESS_DRAIN_WAIT;
+    let mut sent = 1u64;
+    let received = Arc::new(AtomicU64::new(0));
 
     let recv_sock = client_sock.try_clone().expect("clone recv socket");
+    recv_sock
+        .set_read_timeout(Some(RETRY_RECV_WAIT_MS))
+        .expect("set bounded stress receive timeout");
+    let receive_count = Arc::clone(&received);
     let recv_thr = thread::spawn(move || {
-        let mut rcvd = 0u64;
         let mut buf = [0u8; 65535];
-        while Instant::now() < end {
+        while Instant::now() < receive_deadline {
             match recv_sock.recv(&mut buf) {
-                Ok(_) => rcvd += 1,
+                Ok(_) => {
+                    receive_count.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(e) => {
                     let kind = e.kind();
                     if kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::TimedOut {
@@ -78,11 +91,17 @@ fn stress_test_ipv4_case(proto: &str) {
                 }
             }
         }
-        rcvd
     });
 
-    while Instant::now() < end {
-        for _ in 0..64 {
+    while Instant::now() < send_deadline {
+        let in_flight = sent.saturating_sub(received.load(Ordering::Relaxed));
+        let available = STRESS_MAX_IN_FLIGHT_PACKETS.saturating_sub(in_flight);
+        if available == 0 {
+            thread::sleep(STRESS_SEND_PAUSE);
+            continue;
+        }
+        let burst = available.min(STRESS_SEND_BURST_PACKETS);
+        for _ in 0..burst {
             client_sock
                 .send(&payload)
                 .expect("send to forwarder (IPv4)");
@@ -91,7 +110,8 @@ fn stress_test_ipv4_case(proto: &str) {
         thread::sleep(STRESS_SEND_PAUSE);
     }
 
-    let rcvd = recv_thr.join().expect("join recv thread");
+    recv_thr.join().expect("join recv thread");
+    let rcvd = received.load(Ordering::Relaxed);
     let rcvd_pct = if sent == 0 {
         0.0
     } else {

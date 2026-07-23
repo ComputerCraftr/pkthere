@@ -1,21 +1,21 @@
+use crate::endpoint::LogicalEndpoint;
 use crate::flow_key::{ClientFlowKey, SocketLegFlow};
+use crate::net::managed_socket::ManagedSocket;
 use crate::net::packet_headers::ReceiveParserKernel;
-use crate::net::params::CanonicalAddr;
 use crate::net::socket::family_changed;
 use pkthere_socket_policy::{ResolvedSocketPolicy, SocketEvidenceKey};
-use socket2::{Socket, Type};
+use socket2::Type;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub(crate) struct ListenerMetadata {
-    pub(crate) listen_local_filter: CanonicalAddr,
+    pub(crate) listen_local_filter: LogicalEndpoint,
     pub(crate) listen_local_kernel_addr: SocketAddr,
     pub(crate) evidence_key: SocketEvidenceKey,
     pub(crate) flow: Option<ClientFlowKey>,
     pub(crate) listener_flow: SocketLegFlow,
-    pub(crate) listener_connected: bool,
     pub(crate) sock_type: Type,
     pub(crate) policy: ResolvedSocketPolicy,
     pub(crate) parser: ReceiveParserKernel,
@@ -23,19 +23,18 @@ pub(crate) struct ListenerMetadata {
 
 #[derive(Clone)]
 pub(crate) struct UpstreamMetadata {
-    pub(crate) upstream_remote_filter: CanonicalAddr,
-    pub(crate) upstream_local_filter: CanonicalAddr,
+    pub(crate) upstream_remote_filter: LogicalEndpoint,
+    pub(crate) upstream_local_filter: LogicalEndpoint,
     pub(crate) upstream_local_kernel_addr: SocketAddr,
     pub(crate) evidence_key: SocketEvidenceKey,
     pub(crate) upstream_flow: SocketLegFlow,
-    pub(crate) upstream_connected: bool,
     pub(crate) sock_type: Type,
     pub(crate) policy: ResolvedSocketPolicy,
     pub(crate) parser: ReceiveParserKernel,
 }
 
 pub(super) struct ClientListenState {
-    pub(super) sock: Socket,
+    pub(super) sock: ManagedSocket,
     pub(super) metadata: Arc<ListenerMetadata>,
 }
 
@@ -54,7 +53,7 @@ impl DerefMut for ClientListenState {
 }
 
 pub(super) struct UpstreamState {
-    pub(super) sock: Socket,
+    pub(super) sock: ManagedSocket,
     pub(super) metadata: Arc<UpstreamMetadata>,
 }
 
@@ -73,7 +72,7 @@ impl DerefMut for UpstreamState {
 }
 
 pub(super) struct ReresolveResult<M> {
-    pub(super) sock: Socket,
+    pub(super) sock: ManagedSocket,
     pub(super) metadata: Arc<M>,
     pub(super) update: SocketUpdateKind,
 }
@@ -114,17 +113,17 @@ pub(super) enum ReresolveAction {
 
 #[inline]
 pub(super) fn decide_listener_reresolve(
-    prev: CanonicalAddr,
+    prev: LogicalEndpoint,
     resolved: SocketAddr,
-) -> (CanonicalAddr, ReresolveAction) {
+) -> (LogicalEndpoint, ReresolveAction) {
     decide_listener_endpoint_update(prev, prev.with_resolved_ip(resolved))
 }
 
 #[inline]
 pub(super) fn decide_listener_endpoint_update(
-    prev: CanonicalAddr,
-    fresh: CanonicalAddr,
-) -> (CanonicalAddr, ReresolveAction) {
+    prev: LogicalEndpoint,
+    fresh: LogicalEndpoint,
+) -> (LogicalEndpoint, ReresolveAction) {
     if fresh == prev {
         (prev, ReresolveAction::NoChange)
     } else {
@@ -134,11 +133,11 @@ pub(super) fn decide_listener_endpoint_update(
 
 #[inline]
 pub(super) fn decide_upstream_reresolve(
-    prev: CanonicalAddr,
+    prev: LogicalEndpoint,
     resolved: SocketAddr,
     upstream_connected: bool,
     policy: ResolvedSocketPolicy,
-) -> (CanonicalAddr, ReresolveAction) {
+) -> (LogicalEndpoint, ReresolveAction) {
     decide_upstream_endpoint_update(
         prev,
         prev.with_resolved_ip(resolved),
@@ -149,15 +148,15 @@ pub(super) fn decide_upstream_reresolve(
 
 #[inline]
 pub(super) fn decide_upstream_endpoint_update(
-    prev: CanonicalAddr,
-    fresh: CanonicalAddr,
+    prev: LogicalEndpoint,
+    fresh: LogicalEndpoint,
     upstream_connected: bool,
     policy: ResolvedSocketPolicy,
-) -> (CanonicalAddr, ReresolveAction) {
+) -> (LogicalEndpoint, ReresolveAction) {
     if fresh == prev {
         return (prev, ReresolveAction::NoChange);
     }
-    if family_changed(prev.addr, fresh.addr) {
+    if family_changed(prev.to_socket_addr(), fresh.to_socket_addr()) {
         return (fresh, ReresolveAction::ReplaceSocket);
     }
 

@@ -1,5 +1,7 @@
 use super::client::ClientWorkerContext;
-use super::client_lock::{accept_pending_negotiation, publish_client_lock};
+use super::client_lock::{
+    ClientLockTransactionError, accept_pending_negotiation, publish_client_lock,
+};
 use super::packet_admission::AdmittedWirePacket;
 use super::{
     BufferedSyncUpdate, CachedClientState, PacketContext, PacketDisposition, PacketTraceId,
@@ -151,7 +153,7 @@ pub(super) fn process_client_packet(
     upstream_side_cache: &mut IcmpSequenceCache,
     was_locked: &mut bool,
     admitted: AdmittedWirePacket<'_>,
-) {
+) -> Result<(), ClientLockTransactionError> {
     let trace = admitted.trace.expect("received packet trace");
     let received_at = Instant::now();
     if context.flow_state.is_locked() {
@@ -165,26 +167,26 @@ pub(super) fn process_client_packet(
             trace,
             received_at,
         );
-        return;
+        return Ok(());
     }
-    if handles.listener.listener_connected {
+    if handles.listener_connected() {
         log_packet_disposition(context.cfg, trace, PacketDisposition::DropNoActiveFlow);
-        return;
+        return Ok(());
     }
 
     let Some(source) = admitted.normalized_source else {
         log_packet_disposition(context.cfg, trace, PacketDisposition::DropNoActiveFlow);
-        return;
+        return Ok(());
     };
     if admitted.event.is_cadence_packet() {
         log_packet_disposition(context.cfg, trace, PacketDisposition::ConsumeCadence);
-        return;
+        return Ok(());
     }
     if admitted.pending_negotiation.is_some() {
         let pending_reply_route =
             match accept_pending_negotiation(context, admitted.pending_negotiation, trace) {
                 Ok(route) => route,
-                Err(()) => return,
+                Err(()) => return Ok(()),
             };
         handle_c2u_session_control(
             PacketContext::new(
@@ -203,11 +205,11 @@ pub(super) fn process_client_packet(
             &admitted.event,
             Some(trace),
         );
-        return;
+        return Ok(());
     }
     let Some(lock_candidate) = admitted.lock_candidate else {
         log_packet_disposition(context.cfg, trace, PacketDisposition::DropFlowConflict);
-        return;
+        return Ok(());
     };
     if !publish_client_lock(
         context,
@@ -219,8 +221,8 @@ pub(super) fn process_client_packet(
         source,
         lock_candidate,
         trace,
-    ) {
-        return;
+    )? {
+        return Ok(());
     }
     dispatch_c2u_event(
         context,
@@ -232,4 +234,5 @@ pub(super) fn process_client_packet(
         trace,
         received_at,
     );
+    Ok(())
 }

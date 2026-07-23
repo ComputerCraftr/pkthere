@@ -12,7 +12,7 @@ use crate::socket_reality::evidence::{
 use pkthere_socket_policy::{
     IcmpKernelIdPolicy, IcmpPolicyIntent, IcmpSocketIdCapability, PeerSourceRequirement,
     ReceiveSyscall, ResolvedSocketPolicy, SocketEvidenceKey, SocketRole, TimeoutAction,
-    resolve_socket_policy_with_icmp_intent, socket_post_bind_policy,
+    ip_version_for_domain, resolve_socket_policy_with_icmp_intent, socket_post_bind_policy,
 };
 use pkthere_wire::SupportedProtocol;
 use pkthere_wire::packet_headers::{
@@ -765,10 +765,9 @@ fn successful_sends(socket: &ProbeSocketEvidence) -> impl DoubleEndedIterator<It
 }
 
 fn parse_icmp_transport(domain: Domain, bytes: &[u8]) -> ParsedPacketHeaders {
-    if domain == Domain::IPV4 {
-        packet_headers::parse_icmp_v4_transport(bytes)
-    } else {
-        packet_headers::parse_icmp_v6_transport(bytes)
+    match ip_version_for_domain(domain).expect("reality cases use IP socket domains") {
+        IpVersion::V4 => packet_headers::parse_icmp_v4_transport(bytes),
+        IpVersion::V6 => packet_headers::parse_icmp_v6_transport(bytes),
     }
 }
 
@@ -777,13 +776,7 @@ fn parse_received_icmp(
     receive_header: ReceiveHeaderMode,
     bytes: &[u8],
 ) -> ParsedPacketHeaders {
-    let version = if domain == Domain::IPV4 {
-        IpVersion::V4
-    } else if domain == Domain::IPV6 {
-        IpVersion::V6
-    } else {
-        panic!("unsupported direct-probe domain: {domain:?}");
-    };
+    let version = ip_version_for_domain(domain).expect("direct probes use IP socket domains");
     select_receive_parser(SupportedProtocol::ICMP, version, receive_header)
         .expect("production policy must select a strict ICMP parser")
         .parse(bytes)

@@ -2,14 +2,14 @@ use crate::cli::{
     DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
     RuntimeOptions, SupportedProtocol, TimeoutAction, WorkerFlowMode,
 };
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple};
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple};
 use crate::net::framing_shim::{
     ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, ReplyIdNegotiation,
     encode_icmp_tunnel_prefix_with_source,
 };
 use crate::net::icmp_sequence::SharedIcmpSequenceState;
 use crate::net::packet_headers::parse_packet_headers;
-use crate::net::params::CanonicalAddr;
 use crate::net::payload::{
     C2uSessionControlDecision, PayloadEvent, U2cDecision, classify_c2u_session_control_event,
     classify_u2c_event, reply_id_negotiation_for_c2u, reply_id_negotiation_for_u2c_listener_reply,
@@ -32,7 +32,7 @@ fn test_config(
     upstream_proto: SupportedProtocol,
 ) -> RuntimeConfig {
     RuntimeConfig {
-        listen: CanonicalAddr::new(
+        listen: LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1001)),
             1001,
         ),
@@ -41,7 +41,7 @@ fn test_config(
         listen_proto,
         listen_mode: ListenMode::Fixed,
         listen_str: String::from("test-listen"),
-        upstream: CanonicalAddr::new(
+        upstream: LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 4321)),
             4321,
         ),
@@ -113,23 +113,23 @@ fn validate_payload<'a>(
         icmp.id_capability = pkthere_socket_policy::IcmpSocketIdCapability::DisjointIds;
     }
 
-    spec.admission.expected_local = Some(FlowEndpoint::new(
+    spec.admission.expected_local = Some(LogicalEndpoint::new(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         expected_local_id,
     ));
-    spec.socket.local_filter = CanonicalAddr::from_v4(Ipv4Addr::LOCALHOST, expected_local_id);
+    spec.socket.local_filter = LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, expected_local_id);
 
     if is_locked {
         let remote_id = match locked_icmp_remote_source_id {
             Some(id) => id,
             None => DEFAULT_REMOTE_SOURCE_ID,
         };
-        let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), remote_id);
-        let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), expected_local_id);
-        spec.admission.locked_flow = Some(ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::new(127, 0, 0, 2),
-            ident: remote_id,
-        });
+        let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), remote_id);
+        let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), expected_local_id);
+        spec.admission.locked_flow = Some(ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+            Ipv4Addr::new(127, 0, 0, 2),
+            remote_id,
+        )));
         spec.admission.expected_inbound = Some(FlowTuple::new(remote, local));
     }
 

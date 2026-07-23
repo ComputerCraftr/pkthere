@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest
 
 from docker.alpine.pkthere_harness.test_manifest import (
+    ALPINE_CONCURRENCY_TESTS,
     PRIVILEGED_ICMP_TESTS,
     RAW_SOCKET_REALITY_TEST,
+    alpine_concurrency_tests_for_platform,
     native_platform_name,
     privileged_icmp_tests_for_platform,
 )
@@ -30,6 +32,35 @@ class TestManifestTests(unittest.TestCase):
             self.assertIn("--locked", arguments)
             self.assertEqual(arguments[-3:], ("--exact", "--ignored", "--nocapture"))
             self.assertEqual(arguments.count(selection.test_name), 1)
+
+    def test_alpine_concurrency_manifest_is_exact_nonignored_and_complete(self) -> None:
+        expected_suffixes = {
+            "multi_worker_receive_boundary_covers_zero_capacity_reuse_and_mixed_syscalls",
+            "concurrent_destination_required_fallback_publishes_one_association_transition",
+            (
+                "shared_flow_concurrent_rollback_failure_blocks_competitors_"
+                "and_requests_fatal_exit"
+            ),
+        }
+        self.assertEqual(
+            {
+                selection.test_name.rsplit("::", maxsplit=1)[-1]
+                for selection in ALPINE_CONCURRENCY_TESTS
+            },
+            expected_suffixes,
+        )
+        for selection in ALPINE_CONCURRENCY_TESTS:
+            self.assertFalse(selection.ignored)
+            self.assertEqual(
+                selection.harness_arguments()[-2:],
+                ("--exact", "--nocapture"),
+            )
+            self.assertEqual(selection.staged_executable, "pkthere-unit-test")
+        self.assertEqual(
+            alpine_concurrency_tests_for_platform("linux"),
+            ALPINE_CONCURRENCY_TESTS,
+        )
+        self.assertEqual(alpine_concurrency_tests_for_platform("macos"), ())
 
     def test_staged_manifest_names_match_container_artifact_contract(self) -> None:
         self.assertEqual(

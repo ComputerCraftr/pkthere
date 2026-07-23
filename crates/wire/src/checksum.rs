@@ -1,4 +1,7 @@
-use bytemuck::{must_cast_ref, pod_align_to, pod_read_unaligned};
+use bytemuck::pod_read_unaligned;
+#[cfg(not(miri))]
+use bytemuck::{must_cast_ref, pod_align_to};
+#[cfg(not(miri))]
 use wide::u32x16;
 
 const WORD_LO_U32: u32 = 0x0000_FFFF;
@@ -53,6 +56,7 @@ fn csum_be64_8(bytes: &[u8; 8]) -> u32 {
 }
 
 /// Sum 8 bytes as four native-endian 16-bit words. Uses a reduction tree for ILP.
+#[cfg(not(miri))]
 #[inline(always)]
 fn csum_native64_8(bytes: &[u8; 8]) -> u32 {
     let x = pod_read_unaligned::<u64>(bytes);
@@ -101,6 +105,7 @@ fn csum_be_slice(bytes: &[u8]) -> u32 {
 }
 
 /// Sum a byte slice as native-endian 16-bit words. Optimized with ILP and dual accumulators.
+#[cfg(not(miri))]
 #[inline(always)]
 fn csum_native_slice(bytes: &[u8]) -> u32 {
     let mut sum_a = 0;
@@ -137,6 +142,19 @@ const fn fold32_16(mut sum: u32) -> u16 {
 }
 
 /// Central SIMD logic with robust alignment correction.
+#[cfg(miri)]
+#[inline(always)]
+fn csum_slice(data: &[u8], initial_swap: bool) -> u32 {
+    let sum = csum_be_slice(data);
+    if initial_swap {
+        swap_words_u32(sum)
+    } else {
+        sum
+    }
+}
+
+/// Central SIMD logic with robust alignment correction.
+#[cfg(not(miri))]
 #[inline(always)]
 fn csum_slice(data: &[u8], initial_swap: bool) -> u32 {
     // Aligned SIMD handles 64-byte chunks with zero-cost native-endian summation.

@@ -6,11 +6,75 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_TEMP_REPOSITORY: AtomicU64 = AtomicU64::new(0);
 
 fn findings(source: &str, kind: PolicyKind) -> Vec<PolicyFinding> {
-    analyze_rust_source("fixture.rs", source)
+    findings_at("fixture.rs", source, kind)
+}
+
+fn findings_at(path: &str, source: &str, kind: PolicyKind) -> Vec<PolicyFinding> {
+    analyze_rust_source(path, source)
         .findings
         .into_iter()
         .filter(|finding| finding.kind == kind)
         .collect()
+}
+
+#[test]
+fn socket_authority_detects_ufcs_aliases_and_unsafe_prefix_conversion() {
+    let source = r#"
+        use socket2::Socket as RawSocket;
+        fn receive(socket: &RawSocket, buffer: &mut [std::mem::MaybeUninit<u8>]) {
+            let _ = RawSocket::recv(socket, buffer);
+            let _ = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), 1) };
+        }
+    "#;
+    assert!(
+        findings_at(
+            "src/fixture.rs",
+            source,
+            PolicyKind::SocketLifecycleAuthority,
+        )
+        .len()
+            >= 2
+    );
+}
+
+#[test]
+fn socket_authority_rejects_renamed_family_discriminators() {
+    let source = "enum IpFamily { V4, V6 }\n";
+    assert_eq!(
+        findings_at(
+            "crates/wire/src/packet_headers/fixture.rs",
+            source,
+            PolicyKind::SocketLifecycleAuthority,
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
+fn socket_authority_rejects_boolean_send_selection() {
+    let source = r#"
+        fn transmit(socket: &Socket, connected: bool, bytes: &[u8], destination: &SockAddr) {
+            if connected {
+                let _ = socket.send(bytes);
+            } else {
+                let _ = socket.send_to(bytes, destination);
+            }
+        }
+        fn indirect(handles: &Handles, socket: &Socket) {
+            let connected = handles.listener_connected();
+            some_other_send_function(socket, connected);
+        }
+    "#;
+    assert!(
+        findings_at(
+            "src/fixture.rs",
+            source,
+            PolicyKind::SocketLifecycleAuthority,
+        )
+        .len()
+            >= 2
+    );
 }
 
 #[test]

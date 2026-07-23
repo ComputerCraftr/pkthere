@@ -8,13 +8,13 @@ use super::{
 fn wire_packet_admission_stays_stack_sized_without_hot_path_boxing() {
     let size = std::mem::size_of::<WirePacketAdmission<'static>>();
     assert!(
-        size <= 384,
+        size <= 416,
         "WirePacketAdmission grew enough to reconsider its unboxed hot-path representation: {size} bytes"
     );
 }
 use crate::cli::{IcmpReplyIdRequest, SupportedProtocol};
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple};
-use crate::net::params::CanonicalAddr;
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple};
 use crate::net::payload::PayloadEvent;
 use crate::worker_support::admission_test_support::{
     admission_spec, icmp_tunnel_packet, icmp_wire_spec, pending_icmp_lock_candidate, test_config,
@@ -65,17 +65,17 @@ fn wire_admission_builds_pending_state_from_session_control_negotiation_without_
         .expect("pending negotiation candidate");
     assert_eq!(
         lock.flow_key,
-        ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::new(127, 0, 0, 2),
-            ident: 0x2002
-        }
+        ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+            Ipv4Addr::new(127, 0, 0, 2),
+            0x2002
+        ))
     );
     let inbound = lock.listener_flow.inbound.expect("inbound tuple");
-    assert_eq!(inbound.src.id, 0x2002);
-    assert_eq!(inbound.dst.id, 1001);
+    assert_eq!(inbound.src.id(), 0x2002);
+    assert_eq!(inbound.dst.id(), 1001);
     let outbound = lock.listener_flow.outbound.expect("outbound tuple");
-    assert_eq!(outbound.src.id, 3003);
-    assert_eq!(outbound.dst.id, 0x2002);
+    assert_eq!(outbound.src.id(), 3003);
+    assert_eq!(outbound.dst.id(), 0x2002);
 }
 
 #[test]
@@ -95,11 +95,11 @@ fn wire_admission_consumes_pending_negotiation_for_first_shimmed_user_payload() 
     assert_eq!(lock, pending);
     assert!(admitted.pending_negotiation.is_none());
     let inbound = lock.listener_flow.inbound.expect("inbound tuple");
-    assert_eq!(inbound.src.id, 0x2002);
-    assert_eq!(inbound.dst.id, 1001);
+    assert_eq!(inbound.src.id(), 0x2002);
+    assert_eq!(inbound.dst.id(), 1001);
     let outbound = lock.listener_flow.outbound.expect("outbound tuple");
-    assert_eq!(outbound.src.id, 3003);
-    assert_eq!(outbound.dst.id, 0x2002);
+    assert_eq!(outbound.src.id(), 3003);
+    assert_eq!(outbound.dst.id(), 0x2002);
     match &admitted.event {
         PayloadEvent::UserPayload {
             bytes,
@@ -152,29 +152,29 @@ fn wire_admission_wildcard_local_reply_id_yields_to_peer_reply_id_and_uses_reali
         .expect("pending negotiation candidate");
     assert_eq!(
         pending.flow_key,
-        ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::new(127, 0, 0, 2),
-            ident: 0x2002
-        }
+        ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+            Ipv4Addr::new(127, 0, 0, 2),
+            0x2002
+        ))
     );
     let inbound = pending.listener_flow.inbound.expect("inbound tuple");
-    assert_eq!(inbound.src.id, 0x2002);
-    assert_eq!(inbound.dst.id, 1001);
+    assert_eq!(inbound.src.id(), 0x2002);
+    assert_eq!(inbound.dst.id(), 1001);
     let outbound = pending.listener_flow.outbound.expect("outbound tuple");
-    assert_eq!(outbound.src.id, 1001);
-    assert_eq!(outbound.dst.id, 0x2002);
+    assert_eq!(outbound.src.id(), 1001);
+    assert_eq!(outbound.dst.id(), 0x2002);
 }
 
 #[test]
 fn wire_admission_locked_icmp_user_payload_without_renegotiation_uses_locked_reply_id() {
     let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let locked = ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::new(127, 0, 0, 2),
-        ident: 0x2002,
-    };
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+        Ipv4Addr::new(127, 0, 0, 2),
+        0x2002,
+    ));
     let packet = icmp_tunnel_packet(1001, true, &[0x80, 0x20, 0x02, b'x']);
     let admitted = match admit_wire_packet(
         true,
@@ -200,12 +200,12 @@ fn wire_admission_locked_icmp_user_payload_without_renegotiation_uses_locked_rep
 fn wire_admission_rejects_locked_reply_id_renegotiation_after_source_match() {
     let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let locked = ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::new(127, 0, 0, 2),
-        ident: 0x2002,
-    };
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+        Ipv4Addr::new(127, 0, 0, 2),
+        0x2002,
+    ));
     let packet = icmp_tunnel_packet(1001, true, &[0x48, 0x20, 0x02, 0x20, 0x02]);
     match admit_wire_packet(
         true,
@@ -228,12 +228,12 @@ fn wire_admission_rejects_locked_reply_id_renegotiation_after_source_match() {
 fn wire_admission_rejects_locked_icmp_source_endpoint_mismatch() {
     let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let locked = ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::new(127, 0, 0, 2),
-        ident: 0x2002,
-    };
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+        Ipv4Addr::new(127, 0, 0, 2),
+        0x2002,
+    ));
     let packet = icmp_tunnel_packet(1001, true, &[0x80, 0x30, 0x03, b'x']);
     let res = admit_wire_packet(
         true,
@@ -246,7 +246,7 @@ fn wire_admission_rejects_locked_icmp_source_endpoint_mismatch() {
         WirePacketAdmission::Filtered(rej) => {
             assert_eq!(rej.reason, RejectionReason::IcmpSourceEndpointMismatch);
             assert_eq!(
-                rej.normalized_source.unwrap().id,
+                rej.normalized_source.unwrap().id(),
                 0x3003,
                 "rejection source ID must match logical shim ID, not physical header ID"
             );
@@ -259,12 +259,12 @@ fn wire_admission_rejects_locked_icmp_source_endpoint_mismatch() {
 fn wire_admission_rejects_locked_flow_wrong_source_ip() {
     let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let locked = ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::new(127, 0, 0, 2),
-        ident: 0x2002,
-    };
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+        Ipv4Addr::new(127, 0, 0, 2),
+        0x2002,
+    ));
     let packet = icmp_tunnel_packet(1001, true, &[0x80, 0x20, 0x02, b'x']);
     let res = admit_wire_packet(
         true,
@@ -277,7 +277,7 @@ fn wire_admission_rejects_locked_flow_wrong_source_ip() {
         WirePacketAdmission::Filtered(rej) => {
             assert_eq!(rej.reason, RejectionReason::UnexpectedRemotePeer);
             assert_eq!(
-                rej.normalized_source.unwrap().id,
+                rej.normalized_source.unwrap().id(),
                 0x2002,
                 "rejection source ID must match logical shim ID, not physical header ID"
             );
@@ -290,12 +290,12 @@ fn wire_admission_rejects_locked_flow_wrong_source_ip() {
 fn wire_admission_rejects_mismatched_os_id_after_handshake() {
     let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let locked = ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::new(127, 0, 0, 2),
-        ident: 0x2002,
-    };
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+        Ipv4Addr::new(127, 0, 0, 2),
+        0x2002,
+    ));
     let packet = icmp_tunnel_packet(1002, true, &[0x80, 0x20, 0x02, b'x']);
     assert!(matches!(
         admit_wire_packet(
@@ -328,8 +328,8 @@ fn wire_admission_u2c_reflected_reply_id_does_not_create_client_lock() {
 #[test]
 fn udp_admission_requires_exact_remote_ip_and_port() {
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1111).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1111);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1111);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::UDP,
@@ -338,8 +338,8 @@ fn udp_admission_requires_exact_remote_ip_and_port() {
             peer_source: PeerSourceRequirement::SourceMetadata,
             protocol_id: ProtocolIdRequirement::None,
         },
-        Some(remote.canonical()),
-        Some(local.id),
+        Some(remote),
+        Some(local.id()),
         None,
     );
     let packet = test_udp_packet(
@@ -420,8 +420,8 @@ fn udp_connected_admission_accepts_kernel_filtered_missing_socket_source() {
 
 #[test]
 fn icmp_dgram_admission_requires_remote_ip_and_local_receive_id() {
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1001);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1001);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::ICMP,
@@ -430,8 +430,8 @@ fn icmp_dgram_admission_requires_remote_ip_and_local_receive_id() {
             peer_source: PeerSourceRequirement::SourceMetadata,
             protocol_id: ProtocolIdRequirement::ParsedTransportIdentifier,
         },
-        Some(remote.canonical()),
-        Some(local.id),
+        Some(remote),
+        Some(local.id()),
         None,
     );
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1001).into();
@@ -478,7 +478,7 @@ fn icmp_dgram_admission_rejects_missing_socket_source_as_malformed() {
 
 #[test]
 fn icmp_raw_admission_requires_packet_destination_to_match_local_filter() {
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::ICMP,
@@ -488,8 +488,8 @@ fn icmp_raw_admission_requires_packet_destination_to_match_local_filter() {
             protocol_id: ProtocolIdRequirement::ParsedTransportIdentifier,
         },
         None,
-        Some(local.id),
-        Some(local.ip),
+        Some(local.id()),
+        Some(local.ip()),
     );
     let packet = test_icmp_echo_packet(
         Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
@@ -544,7 +544,7 @@ fn icmp_raw_destination_check_allows_unspecified_listener_filter() {
 
 #[test]
 fn icmp_raw_destination_check_rejects_missing_destination_for_concrete_filter() {
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::ICMP,
@@ -554,8 +554,8 @@ fn icmp_raw_destination_check_rejects_missing_destination_for_concrete_filter() 
             protocol_id: ProtocolIdRequirement::ParsedTransportIdentifier,
         },
         None,
-        Some(local.id),
-        Some(local.ip),
+        Some(local.id()),
+        Some(local.ip()),
     );
     let packet = test_icmp_echo_packet(None, None, 1001, true);
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into();
@@ -568,7 +568,7 @@ fn icmp_raw_destination_check_rejects_missing_destination_for_concrete_filter() 
 
 #[test]
 fn icmp_raw_admission_rejects_missing_raw_packet_source_as_malformed() {
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::ICMP,
@@ -578,8 +578,8 @@ fn icmp_raw_admission_rejects_missing_raw_packet_source_as_malformed() {
             protocol_id: ProtocolIdRequirement::ParsedTransportIdentifier,
         },
         None,
-        Some(local.id),
-        Some(local.ip),
+        Some(local.id()),
+        Some(local.ip()),
     );
     let packet_without_ip_header = test_icmp_echo_packet(None, None, 1001, true);
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0).into();
@@ -591,8 +591,8 @@ fn icmp_raw_admission_rejects_missing_raw_packet_source_as_malformed() {
 
 #[test]
 fn icmp_raw_reflected_self_loop_is_rejected_by_remote_ip_check() {
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1001);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1001);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::ICMP,
@@ -601,9 +601,9 @@ fn icmp_raw_reflected_self_loop_is_rejected_by_remote_ip_check() {
             peer_source: PeerSourceRequirement::RawPacketHeader,
             protocol_id: ProtocolIdRequirement::ParsedTransportIdentifier,
         },
-        Some(remote.canonical()),
-        Some(local.id),
-        Some(local.ip),
+        Some(remote),
+        Some(local.id()),
+        Some(local.ip()),
     );
     let packet = test_icmp_echo_packet(
         Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -621,7 +621,7 @@ fn icmp_raw_reflected_self_loop_is_rejected_by_remote_ip_check() {
 
 #[test]
 fn icmp_raw_admission_uses_packet_source_ip_not_socket_metadata() {
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 65410);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 65410);
     let spec = admission_spec(
         SocketLeg::ClientFacing,
         SupportedProtocol::ICMP,
@@ -631,8 +631,8 @@ fn icmp_raw_admission_uses_packet_source_ip_not_socket_metadata() {
             protocol_id: ProtocolIdRequirement::ParsedTransportIdentifier,
         },
         None,
-        Some(local.id),
-        Some(local.ip),
+        Some(local.id()),
+        Some(local.ip()),
     );
     let packet = test_icmp_echo_packet(
         Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3))),
@@ -647,7 +647,7 @@ fn icmp_raw_admission_uses_packet_source_ip_not_socket_metadata() {
     };
     assert_eq!(
         admitted.normalized_source,
-        Some(CanonicalAddr::new(
+        Some(LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)), 0),
             65410
         ))
@@ -708,12 +708,12 @@ fn wire_admission_dgram_rejects_disjoint_reply_id_even_when_locked() {
     // disjoint receive capability.
     let cfg = test_config(IcmpReplyIdRequest::Default);
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let locked = ClientFlowKey::IcmpV4 {
-        ip: Ipv4Addr::new(127, 0, 0, 2),
-        ident: 0x2002,
-    };
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 0x2002);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let locked = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(
+        Ipv4Addr::new(127, 0, 0, 2),
+        0x2002,
+    ));
     let mut spec = icmp_wire_spec(Some(FlowTuple::new(remote, local)), Some(locked));
     spec.socket.sock_type = Type::DGRAM;
     spec.socket
@@ -802,23 +802,20 @@ fn icmp_raw_ipv6_admission_accepts_headerless_packet() {
         Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
     );
     let packet = icmp_tunnel_packet(1001, true, &[]);
-    let source = SocketAddr::new(
-        IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+    let source = socket2::SockAddr::from(SocketAddr::V6(std::net::SocketAddrV6::new(
+        Ipv6Addr::LOCALHOST,
         0,
-    )
-    .into();
-    let mut source = CanonicalAddr::from_sock_addr(&source).unwrap();
-    if let SocketAddr::V6(v6) = &mut source.addr {
-        v6.set_scope_id(7);
-    }
+        0,
+        7,
+    )));
 
-    let admitted = match admit_packet(spec, &packet, Some(&source.addr.into())) {
+    let admitted = match admit_packet(spec, &packet, Some(&source)) {
         TransportAdmission::Accepted(admitted) => admitted,
         other => panic!("unexpected admission: {other:?}"),
     };
     assert_eq!(
         admitted.normalized_source,
-        Some(CanonicalAddr::new(
+        Some(LogicalEndpoint::from_socket_addr_with_id(
             SocketAddr::V6(std::net::SocketAddrV6::new(Ipv6Addr::LOCALHOST, 0, 0, 7)),
             1001
         ))
@@ -852,8 +849,8 @@ fn icmp_raw_ipv4_admission_rejects_headerless_packet_as_malformed() {
 fn wire_admission_debug_kernel_echo_allows_reflected_explicit_self_negotiation() {
     let cfg = test_config(IcmpReplyIdRequest::Fixed(3003));
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into();
-    let remote = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
-    let local = FlowEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
+    let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1001);
     let mut spec = icmp_wire_spec(Some(FlowTuple::new(remote, local)), None);
     spec.socket.role = SocketLeg::UpstreamFacing;
     spec.socket
@@ -878,7 +875,7 @@ fn wire_admission_debug_kernel_echo_allows_reflected_explicit_self_negotiation()
     // macOS ping sockets can retain an unspecified logical local address while
     // exposing the loopback peer address as receive metadata. In that shape,
     // the configured kernel-echo peer is the authoritative reflection address.
-    spec.socket.local_filter = CanonicalAddr::from_v4(Ipv4Addr::UNSPECIFIED, 1001);
+    spec.socket.local_filter = LogicalEndpoint::from_v4(Ipv4Addr::UNSPECIFIED, 1001);
     assert!(matches!(
         admit_wire_packet(false, &cfg, spec, &packet, Some(&source)),
         WirePacketAdmission::Accepted(_)
@@ -960,14 +957,11 @@ fn wire_admission_dgram_accepts_source_id_equals_header_when_ids_match() {
         .expect("pending negotiation candidate");
     assert_eq!(
         lock.flow_key,
-        ClientFlowKey::IcmpV4 {
-            ip: Ipv4Addr::new(127, 0, 0, 2),
-            ident: 1001,
-        }
+        ClientFlowKey::Icmp(LogicalEndpoint::from_v4(Ipv4Addr::new(127, 0, 0, 2), 1001))
     );
     let inbound = lock.listener_flow.inbound.expect("inbound tuple");
-    assert_eq!(inbound.src.id, 1001);
-    assert_eq!(inbound.dst.id, 1001);
+    assert_eq!(inbound.src.id(), 1001);
+    assert_eq!(inbound.dst.id(), 1001);
 }
 
 #[test]

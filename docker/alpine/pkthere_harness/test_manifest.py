@@ -14,6 +14,14 @@ class CargoTestSelection:
     test_name: str
     staged_executable: str
     platforms: frozenset[str]
+    ignored: bool
+
+    def harness_arguments(self) -> tuple[str, ...]:
+        arguments = [self.test_name, "--exact"]
+        if self.ignored:
+            arguments.append("--ignored")
+        arguments.append("--nocapture")
+        return tuple(arguments)
 
     def cargo_arguments(self) -> tuple[str, ...]:
         target = (
@@ -28,21 +36,12 @@ class CargoTestSelection:
             "-p",
             self.package,
             *target,
-            self.test_name,
             "--",
-            "--exact",
-            "--ignored",
-            "--nocapture",
+            *self.harness_arguments(),
         )
 
     def executable_arguments(self, executable: str) -> tuple[str, ...]:
-        return (
-            executable,
-            self.test_name,
-            "--exact",
-            "--ignored",
-            "--nocapture",
-        )
+        return (executable, *self.harness_arguments())
 
 
 PRIVILEGED_ICMP_TESTS = (
@@ -55,6 +54,7 @@ PRIVILEGED_ICMP_TESTS = (
         ),
         staged_executable="icmp-integration-test",
         platforms=frozenset({"linux", "android"}),
+        ignored=True,
     ),
     CargoTestSelection(
         package="pkthere",
@@ -63,6 +63,7 @@ PRIVILEGED_ICMP_TESTS = (
         test_name="raw_icmp_locked_flow_rejects_wrong_source_id",
         staged_executable="icmp-integration-test",
         platforms=frozenset({"linux", "android", "windows", "freebsd"}),
+        ignored=True,
     ),
     CargoTestSelection(
         package="pkthere",
@@ -71,6 +72,7 @@ PRIVILEGED_ICMP_TESTS = (
         test_name="test_raw_icmp_independent_ids",
         staged_executable="icmp-integration-test",
         platforms=frozenset({"linux", "android", "windows", "freebsd"}),
+        ignored=True,
     ),
     CargoTestSelection(
         package="pkthere-test-support",
@@ -81,6 +83,7 @@ PRIVILEGED_ICMP_TESTS = (
         ),
         staged_executable="pkthere-test-support-test",
         platforms=frozenset({"linux", "android", "windows", "freebsd"}),
+        ignored=True,
     ),
 )
 
@@ -91,6 +94,47 @@ RAW_SOCKET_REALITY_TEST = CargoTestSelection(
     test_name="raw_icmp_forwarder_packet_dump_matches_policy",
     staged_executable="socket-reality-test",
     platforms=frozenset({"linux", "android", "macos", "windows", "freebsd"}),
+    ignored=True,
+)
+
+ALPINE_CONCURRENCY_TESTS = (
+    CargoTestSelection(
+        package="pkthere",
+        target_flag="--bin",
+        target_name="pkthere",
+        test_name=(
+            "net::managed_socket::receive_tests::"
+            "multi_worker_receive_boundary_covers_zero_capacity_reuse_and_mixed_syscalls"
+        ),
+        staged_executable="pkthere-unit-test",
+        platforms=frozenset({"linux"}),
+        ignored=False,
+    ),
+    CargoTestSelection(
+        package="pkthere",
+        target_flag="--bin",
+        target_name="pkthere",
+        test_name=(
+            "net::managed_socket::concurrency_tests::"
+            "concurrent_destination_required_fallback_publishes_one_association_transition"
+        ),
+        staged_executable="pkthere-unit-test",
+        platforms=frozenset({"linux"}),
+        ignored=False,
+    ),
+    CargoTestSelection(
+        package="pkthere",
+        target_flag="--bin",
+        target_name="pkthere",
+        test_name=(
+            "worker_support::client_lock::tests::"
+            "shared_flow_concurrent_rollback_failure_blocks_competitors_"
+            "and_requests_fatal_exit"
+        ),
+        staged_executable="pkthere-unit-test",
+        platforms=frozenset({"linux"}),
+        ignored=False,
+    ),
 )
 
 
@@ -113,5 +157,16 @@ def privileged_icmp_tests_for_platform(
     return tuple(
         selection
         for selection in PRIVILEGED_ICMP_TESTS
+        if normalized in selection.platforms
+    )
+
+
+def alpine_concurrency_tests_for_platform(
+    platform: str,
+) -> tuple[CargoTestSelection, ...]:
+    normalized = platform.lower()
+    return tuple(
+        selection
+        for selection in ALPINE_CONCURRENCY_TESTS
         if normalized in selection.platforms
     )

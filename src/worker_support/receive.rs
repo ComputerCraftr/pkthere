@@ -2,16 +2,15 @@ use super::packet_admission::{
     AdmittedWirePacket, ReceiveContext, SocketLeg, WirePacketAdmission, log_rejected_packet,
     record_rejection_stats,
 };
-use super::{PacketTraceId, admit_received_packet_with_dump, recv_packet};
+use super::{PacketTraceId, admit_received_packet_with_dump};
 use crate::cli::RuntimeConfig;
-use crate::recv_buf::RecvBuf;
+use crate::net::managed_socket::{ManagedSocket, ReceiveBuffer};
 use crate::stats::StatsShard;
 use pkthere_socket_policy::ReceiveSyscall;
-use socket2::Socket;
 use std::io;
 
 pub(crate) struct PacketReceiver<const CAPACITY: usize> {
-    buffer: RecvBuf<CAPACITY>,
+    buffer: ReceiveBuffer<CAPACITY>,
     next_packet_id: u64,
 }
 
@@ -28,21 +27,22 @@ pub(crate) struct ReceivePacketContext<'a> {
 impl<const CAPACITY: usize> PacketReceiver<CAPACITY> {
     pub(crate) fn new() -> Self {
         Self {
-            buffer: RecvBuf::new(),
+            buffer: ReceiveBuffer::new(),
             next_packet_id: 1,
         }
     }
 
     pub(crate) fn receive<'a>(
         &'a mut self,
-        socket: &Socket,
+        socket: &ManagedSocket,
         syscall: ReceiveSyscall,
         context: ReceivePacketContext<'_>,
     ) -> io::Result<Option<(usize, AdmittedWirePacket<'a>)>> {
-        let (length, source) = recv_packet(socket, syscall, self.buffer.recv_buf_mut())?;
+        let packet = socket.receive(syscall, &mut self.buffer)?;
+        let length = packet.bytes().len();
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.wrapping_add(1).max(1);
-        let bytes = self.buffer.initialized(length);
+        let bytes = packet.bytes();
         let trace = PacketTraceId {
             worker_id: context.worker_id,
             c2u: context.c2u,
@@ -53,7 +53,7 @@ impl<const CAPACITY: usize> PacketReceiver<CAPACITY> {
             trace,
             context.receive_context,
             bytes,
-            source.as_ref(),
+            packet.source(),
         ) {
             WirePacketAdmission::Accepted(admitted) => Ok(Some((length, admitted))),
             WirePacketAdmission::ReceiveNoise(_) => Ok(None),

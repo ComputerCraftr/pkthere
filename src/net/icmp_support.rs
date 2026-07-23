@@ -1,3 +1,4 @@
+#[cfg(not(miri))]
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering as AtomOrdering};
 
@@ -6,6 +7,7 @@ use pkthere_socket_policy::{IcmpKernelIdPolicy, IcmpWildcardIdPolicy, ResolvedIc
 static FALLBACK_ICMP_ID: AtomicU16 = AtomicU16::new(49152);
 
 fn next_nonzero_icmp_id() -> u16 {
+    #[cfg(not(miri))]
     if let Ok(sock) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
         && let Ok(addr) = sock.local_addr()
     {

@@ -1,3 +1,4 @@
+use super::receive_buffer::ProbeReceiveBuffer;
 use crate::socket_reality::case::{
     ICMP_DGRAM_FIXED_ID, RealityCase, RealityOperation, RealitySocketPath, SocketCreateSpec,
 };
@@ -17,7 +18,6 @@ use pkthere_wire::checksum::checksum16_header_parts;
 use pkthere_wire::packet_headers::{SHIM_IS_DATA, SHIM_SOURCE_ID_EQUALS_HEADER};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::io;
-use std::mem::MaybeUninit;
 use std::net::UdpSocket;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::thread;
@@ -133,10 +133,10 @@ impl InstrumentedSocket {
     }
 
     fn recv(&mut self, capacity: usize) {
-        let mut buffer = vec![MaybeUninit::<u8>::uninit(); capacity];
-        let result = match self.socket.recv(&mut buffer) {
-            Ok(length) => CallResult::Ok(ReceiveEvidence {
-                bytes: initialized_prefix(&buffer, length),
+        let mut buffer = ProbeReceiveBuffer::with_capacity(capacity);
+        let result = match buffer.recv(&self.socket) {
+            Ok(bytes) => CallResult::Ok(ReceiveEvidence {
+                bytes,
                 source: None,
             }),
             Err(error) => CallResult::OsError((&error).into()),
@@ -148,10 +148,10 @@ impl InstrumentedSocket {
     }
 
     fn recv_from(&mut self, capacity: usize) {
-        let mut buffer = vec![MaybeUninit::<u8>::uninit(); capacity];
-        let result = match self.socket.recv_from(&mut buffer) {
-            Ok((length, source)) => CallResult::Ok(ReceiveEvidence {
-                bytes: initialized_prefix(&buffer, length),
+        let mut buffer = ProbeReceiveBuffer::with_capacity(capacity);
+        let result = match buffer.recv_from(&self.socket) {
+            Ok((bytes, source)) => CallResult::Ok(ReceiveEvidence {
+                bytes,
                 source: source.as_socket(),
             }),
             Err(error) => CallResult::OsError((&error).into()),
@@ -592,11 +592,6 @@ fn require_case(
             "collector does not support case {case:?}"
         )))
     }
-}
-
-fn initialized_prefix(buffer: &[MaybeUninit<u8>], length: usize) -> Vec<u8> {
-    // socket2 guarantees the first `length` elements were initialized by recv.
-    unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), length) }.to_vec()
 }
 
 fn loopback(domain: Domain) -> IpAddr {

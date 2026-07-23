@@ -537,23 +537,15 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
         payload.len() as u64
     );
 
-    let c2u_us_max = stats["c2u_us_max"].as_u64().unwrap();
-    let u2c_us_max = stats["u2c_us_max"].as_u64().unwrap();
-    let c2u_us_avg = stats["c2u_us_avg"].as_u64().unwrap();
-    let u2c_us_avg = stats["u2c_us_avg"].as_u64().unwrap();
-    let c2u_us_ewma = stats["c2u_us_ewma"].as_u64().unwrap();
-    let u2c_us_ewma = stats["u2c_us_ewma"].as_u64().unwrap();
+    let c2u_us_max = stats["c2u_us_max"].as_u64().expect("missing c2u_us_max");
+    let u2c_us_max = stats["u2c_us_max"].as_u64().expect("missing u2c_us_max");
+    let c2u_us_avg = stats["c2u_us_avg"].as_u64().expect("missing c2u_us_avg");
+    let u2c_us_avg = stats["u2c_us_avg"].as_u64().expect("missing u2c_us_avg");
+    let c2u_us_ewma = stats["c2u_us_ewma"].as_u64().expect("missing c2u_us_ewma");
+    let u2c_us_ewma = stats["u2c_us_ewma"].as_u64().expect("missing u2c_us_ewma");
 
-    assert!(c2u_us_avg > 0, "expected c2u_us_avg > 0, got {c2u_us_avg}");
-    assert!(u2c_us_avg > 0, "expected u2c_us_avg > 0, got {u2c_us_avg}");
-    assert!(
-        c2u_us_ewma > 0,
-        "expected c2u_us_ewma > 0, got {c2u_us_ewma}"
-    );
-    assert!(
-        u2c_us_ewma > 0,
-        "expected u2c_us_ewma > 0, got {u2c_us_ewma}"
-    );
+    // Diagnostics intentionally quantize nanoseconds to whole microseconds.
+    // Fast loopback operations may therefore report zero without losing samples.
     assert!(c2u_us_max >= c2u_us_avg);
     assert!(u2c_us_max >= u2c_us_avg);
     assert!(c2u_us_max >= c2u_us_ewma);

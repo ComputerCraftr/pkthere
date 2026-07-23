@@ -4,11 +4,11 @@ use crate::net::framing_shim::{
     ICMP_TUNNEL_SHIM_MAX_LEN, IcmpTunnelFrameKind, ReplyIdNegotiation,
     encode_icmp_tunnel_prefix_with_source,
 };
+use crate::net::managed_socket::{ManagedSendResult, ManagedSocket};
 use crate::net::packet_headers::WireIcmpIdentity;
-use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 pub(crate) use pkthere_socket_policy::{IcmpChecksumMode, IpHeaderMode, SocketSendPolicy};
 use pkthere_wire::checksum::{checksum16_bytes, checksum16_header, checksum16_header_parts};
-use socket2::{SockAddr, Socket};
+use socket2::SockAddr;
 use std::io::{self, IoSlice};
 use std::mem::MaybeUninit;
 use std::net::IpAddr;
@@ -71,53 +71,28 @@ pub(crate) fn outbound_payload_event<'a>(
 }
 
 pub(crate) fn send_payload(
-    sock: &Socket,
-    sock_connected: bool,
+    sock: &ManagedSocket,
     dest_sa: &SockAddr,
     send_policy: SocketSendPolicy,
     source_ip: Option<IpAddr>,
     event: &OutboundPayloadEvent<'_>,
-) -> io::Result<bool> {
-    let send_res = send_payload_once(sock, sock_connected, dest_sa, send_policy, source_ip, event);
-
-    match send_res {
-        Ok(_) => Ok(true),
-        Err(e) if sock_connected && e.raw_os_error() == Some(DEST_ADDR_REQUIRED) => {
-            match send_payload_once(sock, false, dest_sa, send_policy, source_ip, event) {
-                Ok(_) => Ok(false),
-                Err(retry_err) => Err(retry_err),
-            }
-        }
-        Err(e) => Err(e),
-    }
+) -> io::Result<ManagedSendResult> {
+    send_payload_once(sock, dest_sa, send_policy, source_ip, event)
 }
 
 #[inline]
 fn send_payload_once(
-    sock: &Socket,
-    sock_connected: bool,
+    sock: &ManagedSocket,
     dest_sa: &SockAddr,
     send_policy: SocketSendPolicy,
     source_ip: Option<IpAddr>,
     event: &OutboundPayloadEvent<'_>,
-) -> io::Result<usize> {
+) -> io::Result<ManagedSendResult> {
     match event.icmp {
-        Some(meta) => send_icmp_echo(
-            sock,
-            sock_connected,
-            dest_sa,
-            send_policy,
-            source_ip,
-            event.payload,
-            &meta,
-        ),
+        Some(meta) => send_icmp_echo(sock, dest_sa, send_policy, source_ip, event.payload, &meta),
         None => match event.payload {
             PayloadEvent::UserPayload { bytes, .. } => {
-                if sock_connected {
-                    sock.send(bytes)
-                } else {
-                    sock.send_to(bytes, dest_sa)
-                }
+                sock.send_packet(&[IoSlice::new(bytes)], dest_sa)
             }
             _ => unreachable!("non-ICMP sends must be user payload only"),
         },
@@ -125,14 +100,13 @@ fn send_payload_once(
 }
 
 fn send_icmp_echo(
-    sock: &Socket,
-    sock_connected: bool,
+    sock: &ManagedSocket,
     dest_sa: &SockAddr,
     send_policy: SocketSendPolicy,
     source_ip: Option<IpAddr>,
     event: &PayloadEvent<'_>,
     meta: &OutboundIcmpMeta,
-) -> io::Result<usize> {
+) -> io::Result<ManagedSendResult> {
     let mut hdr = [
         0,
         0,
@@ -287,11 +261,7 @@ fn send_icmp_echo(
     }
 
     let slices_to_send = &iovecs[iovec_start..];
-    if sock_connected {
-        sock.send_vectored(slices_to_send)
-    } else {
-        sock.send_to_vectored(slices_to_send, dest_sa)
-    }
+    sock.send_packet(slices_to_send, dest_sa)
 }
 
 #[cfg(test)]

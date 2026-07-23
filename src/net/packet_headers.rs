@@ -5,24 +5,11 @@ pub(crate) use pkthere_wire::packet_headers::{
 };
 
 use crate::cli::SupportedProtocol;
-use pkthere_socket_policy::ResolvedSocketPolicy;
+use pkthere_socket_policy::{ResolvedSocketPolicy, ip_version_for_domain};
 #[cfg(test)]
 pub(crate) use pkthere_wire::packet_headers::{ParsedUdpHeader, parse_packet_headers};
 use socket2::Domain;
 use std::io;
-
-pub(crate) fn ip_version_for_domain(domain: Domain) -> io::Result<IpVersion> {
-    if domain == Domain::IPV4 {
-        Ok(IpVersion::V4)
-    } else if domain == Domain::IPV6 {
-        Ok(IpVersion::V6)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unsupported socket domain for packet parsing: {domain:?}"),
-        ))
-    }
-}
 
 pub(crate) fn select_packet_parser(
     proto: SupportedProtocol,
@@ -31,7 +18,7 @@ pub(crate) fn select_packet_parser(
 ) -> io::Result<ReceiveParserKernel> {
     pkthere_wire::packet_headers::select_receive_parser(
         proto,
-        ip_version_for_domain(family)?,
+        ip_version_for_domain(family).map_err(io::Error::other)?,
         policy.receive_header,
     )
     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))

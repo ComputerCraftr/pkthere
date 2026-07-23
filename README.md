@@ -68,13 +68,12 @@ Re-resolve behavior:
 
 - `cargo build --release` builds for the current host operating system and architecture. On Apple Silicon, it produces a macOS AArch64 executable, not a Linux executable.
 - Release builds use `opt-level=3`, fat LTO, and one codegen unit.
-- Portable Linux-musl builds never enable native CPU tuning implicitly. The Python portable builder uses Rust's target baseline; the container-native portable profile deliberately uses `TARGET_CPU=generic`.
+- Portable Linux-musl builds never enable native CPU tuning implicitly. The authoritative Python artifact builder uses Rust's target baseline.
 - Build scripts do not probe the network or runtime socket capabilities. Platform socket behavior is measured by runtime reality tests.
 
 Choose the build path based on the host:
 
-- **Apple Silicon local build**: use the container-native `linux/arm64` builder.
-- **Independent CI cross-build**: use the pinned Cross backend.
+- **Apple Silicon or CI AArch64 build**: use the pinned Cross backend.
 - **x86_64 Linux host**: use the host `musl-gcc` builder.
 
 ### Portable AArch64 Linux-musl
@@ -83,6 +82,7 @@ Build the statically linked AArch64 artifact through the pinned Cross/Docker bac
 
 ```bash
 python3 -m docker.alpine.portable_build aarch64 \
+  --backend cross \
   --evidence-dir cross-artifacts
 ```
 
@@ -92,7 +92,38 @@ The executable is written to:
 target/aarch64-unknown-linux-musl/release/pkthere
 ```
 
-The command requires Docker, the pinned `cross` version used by CI, `file`, and GNU `readelf`.
+The same invocation stages the complete Alpine runtime and test artifact set in
+`.artifacts/alpine`. On an AArch64 Docker host, that stage can be consumed
+directly by the existing Alpine image and test orchestrator:
+
+```bash
+docker buildx build --platform linux/arm64 --load \
+  --file docker/alpine/Dockerfile \
+  --tag pkthere-alpine-reality .
+python3 -m docker.alpine.ci all --artifact-dir docker-artifacts
+```
+
+The command requires Docker, the pinned `cross` version used by CI, `file`, and
+GNU `readelf`. On Apple Silicon, Cross uses the configured Docker backend, such
+as Colima, while retaining the same pinned target image and artifact pipeline as
+CI.
+
+When the Docker server itself is AArch64, local Alpine Compose testing does not
+require Cross. The default `auto` backend detects the Docker server architecture
+and builds the same artifact inventory inside a native AArch64 Alpine container:
+
+```bash
+python3 -m docker.alpine.portable_build aarch64 \
+  --evidence-dir docker-artifacts/aarch64-native
+docker buildx build --platform linux/arm64 --load \
+  --file docker/alpine/Dockerfile \
+  --tag pkthere-alpine-reality .
+python3 -m docker.alpine.ci all --artifact-dir docker-artifacts
+```
+
+Use `--backend native-container` to require this path instead of automatic
+selection. It is a local same-architecture execution check; the pinned Cross
+backend remains the reproducible CI artifact proof.
 
 ### Portable x86_64 Linux-musl
 
@@ -109,9 +140,15 @@ This requires:
 - a compatible `musl-gcc`;
 - `file` and GNU `readelf`.
 
-### Container-native Linux-musl build
+### Separate CPU-tuned application build
 
-The checked-in Rust builder can produce a static musl executable for the container architecture. On Apple Silicon with a Linux/ARM64 Docker-compatible builder, such as Docker Desktop or Colima:
+`docker/rust_build/Dockerfile` builds only the `pkthere` application. It is
+separate from the reproducible CI test-artifact builder above and is not used to
+stage Alpine test executables.
+
+It can produce a static musl executable for the container architecture. On Apple
+Silicon with a Linux/ARM64 Docker-compatible builder, such as Docker Desktop or
+Colima:
 
 ```bash
 docker buildx build \
@@ -137,9 +174,9 @@ docker buildx build \
 
 The tuned executable may not run on other ARMv8 systems. The exported `out/evidence/build-profile.txt` records the selected profile and CPU.
 
-### Artifact verification
+### Reproducible artifact verification
 
-Both `python3 -m docker.alpine.portable_build` and the `export` target in `docker/rust_build/Dockerfile` do the following:
+`python3 -m docker.alpine.portable_build`:
 
 - clear ambient Rust, compiler, and linker flags;
 - perform a final linked release build;

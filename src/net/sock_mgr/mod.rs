@@ -14,8 +14,8 @@ pub(crate) use evidence::socket_evidence_key_json;
 pub(crate) use handles::{SocketHandles, SocketManagerInit, SocketStateSnapshot};
 pub(crate) use manager::{ReresolveSummary, SocketManager};
 pub(crate) use pkthere_socket_policy::SocketEvidenceKey;
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 pub(crate) use state::{ListenerMetadata, UpstreamMetadata};
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests;

@@ -90,6 +90,36 @@ jobs:
       - name: Compile benchmarks without running them
         run: cargo bench --locked --workspace --no-run
 
+  miri-production-units:
+    name: Miri production unit suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MIRIFLAGS: -Zmiri-disable-isolation
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up pinned nightly Miri
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-07-01
+          components: miri
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: miri-production-units
+
+      - name: Prepare Miri
+        run: cargo miri setup
+
+      - name: Run every Miri-compatible production unit test
+        run: >-
+          cargo miri test --locked
+          -p pkthere
+          -p pkthere-wire
+          -p pkthere-socket-policy
+          --lib --bins -- --nocapture
+
   test:
     strategy:
       matrix:
@@ -161,6 +191,8 @@ jobs:
           path: |
             native-tests-*.log
             raw-reality-*.log
+            ${{ matrix.app_source }}
+            ${{ matrix.test_app }}
           if-no-files-found: warn
 
   stress-release:
@@ -239,19 +271,23 @@ jobs:
         run: >-
           cargo install cross
           --git https://github.com/cross-rs/cross
-          --rev 88f49ff79e777bef6d3564531636ee4d3cc2f8d2
+          --rev 1d07d3f9cc465c435256f1aabc1d18024517891a
           --locked
 
       - name: Build and inspect aarch64 musl artifact
         run: >-
           python3 -m docker.alpine.portable_build aarch64
+          --backend cross
           --evidence-dir cross-artifacts
+          --output cross-artifacts/alpine
 
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: aarch64-musl
-          path: cross-artifacts
+          path: |
+            cross-artifacts
+            target/aarch64-unknown-linux-musl/release
           if-no-files-found: error
 
   alpine-socket-reality:

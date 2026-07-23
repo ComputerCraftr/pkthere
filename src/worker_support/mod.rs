@@ -10,9 +10,8 @@ mod pacing;
 mod packet_admission;
 mod packet_dump;
 mod receive;
-mod socket_io;
 mod sync_buffer;
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 pub(crate) mod test_support;
 mod upstream;
 mod upstream_ack;
@@ -42,6 +41,5 @@ pub(crate) use packet_dump::{
     log_packet_send_disposition,
 };
 pub(crate) use receive::{PacketReceiver, ReceivePacketContext};
-pub(crate) use socket_io::{recv_packet, wait_socket_until_readable};
 pub(crate) use sync_buffer::{BufferedSyncUpdate, buffer_sync_event, handle_c2u_session_control};
 pub(crate) use upstream::{UpstreamWorkerContext, run_upstream_to_client_thread};

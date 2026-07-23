@@ -1,8 +1,8 @@
 use crate::flow_key::{ClientFlowKey, SocketLegFlow};
 use crate::net::payload::BufferedPayload;
 use crate::packet_trace::PacketTraceId;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomOrdering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
 pub(crate) struct FlowRuntimeState {
@@ -11,6 +11,7 @@ pub(crate) struct FlowRuntimeState {
     upstream_reply_id_acked: AtomicBool,
     upstream_reply_id_handshake: Mutex<ReplyIdHandshake>,
     pending_icmp_client_lock: Mutex<Option<PendingIcmpClientLock>>,
+    client_lock_transaction: Mutex<()>,
 }
 
 impl FlowRuntimeState {
@@ -21,6 +22,7 @@ impl FlowRuntimeState {
             upstream_reply_id_acked: AtomicBool::new(false),
             upstream_reply_id_handshake: Mutex::new(ReplyIdHandshake::NotRequired),
             pending_icmp_client_lock: Mutex::new(None),
+            client_lock_transaction: Mutex::new(()),
         }
     }
 
@@ -39,6 +41,15 @@ impl FlowRuntimeState {
             *self.upstream_reply_id_handshake.lock().unwrap() = ReplyIdHandshake::NotRequired;
             *self.pending_icmp_client_lock.lock().unwrap() = None;
         }
+    }
+
+    /// Serialize client-flow socket transitions and global lock publication.
+    ///
+    /// Shared-flow worker pairs use the same `FlowRuntimeState`, so this guard
+    /// prevents two workers from interleaving their manager transactions.
+    #[inline]
+    pub(crate) fn client_lock_transaction(&self) -> MutexGuard<'_, ()> {
+        self.client_lock_transaction.lock().unwrap()
     }
 
     #[inline]

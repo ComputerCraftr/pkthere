@@ -4,9 +4,21 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from docker.alpine.pkthere_harness.command_runner import CommandRunner
-from docker.alpine.portable_build import sanitize_environment, verify_static_elf
+from docker.alpine import portable_build
+from docker.alpine.portable_build import (
+    AARCH64_TARGET,
+    NATIVE_CONTAINER_MARKER,
+    STAGED_EXECUTABLE_NAMES,
+    X86_TARGET,
+    _select_aarch64_backend,
+    build_aarch64,
+    build_x86_64,
+    sanitize_environment,
+    verify_static_elf,
+)
 
 
 class PortableEnvironmentTests(unittest.TestCase):
@@ -31,6 +43,175 @@ class PortableEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             set(removed), set(injected).difference({"RETAINED_BUILD_CONTEXT"})
         )
+
+
+class PortableArtifactInventoryTests(unittest.TestCase):
+    def test_aarch64_uses_shared_complete_alpine_artifact_pipeline(self) -> None:
+        expected_artifacts = {
+            "pkthere",
+            "socket-reality-test",
+            "icmp-integration-test",
+            "worker-modes-test",
+            "pkthere-test-support-test",
+            "pkthere-unit-test",
+            "topology-verifier",
+        }
+        self.assertEqual(set(STAGED_EXECUTABLE_NAMES.values()), expected_artifacts)
+
+        runner = Mock(spec=CommandRunner)
+        executables = {
+            name: Path(f"/artifacts/{name}") for name in STAGED_EXECUTABLE_NAMES
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(portable_build, "_require_tools"),
+            patch.object(portable_build, "_recorded_command"),
+            patch.object(portable_build, "_record_toolchain"),
+            patch.object(
+                portable_build,
+                "_build_alpine_executables",
+                return_value=executables,
+            ) as build_executables,
+            patch.object(
+                portable_build, "_stage_alpine_executables"
+            ) as stage_executables,
+        ):
+            temporary = Path(temporary_directory)
+            output = temporary / "alpine"
+            build_aarch64(
+                temporary / "evidence",
+                output,
+                runner=runner,
+                source_environment={},
+                backend="cross",
+            )
+
+        build_executables.assert_called_once()
+        self.assertEqual(
+            build_executables.call_args.args[:2], (AARCH64_TARGET, ("cross",))
+        )
+        stage_executables.assert_called_once()
+        self.assertEqual(stage_executables.call_args.args, (executables, output))
+        self.assertEqual(
+            stage_executables.call_args.kwargs["expected_machine"], "AArch64"
+        )
+
+    def test_x86_64_uses_the_same_complete_alpine_artifact_pipeline(self) -> None:
+        runner = Mock(spec=CommandRunner)
+        executables = {
+            name: Path(f"/artifacts/{name}") for name in STAGED_EXECUTABLE_NAMES
+        }
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(portable_build, "_require_tools"),
+            patch.object(portable_build, "_record_toolchain"),
+            patch.object(
+                portable_build,
+                "_build_alpine_executables",
+                return_value=executables,
+            ) as build_executables,
+            patch.object(
+                portable_build, "_stage_alpine_executables"
+            ) as stage_executables,
+        ):
+            temporary = Path(temporary_directory)
+            output = temporary / "alpine"
+            build_x86_64(
+                temporary / "evidence",
+                output,
+                runner=runner,
+                source_environment={},
+            )
+
+        build_executables.assert_called_once()
+        self.assertEqual(build_executables.call_args.args[:2], (X86_TARGET, ("cargo",)))
+        stage_executables.assert_called_once()
+        self.assertEqual(stage_executables.call_args.args, (executables, output))
+        self.assertEqual(
+            stage_executables.call_args.kwargs["expected_machine"],
+            "Advanced Micro Devices X86-64",
+        )
+
+    def test_auto_backend_uses_native_container_on_aarch64_docker(self) -> None:
+        runner = Mock(spec=CommandRunner)
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(
+                portable_build,
+                "_docker_server_architecture",
+                return_value="arm64",
+            ),
+        ):
+            selected = _select_aarch64_backend(
+                "auto",
+                Path(temporary_directory),
+                runner=runner,
+                environment={},
+            )
+
+        self.assertEqual(selected, "native-container")
+
+    def test_auto_backend_keeps_cross_on_non_aarch64_docker(self) -> None:
+        runner = Mock(spec=CommandRunner)
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(
+                portable_build,
+                "_docker_server_architecture",
+                return_value="amd64",
+            ),
+        ):
+            selected = _select_aarch64_backend(
+                "auto",
+                Path(temporary_directory),
+                runner=runner,
+                environment={},
+            )
+
+        self.assertEqual(selected, "cross")
+
+    def test_native_container_inner_build_does_not_require_docker_socket(self) -> None:
+        runner = Mock(spec=CommandRunner)
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(
+                portable_build,
+                "_build_aarch64_in_native_container",
+            ) as native_build,
+            patch.object(
+                portable_build,
+                "_docker_server_architecture",
+            ) as docker_architecture,
+        ):
+            temporary = Path(temporary_directory)
+            build_aarch64(
+                temporary / "evidence",
+                temporary / "alpine",
+                runner=runner,
+                source_environment={NATIVE_CONTAINER_MARKER: "1"},
+                backend="native-container",
+            )
+
+        native_build.assert_called_once()
+        docker_architecture.assert_not_called()
+
+    def test_explicit_native_container_rejects_non_aarch64_docker(self) -> None:
+        runner = Mock(spec=CommandRunner)
+        with (
+            tempfile.TemporaryDirectory() as temporary_directory,
+            patch.object(
+                portable_build,
+                "_docker_server_architecture",
+                return_value="amd64",
+            ),
+            self.assertRaisesRegex(RuntimeError, "AArch64 Docker server"),
+        ):
+            _select_aarch64_backend(
+                "native-container",
+                Path(temporary_directory),
+                runner=runner,
+                environment={},
+            )
 
 
 class StaticElfVerifierTests(unittest.TestCase):

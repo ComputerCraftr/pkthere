@@ -14,6 +14,9 @@ use pkthere_wire::packet_headers::ReceiveHeaderMode;
 use socket2::{Domain, Protocol, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+#[path = "tests/peer_verification.rs"]
+mod peer_verification_tests;
+
 fn assert_capability(actual: SocketReuseCapability, expected: SocketReuseCapability) {
     assert_eq!(actual, expected);
 }
@@ -911,6 +914,20 @@ fn listener_worker_socket_policy_limits_separate_state_to_kernel_flow_affinity()
     );
     assert!(shared.reuse_address);
     assert_eq!(shared.reuse_port, cfg!(unix));
+    let listener_udp = resolve_socket_policy_with_icmp_intent(
+        SocketRole::Listener,
+        SupportedProtocol::UDP,
+        Type::DGRAM,
+        TimeoutAction::Drop,
+        false,
+        Domain::IPV4,
+        IcmpPolicyIntent::default(),
+    );
+    assert!(!shared.connects_after_lock(listener_udp));
+    assert_eq!(
+        listener_worker_socket_policy(1, false).connects_after_lock(listener_udp),
+        listener_udp.reuse.connects_after_lock()
+    );
 
     let separate = listener_worker_socket_policy(3, true);
     assert_eq!(

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from docker.alpine.pkthere_harness import reality
 from docker.alpine.pkthere_harness.test_manifest import (
+    alpine_concurrency_tests_for_platform,
     privileged_icmp_tests_for_platform,
 )
 from docker.alpine.pkthere_harness.timing import (
@@ -44,20 +45,30 @@ class RealityCommandPolicyTests(unittest.TestCase):
         )
         test_calls = calls[2:]
         self.assertEqual(
-            [timeout for _, timeout in test_calls[:4]],
+            [timeout for _, timeout in test_calls[:3]],
             [
                 DOCKER_SUITE_TIMEOUT_SECONDS,
                 DOCKER_EXACT_TEST_TIMEOUT_SECONDS,
                 DOCKER_SUITE_TIMEOUT_SECONDS,
-                DOCKER_SUITE_TIMEOUT_SECONDS,
             ],
+        )
+        concurrency_tests = alpine_concurrency_tests_for_platform("linux")
+        concurrency_start = 3
+        concurrency_end = concurrency_start + len(concurrency_tests)
+        self.assertEqual(
+            [timeout for _, timeout in test_calls[concurrency_start:concurrency_end]],
+            [DOCKER_EXACT_TEST_TIMEOUT_SECONDS] * len(concurrency_tests),
+        )
+        self.assertEqual(
+            test_calls[concurrency_end][1],
+            DOCKER_SUITE_TIMEOUT_SECONDS,
         )
         privileged_tests = privileged_icmp_tests_for_platform("linux")
         self.assertEqual(
-            [timeout for _, timeout in test_calls[4:]],
+            [timeout for _, timeout in test_calls[concurrency_end + 1 :]],
             [DOCKER_EXACT_TEST_TIMEOUT_SECONDS] * len(privileged_tests),
         )
-        for selection in privileged_tests:
+        for selection in (*concurrency_tests, *privileged_tests):
             self.assertIn(selection.test_name, output.getvalue())
 
 

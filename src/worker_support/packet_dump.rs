@@ -3,7 +3,8 @@ use super::packet_admission::{
     WirePacketAdmission, admit_wire_packet_with_parsed,
 };
 use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::flow_key::{ClientFlowKey, FlowEndpoint, FlowTuple};
+use crate::endpoint::LogicalEndpoint;
+use crate::flow_key::{ClientFlowKey, FlowTuple};
 use crate::net::packet_headers::{ParsedIcmpEcho, ParsedPacketHeaders, ParsedTransport};
 use crate::net::payload::PayloadEvent;
 use crate::net::sock_mgr::SocketEvidenceKey;
@@ -527,8 +528,8 @@ fn payload_event_kind(event: &PayloadEvent<'_>) -> &'static str {
     }
 }
 
-fn flow_endpoint_string(endpoint: FlowEndpoint) -> String {
-    endpoint.canonical().to_string()
+fn flow_endpoint_string(endpoint: LogicalEndpoint) -> String {
+    endpoint.to_string()
 }
 
 fn flow_tuple_string(flow: FlowTuple) -> String {

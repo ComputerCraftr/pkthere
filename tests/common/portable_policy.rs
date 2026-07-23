@@ -1,6 +1,6 @@
 use super::{WorkspaceInventory, build_surface_paths, read, relative};
 
-const CROSS_COMMIT: &str = "88f49ff79e777bef6d3564531636ee4d3cc2f8d2";
+const CROSS_COMMIT: &str = "1d07d3f9cc465c435256f1aabc1d18024517891a";
 const CROSS_IMAGE: &str = "ghcr.io/cross-rs/aarch64-unknown-linux-musl@sha256:53a761857a806b4f73b209a15bf71eacc38a82d5a02e05b166300c4794d7ad83";
 
 pub(super) fn assert_configuration(inventory: &WorkspaceInventory) {
@@ -72,6 +72,8 @@ pub(super) fn assert_configuration(inventory: &WorkspaceInventory) {
         .join("\n");
     assert!(runs.contains(CROSS_COMMIT));
     assert!(runs.contains("docker.alpine.portable_build aarch64"));
+    assert!(runs.contains("--backend cross"));
+    assert!(runs.contains("--output cross-artifacts/alpine"));
     assert!(workflow_text.contains("cargo check --locked"));
 
     let forbidden = build_surface_paths(inventory)
@@ -125,6 +127,17 @@ pub(super) fn assert_configuration(inventory: &WorkspaceInventory) {
             && portable_builder.contains("\"--locked\"")
     );
     assert!(
+        portable_builder.contains("_build_alpine_executables")
+            && portable_builder.contains("_stage_alpine_executables")
+            && portable_builder.contains("AARCH64_TARGET")
+            && portable_builder.contains("(\"cross\",)")
+    );
+    assert!(
+        portable_builder.contains("\"native-container\"")
+            && portable_builder.contains("_docker_server_architecture")
+            && portable_builder.contains("_build_aarch64_in_native_container")
+    );
+    assert!(
         portable_builder.contains("ghcr.io/cross-rs/aarch64-unknown-linux-musl@")
             && portable_builder.contains(
                 "sha256:53a761857a806b4f73b209a15bf71eacc38a82d5a02e05b166300c4794d7ad83"
@@ -150,6 +163,29 @@ pub(super) fn assert_configuration(inventory: &WorkspaceInventory) {
             "container musl builder omits {required}"
         );
     }
+    for forbidden in [
+        "docker.alpine.portable_build",
+        "alpine_test_builder",
+        "alpine_test_export",
+        "/artifacts/alpine",
+    ] {
+        assert!(
+            !container_builder.contains(forbidden),
+            "CPU-tuned application builder must not duplicate portable test-artifact authority: {forbidden}"
+        );
+    }
+
+    let native_adapter = read(
+        &inventory
+            .repo_root
+            .join("docker/alpine/portable_builder.Dockerfile"),
+    );
+    assert!(native_adapter.contains("docker.alpine.portable_build aarch64"));
+    assert!(native_adapter.contains("--backend native-container"));
+    assert!(
+        !native_adapter.contains("cargo build") && !native_adapter.contains("cargo test"),
+        "native AArch64 adapter must delegate artifact inventory to portable_build.py"
+    );
 
     for retired in [
         "build-aarch64-musl.sh",

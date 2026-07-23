@@ -1,6 +1,7 @@
 pub(crate) mod framing_shim;
 pub(crate) mod icmp_sequence;
 pub(crate) mod icmp_support;
+pub(crate) mod managed_socket;
 pub(crate) mod packet_headers;
 pub(crate) mod params;
 pub(crate) mod payload;

@@ -3,19 +3,7 @@ use crate::packet_headers::{
     SHIM_NEGOTIATE_REPLY_ID, SHIM_SOURCE_ID_EQUALS_HEADER, parse_icmp_v4_transport,
     parse_icmp_v6_transport, parse_ipv4_icmp_packet, parse_ipv6_icmp_packet, parse_packet_headers,
 };
-
-#[derive(Clone, Copy)]
-enum Family {
-    V4,
-    V6,
-}
-
-#[derive(Clone, Copy)]
-enum Layout {
-    Headerless,
-    IpHeader,
-    Ipv6Extension,
-}
+use crate::packet_headers::{IpVersion, ReceiveHeaderMode};
 
 struct MalformedCase {
     name: &'static str,
@@ -23,11 +11,11 @@ struct MalformedCase {
     reason: IcmpMalformedReason,
 }
 
-fn echo(family: Family, body: &[u8]) -> Vec<u8> {
+fn echo(version: IpVersion, body: &[u8]) -> Vec<u8> {
     let mut packet = vec![
-        match family {
-            Family::V4 => 8,
-            Family::V6 => 128,
+        match version {
+            IpVersion::V4 => 8,
+            IpVersion::V6 => 128,
         },
         0,
         0,
@@ -41,10 +29,15 @@ fn echo(family: Family, body: &[u8]) -> Vec<u8> {
     packet
 }
 
-fn wrap_ip(family: Family, layout: Layout, transport: &[u8]) -> Vec<u8> {
-    match (family, layout) {
-        (_, Layout::Headerless) => transport.to_vec(),
-        (Family::V4, Layout::IpHeader) => {
+fn wrap_ip(
+    version: IpVersion,
+    receive_header: ReceiveHeaderMode,
+    ipv6_extension: bool,
+    transport: &[u8],
+) -> Vec<u8> {
+    match (version, receive_header) {
+        (_, ReceiveHeaderMode::TransportHeaderOnly) => transport.to_vec(),
+        (IpVersion::V4, ReceiveHeaderMode::IpHeaderIncluded) => {
             let total_len = 20 + transport.len();
             let mut packet = vec![0u8; 20];
             packet[0] = 0x45;
@@ -56,8 +49,8 @@ fn wrap_ip(family: Family, layout: Layout, transport: &[u8]) -> Vec<u8> {
             packet.extend_from_slice(transport);
             packet
         }
-        (Family::V6, Layout::IpHeader | Layout::Ipv6Extension) => {
-            let extension_len = usize::from(matches!(layout, Layout::Ipv6Extension)) * 8;
+        (IpVersion::V6, ReceiveHeaderMode::IpHeaderIncluded) => {
+            let extension_len = usize::from(ipv6_extension) * 8;
             let payload_len = extension_len + transport.len();
             let mut packet = vec![0u8; 40];
             packet[0] = 0x60;
@@ -72,17 +65,39 @@ fn wrap_ip(family: Family, layout: Layout, transport: &[u8]) -> Vec<u8> {
             packet.extend_from_slice(transport);
             packet
         }
-        (Family::V4, Layout::Ipv6Extension) => unreachable!("IPv4 has no IPv6 extension layout"),
+        (_, ReceiveHeaderMode::PayloadOnly) => {
+            unreachable!("ICMP malformed kernels do not use payload-only receive mode")
+        }
     }
 }
 
-fn specialized(family: Family, layout: Layout, packet: &[u8]) -> ParsedPacketHeaders {
-    match (family, layout) {
-        (Family::V4, Layout::Headerless) => parse_icmp_v4_transport(packet),
-        (Family::V6, Layout::Headerless) => parse_icmp_v6_transport(packet),
-        (Family::V4, Layout::IpHeader) => parse_ipv4_icmp_packet(packet),
-        (Family::V6, Layout::IpHeader | Layout::Ipv6Extension) => parse_ipv6_icmp_packet(packet),
-        (Family::V4, Layout::Ipv6Extension) => unreachable!("inapplicable layout"),
+fn specialized(
+    version: IpVersion,
+    receive_header: ReceiveHeaderMode,
+    packet: &[u8],
+) -> ParsedPacketHeaders {
+    match (version, receive_header) {
+        (IpVersion::V4, ReceiveHeaderMode::TransportHeaderOnly) => parse_icmp_v4_transport(packet),
+        (IpVersion::V6, ReceiveHeaderMode::TransportHeaderOnly) => parse_icmp_v6_transport(packet),
+        (IpVersion::V4, ReceiveHeaderMode::IpHeaderIncluded) => parse_ipv4_icmp_packet(packet),
+        (IpVersion::V6, ReceiveHeaderMode::IpHeaderIncluded) => parse_ipv6_icmp_packet(packet),
+        (_, ReceiveHeaderMode::PayloadOnly) => {
+            unreachable!("ICMP malformed kernels do not use payload-only receive mode")
+        }
+    }
+}
+
+fn layouts(version: IpVersion) -> &'static [(ReceiveHeaderMode, bool)] {
+    match version {
+        IpVersion::V4 => &[
+            (ReceiveHeaderMode::TransportHeaderOnly, false),
+            (ReceiveHeaderMode::IpHeaderIncluded, false),
+        ],
+        IpVersion::V6 => &[
+            (ReceiveHeaderMode::TransportHeaderOnly, false),
+            (ReceiveHeaderMode::IpHeaderIncluded, false),
+            (ReceiveHeaderMode::IpHeaderIncluded, true),
+        ],
     }
 }
 
@@ -126,15 +141,20 @@ fn assert_reason(name: &str, parsed: ParsedPacketHeaders, expected: IcmpMalforme
 
 #[test]
 fn canonical_malformed_corpus_matches_every_applicable_kernel() {
-    for family in [Family::V4, Family::V6] {
-        let layouts: &[Layout] = match family {
-            Family::V4 => &[Layout::Headerless, Layout::IpHeader],
-            Family::V6 => &[Layout::Headerless, Layout::IpHeader, Layout::Ipv6Extension],
-        };
+    for version in [IpVersion::V4, IpVersion::V6] {
         for case in malformed_corpus() {
-            for &layout in layouts {
-                let packet = wrap_ip(family, layout, &echo(family, &case.body));
-                assert_reason(case.name, specialized(family, layout, &packet), case.reason);
+            for &(receive_header, ipv6_extension) in layouts(version) {
+                let packet = wrap_ip(
+                    version,
+                    receive_header,
+                    ipv6_extension,
+                    &echo(version, &case.body),
+                );
+                assert_reason(
+                    case.name,
+                    specialized(version, receive_header, &packet),
+                    case.reason,
+                );
                 assert_reason(case.name, parse_packet_headers(&packet), case.reason);
             }
         }
@@ -143,13 +163,13 @@ fn canonical_malformed_corpus_matches_every_applicable_kernel() {
 
 #[test]
 fn every_headerless_echo_truncation_has_canonical_first_reason() {
-    for family in [Family::V4, Family::V6] {
-        let complete = echo(family, &[]);
+    for version in [IpVersion::V4, IpVersion::V6] {
+        let complete = echo(version, &[]);
         for end in 1..complete.len() {
             let packet = &complete[..end];
             assert_reason(
                 "truncated Echo header specialized",
-                specialized(family, Layout::Headerless, packet),
+                specialized(version, ReceiveHeaderMode::TransportHeaderOnly, packet),
                 IcmpMalformedReason::TruncatedEchoHeader,
             );
             assert_reason(
@@ -163,11 +183,15 @@ fn every_headerless_echo_truncation_has_canonical_first_reason() {
 
 #[test]
 fn invalid_echo_code_precedes_shim_errors_but_unrelated_types_are_noise() {
-    for family in [Family::V4, Family::V6] {
-        let mut invalid_code = echo(family, &[0]);
+    for version in [IpVersion::V4, IpVersion::V6] {
+        let mut invalid_code = echo(version, &[0]);
         invalid_code[1] = 1;
         for parsed in [
-            specialized(family, Layout::Headerless, &invalid_code),
+            specialized(
+                version,
+                ReceiveHeaderMode::TransportHeaderOnly,
+                &invalid_code,
+            ),
             parse_packet_headers(&invalid_code),
         ] {
             assert_reason(
@@ -177,13 +201,13 @@ fn invalid_echo_code_precedes_shim_errors_but_unrelated_types_are_noise() {
             );
         }
 
-        let mut unrelated = echo(family, &[0]);
-        unrelated[0] = match family {
-            Family::V4 => 3,
-            Family::V6 => 1,
+        let mut unrelated = echo(version, &[0]);
+        unrelated[0] = match version {
+            IpVersion::V4 => 3,
+            IpVersion::V6 => 1,
         };
         for parsed in [
-            specialized(family, Layout::Headerless, &unrelated),
+            specialized(version, ReceiveHeaderMode::TransportHeaderOnly, &unrelated),
             parse_packet_headers(&unrelated),
         ] {
             assert_eq!(parsed.transport, ParsedTransport::Unsupported);
@@ -194,15 +218,11 @@ fn invalid_echo_code_precedes_shim_errors_but_unrelated_types_are_noise() {
 
 #[test]
 fn empty_echo_body_is_cadence_in_every_applicable_kernel() {
-    for family in [Family::V4, Family::V6] {
-        let layouts: &[Layout] = match family {
-            Family::V4 => &[Layout::Headerless, Layout::IpHeader],
-            Family::V6 => &[Layout::Headerless, Layout::IpHeader, Layout::Ipv6Extension],
-        };
-        for &layout in layouts {
-            let packet = wrap_ip(family, layout, &echo(family, &[]));
+    for version in [IpVersion::V4, IpVersion::V6] {
+        for &(receive_header, ipv6_extension) in layouts(version) {
+            let packet = wrap_ip(version, receive_header, ipv6_extension, &echo(version, &[]));
             for parsed in [
-                specialized(family, layout, &packet),
+                specialized(version, receive_header, &packet),
                 parse_packet_headers(&packet),
             ] {
                 assert!(parsed.icmp.is_some());

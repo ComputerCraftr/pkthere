@@ -7,10 +7,13 @@ from collections.abc import Mapping, Sequence
 import fnmatch
 import os
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from typing import Literal
 
 from docker.alpine.pkthere_harness.cargo import cargo_executables
 from docker.alpine.pkthere_harness.command_runner import CommandResult, CommandRunner
@@ -24,11 +27,32 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STAGE = ROOT / ".artifacts/alpine"
 X86_TARGET = "x86_64-unknown-linux-musl"
 AARCH64_TARGET = "aarch64-unknown-linux-musl"
+AARCH64_NATIVE_PLATFORM = "linux/arm64"
 CROSS_IMAGE = (
     "ghcr.io/cross-rs/aarch64-unknown-linux-musl@"
     "sha256:53a761857a806b4f73b209a15bf71eacc38a82d5a02e05b166300c4794d7ad83"
 )
-
+NATIVE_CONTAINER_DOCKERFILE = ROOT / "docker/alpine/portable_builder.Dockerfile"
+NATIVE_CONTAINER_MARKER = "PKTHERE_PORTABLE_NATIVE_CONTAINER"
+NATIVE_CONTAINER_RUSTFLAGS = (
+    "-C linker=clang "
+    "-C link-arg=-fuse-ld=lld "
+    "-C target-feature=+crt-static "
+    "-C relocation-model=pic "
+    "-C link-arg=-static-pie "
+    "-C link-arg=-Wl,--eh-frame-hdr "
+    "-C target-cpu=generic"
+)
+Aarch64Backend = Literal["auto", "cross", "native-container"]
+STAGED_EXECUTABLE_NAMES = {
+    "pkthere": "pkthere",
+    "socket_reality": "socket-reality-test",
+    "icmp_integration": "icmp-integration-test",
+    "worker_modes": "worker-modes-test",
+    "pkthere_test_support": "pkthere-test-support-test",
+    "pkthere_unit_test": "pkthere-unit-test",
+    "topology-verifier": "topology-verifier",
+}
 _EXACT_BUILD_VARIABLES = frozenset(
     {
         "RUSTFLAGS",
@@ -169,7 +193,39 @@ def build_x86_64(
         runner=runner,
         environment=environment,
     )
-    common = ["--locked", "--target", X86_TARGET, "--release"]
+    executables = _build_alpine_executables(
+        X86_TARGET,
+        ("cargo",),
+        evidence_dir,
+        runner=runner,
+        environment=environment,
+    )
+    _stage_alpine_executables(
+        executables,
+        output,
+        expected_machine="Advanced Micro Devices X86-64",
+        evidence_name="x86_64-musl",
+        evidence_dir=evidence_dir,
+        runner=runner,
+        environment=environment,
+    )
+
+
+def _build_alpine_executables(
+    target: str | None,
+    cargo_command: Sequence[str],
+    evidence_dir: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+    target_dir: Path | None = None,
+    container_target_dir: Path | None = None,
+) -> dict[str, Path]:
+    common = ["--locked", "--release"]
+    if target is not None:
+        common[1:1] = ["--target", target]
+    if target_dir is not None:
+        common.extend(("--target-dir", str(target_dir)))
     executables: dict[str, Path] = {}
     executables.update(
         cargo_executables(
@@ -178,8 +234,30 @@ def build_x86_64(
             root=ROOT,
             runner=runner,
             environment=environment,
+            cargo_command=cargo_command,
+            evidence_prefix=evidence_dir / "cargo-build-pkthere",
+            container_target_dir=container_target_dir,
         )
     )
+    pkthere_unit_test = cargo_executables(
+        [
+            "test",
+            *common,
+            "-p",
+            "pkthere",
+            "--bin",
+            "pkthere",
+            "--no-run",
+        ],
+        {"pkthere"},
+        root=ROOT,
+        runner=runner,
+        environment=environment,
+        cargo_command=cargo_command,
+        evidence_prefix=evidence_dir / "cargo-test-pkthere-unit",
+        container_target_dir=container_target_dir,
+    )
+    executables["pkthere_unit_test"] = pkthere_unit_test["pkthere"]
     executables.update(
         cargo_executables(
             [
@@ -199,6 +277,9 @@ def build_x86_64(
             root=ROOT,
             runner=runner,
             environment=environment,
+            cargo_command=cargo_command,
+            evidence_prefix=evidence_dir / "cargo-test-integration-artifacts",
+            container_target_dir=container_target_dir,
         )
     )
     executables.update(
@@ -215,6 +296,9 @@ def build_x86_64(
             root=ROOT,
             runner=runner,
             environment=environment,
+            cargo_command=cargo_command,
+            evidence_prefix=evidence_dir / "cargo-test-support-unit",
+            container_target_dir=container_target_dir,
         )
     )
     executables.update(
@@ -231,21 +315,28 @@ def build_x86_64(
             root=ROOT,
             runner=runner,
             environment=environment,
+            cargo_command=cargo_command,
+            evidence_prefix=evidence_dir / "cargo-build-topology-verifier",
+            container_target_dir=container_target_dir,
         )
     )
+    return executables
 
+
+def _stage_alpine_executables(
+    executables: Mapping[str, Path],
+    output: Path,
+    *,
+    expected_machine: str,
+    evidence_name: str,
+    evidence_dir: Path,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+) -> None:
     if output.exists():
         shutil.rmtree(output)
     output.mkdir(parents=True)
-    destination_names = {
-        "pkthere": "pkthere",
-        "socket_reality": "socket-reality-test",
-        "icmp_integration": "icmp-integration-test",
-        "worker_modes": "worker-modes-test",
-        "pkthere_test_support": "pkthere-test-support-test",
-        "topology-verifier": "topology-verifier",
-    }
-    for name, destination_name in destination_names.items():
+    for name, destination_name in STAGED_EXECUTABLE_NAMES.items():
         source = executables[name]
         if not source.is_absolute():
             source = ROOT / source
@@ -254,8 +345,8 @@ def build_x86_64(
         destination.chmod(0o755)
         verify_static_elf(
             destination,
-            "Advanced Micro Devices X86-64",
-            evidence_dir / f"x86_64-musl-{destination_name}",
+            expected_machine,
+            evidence_dir / f"{evidence_name}-{destination_name}",
             runner=runner,
             environment=environment,
         )
@@ -263,11 +354,100 @@ def build_x86_64(
 
 def build_aarch64(
     evidence_dir: Path,
+    output: Path,
     *,
     runner: CommandRunner,
     source_environment: Mapping[str, str],
+    backend: Aarch64Backend = "cross",
 ) -> None:
     environment = _portable_environment(source_environment, evidence_dir)
+    inside_native_container = environment.get(NATIVE_CONTAINER_MARKER) == "1"
+    selected_backend = (
+        "native-container"
+        if inside_native_container and backend == "native-container"
+        else _select_aarch64_backend(
+            backend,
+            evidence_dir,
+            runner=runner,
+            environment=environment,
+        )
+    )
+    if selected_backend == "native-container":
+        if inside_native_container:
+            _build_aarch64_in_native_container(
+                evidence_dir,
+                output,
+                runner=runner,
+                environment=environment,
+            )
+        else:
+            _run_aarch64_native_container(
+                evidence_dir,
+                output,
+                runner=runner,
+                environment=environment,
+            )
+        return
+
+    _build_aarch64_with_cross(
+        evidence_dir,
+        output,
+        runner=runner,
+        environment=environment,
+    )
+
+
+def _select_aarch64_backend(
+    requested: Aarch64Backend,
+    evidence_dir: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+) -> Literal["cross", "native-container"]:
+    if requested == "cross":
+        return "cross"
+
+    architecture = _docker_server_architecture(
+        evidence_dir,
+        runner=runner,
+        environment=environment,
+    )
+    native = architecture in {"aarch64", "arm64"}
+    if requested == "native-container" and not native:
+        raise RuntimeError(
+            "native-container AArch64 builds require an AArch64 Docker server; "
+            f"found {architecture!r}"
+        )
+    return "native-container" if native else "cross"
+
+
+def _docker_server_architecture(
+    evidence_dir: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+) -> str:
+    _require_tools(("docker",), environment)
+    result = _recorded_command(
+        ["docker", "version", "--format", "{{.Server.Arch}}"],
+        evidence_dir / "docker-server-architecture",
+        runner=runner,
+        environment=environment,
+        timeout_seconds=DOCKER_CONTROL_TIMEOUT_SECONDS,
+    )
+    architecture = result.stdout.strip().lower()
+    if not architecture:
+        raise RuntimeError("Docker did not report its server architecture")
+    return architecture
+
+
+def _build_aarch64_with_cross(
+    evidence_dir: Path,
+    output: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+) -> None:
     _require_tools(
         ("cargo", "cross", "docker", "file", "readelf", "rustc"), environment
     )
@@ -297,31 +477,118 @@ def build_aarch64(
         runner=runner,
         environment=environment,
     )
-    _recorded_command(
-        [
-            "cross",
-            "build",
-            "--locked",
-            "--release",
-            "--target",
-            AARCH64_TARGET,
-            "-p",
-            "pkthere",
-            "--bin",
-            "pkthere",
-        ],
-        evidence_dir / "cross-build",
+    cross_target_dir = ROOT / "target/cross-aarch64-musl"
+    executables = _build_alpine_executables(
+        AARCH64_TARGET,
+        ("cross",),
+        evidence_dir,
         runner=runner,
         environment=environment,
-        timeout_seconds=ARTIFACT_BUILD_TIMEOUT_SECONDS,
+        target_dir=cross_target_dir,
+        container_target_dir=cross_target_dir,
     )
-    verify_static_elf(
-        ROOT / "target" / AARCH64_TARGET / "release/pkthere",
-        "AArch64",
-        evidence_dir / "aarch64-musl-pkthere",
+    _stage_alpine_executables(
+        executables,
+        output,
+        expected_machine="AArch64",
+        evidence_name="aarch64-musl",
+        evidence_dir=evidence_dir,
         runner=runner,
         environment=environment,
     )
+
+
+def _run_aarch64_native_container(
+    evidence_dir: Path,
+    output: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+) -> None:
+    with tempfile.TemporaryDirectory(prefix="pkthere-aarch64-native-") as temporary:
+        export_root = Path(temporary)
+        _recorded_command(
+            [
+                "docker",
+                "buildx",
+                "build",
+                "--platform",
+                AARCH64_NATIVE_PLATFORM,
+                "--file",
+                str(NATIVE_CONTAINER_DOCKERFILE.relative_to(ROOT)),
+                "--target",
+                "export",
+                "--output",
+                f"type=local,dest={export_root}",
+                ".",
+            ],
+            evidence_dir / "native-container-build",
+            runner=runner,
+            environment=environment,
+            timeout_seconds=ARTIFACT_BUILD_TIMEOUT_SECONDS,
+        )
+        exported_artifacts = export_root / "alpine"
+        exported_evidence = export_root / "evidence"
+        if not exported_artifacts.is_dir() or not exported_evidence.is_dir():
+            raise RuntimeError(
+                "native AArch64 container did not export Alpine artifacts and evidence"
+            )
+        _replace_directory(exported_artifacts, output)
+        shutil.copytree(exported_evidence, evidence_dir, dirs_exist_ok=True)
+
+
+def _build_aarch64_in_native_container(
+    evidence_dir: Path,
+    output: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+) -> None:
+    machine = platform.machine().lower()
+    if platform.system() != "Linux" or machine not in {"aarch64", "arm64"}:
+        raise RuntimeError(
+            "native-container inner build requires AArch64 Linux; "
+            f"found {platform.system()} {machine}"
+        )
+    native_environment = dict(environment)
+    native_environment["RUSTFLAGS"] = NATIVE_CONTAINER_RUSTFLAGS
+    _require_tools(
+        ("cargo", "clang", "file", "readelf", "rustc"),
+        native_environment,
+    )
+    _record_toolchain(
+        (
+            ("rustc", "-vV"),
+            ("cargo", "-V"),
+            ("clang", "--version"),
+        ),
+        evidence_dir,
+        runner=runner,
+        environment=native_environment,
+    )
+    executables = _build_alpine_executables(
+        None,
+        ("cargo",),
+        evidence_dir,
+        runner=runner,
+        environment=native_environment,
+    )
+    _stage_alpine_executables(
+        executables,
+        output,
+        expected_machine="AArch64",
+        evidence_name="aarch64-native-musl",
+        evidence_dir=evidence_dir,
+        runner=runner,
+        environment=native_environment,
+    )
+
+
+def _replace_directory(source: Path, destination: Path) -> None:
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, destination)
 
 
 def _portable_environment(
@@ -401,6 +668,12 @@ def parse_args() -> argparse.Namespace:
     x86.add_argument("--output", type=Path, default=DEFAULT_STAGE)
     arm = subparsers.add_parser("aarch64")
     arm.add_argument("--evidence-dir", type=Path, required=True)
+    arm.add_argument("--output", type=Path, default=DEFAULT_STAGE)
+    arm.add_argument(
+        "--backend",
+        choices=("auto", "cross", "native-container"),
+        default="auto",
+    )
     return parser.parse_args()
 
 
@@ -417,8 +690,10 @@ def main() -> None:
     else:
         build_aarch64(
             args.evidence_dir.resolve(),
+            args.output.resolve(),
             runner=runner,
             source_environment=os.environ,
+            backend=args.backend,
         )
 
 

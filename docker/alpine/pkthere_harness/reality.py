@@ -11,6 +11,7 @@ from .config import (
     ICMP_INTEGRATION_TEST,
     PKTHERE,
     PKTHERE_TEST_SUPPORT_TEST,
+    PKTHERE_UNIT_TEST,
     SOCKET_REALITY_TEST,
     TEST_APP,
     WORKER_MODES_TEST,
@@ -18,6 +19,7 @@ from .config import (
 from .processes import run
 from .test_manifest import (
     RAW_SOCKET_REALITY_TEST,
+    alpine_concurrency_tests_for_platform,
     privileged_icmp_tests_for_platform,
 )
 from .timing import (
@@ -83,6 +85,17 @@ def reality() -> None:
         DOCKER_SUITE_TIMEOUT_SECONDS,
         environment,
     )
+    for selection in alpine_concurrency_tests_for_platform("linux"):
+        run_reality_test(
+            selection.test_name,
+            [
+                "su-exec",
+                "pkthere",
+                *selection.executable_arguments(PKTHERE_UNIT_TEST),
+            ],
+            DOCKER_EXACT_TEST_TIMEOUT_SECONDS,
+            environment,
+        )
     run_reality_test(
         "non-privileged ICMP integration suite",
         ["su-exec", "pkthere", ICMP_INTEGRATION_TEST, "--nocapture"],
