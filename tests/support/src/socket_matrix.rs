@@ -1,4 +1,11 @@
 use crate::matrix::MatrixCase;
+use pkthere_socket_policy::{
+    IcmpPolicyIntent, ProtocolPolicyIntent, SocketRole, TimeoutAction,
+    listener_worker_socket_policy, resolve_listener_socket_policy_with_protocol_intent,
+    resolve_socket_policy_with_protocol_intent,
+};
+use pkthere_wire::SupportedProtocol;
+use socket2::Type;
 
 fn worker_str<'a>(worker: &'a serde_json::Value, field: &str) -> &'a str {
     worker[field]
@@ -9,22 +16,47 @@ fn worker_str<'a>(worker: &'a serde_json::Value, field: &str) -> &'a str {
 pub fn assert_socket_matrix_state(
     worker: &serde_json::Value,
     case: MatrixCase,
-    timeout_action: &str,
+    timeout_action: TimeoutAction,
     case_desc: &str,
 ) {
     assert_identity_fields(worker, case_desc);
-    let listener_expected = !case.debug_client_unconnected
-        && worker_str(worker, "client_proto") != "ICMP"
-        && worker_str(worker, "client_sock_type") != "RAW"
-        && (timeout_action.eq_ignore_ascii_case("exit") || cfg!(not(target_os = "freebsd")));
-    let upstream_expected = if cfg!(windows)
-        && worker_str(worker, "upstream_proto") == "ICMP"
-        && worker_str(worker, "upstream_sock_type") == "RAW"
-    {
-        true
-    } else {
-        !case.debug_upstream_unconnected
-    };
+    let listener_policy = resolve_listener_socket_policy_with_protocol_intent(
+        ProtocolPolicyIntent::Udp,
+        Type::DGRAM,
+        timeout_action,
+        case.client_connection.debug_force_unconnected(),
+        case.family,
+        listener_worker_socket_policy(1, false),
+    );
+    let listener_lifecycle = listener_policy
+        .listener_lifecycle
+        .expect("listener policy must resolve a lifecycle");
+    let upstream_policy = resolve_socket_policy_with_protocol_intent(
+        SocketRole::Upstream,
+        match case.proto {
+            SupportedProtocol::UDP => ProtocolPolicyIntent::Udp,
+            SupportedProtocol::ICMP => ProtocolPolicyIntent::Icmp(IcmpPolicyIntent {
+                allow_debug_kernel_echo_self_handshake: true,
+                ..IcmpPolicyIntent::default()
+            }),
+        },
+        Type::DGRAM,
+        timeout_action,
+        case.upstream_connection.debug_force_unconnected(),
+        case.family,
+    );
+    let listener_expected = listener_lifecycle.connects_after_lock();
+    let upstream_expected = upstream_policy.reuse.starts_connected();
+    assert_eq!(
+        worker_str(worker, "listener_lifecycle"),
+        listener_lifecycle.wire_name(),
+        "{case_desc}: emitted listener lifecycle differs from independently resolved policy"
+    );
+    assert_eq!(
+        worker_str(worker, "upstream_peer_mode"),
+        upstream_policy.reuse.startup_peer_mode.wire_name(),
+        "{case_desc}: emitted upstream peer mode differs from independently resolved policy"
+    );
     assert_eq!(
         worker["listener_connected"]
             .as_bool()
@@ -44,11 +76,9 @@ pub fn assert_socket_matrix_state(
 fn assert_identity_fields(worker: &serde_json::Value, case_desc: &str) {
     for field in [
         "listener_flow_outbound",
-        "listen_local_filter_canonical",
-        "listen_local_kernel_addr",
-        "upstream_remote_filter_canonical",
-        "upstream_local_filter_canonical",
-        "upstream_local_kernel_addr",
+        "listener_local_filter",
+        "upstream_remote_filter",
+        "upstream_local_filter",
     ] {
         assert!(
             worker[field].as_str().is_some(),
@@ -56,6 +86,11 @@ fn assert_identity_fields(worker: &serde_json::Value, case_desc: &str) {
         );
     }
     for field in [
+        "listen_local_kernel_addr",
+        "upstream_local_kernel_addr",
+        "listen_local_filter_canonical",
+        "upstream_remote_filter_canonical",
+        "upstream_local_filter_canonical",
         "listen_local_kernel_canonical",
         "upstream_local_kernel_canonical",
     ] {

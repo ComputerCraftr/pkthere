@@ -1,4 +1,5 @@
 pub mod app_bin;
+pub mod authority_evidence;
 pub mod cli;
 pub mod fixtures;
 pub mod forwarder;

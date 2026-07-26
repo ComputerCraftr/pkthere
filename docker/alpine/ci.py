@@ -3,19 +3,20 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
 import json
 import os
-from pathlib import Path
 import shutil
+import subprocess
 import sys
 import uuid
+from collections.abc import Sequence
+from pathlib import Path
 
-from docker.alpine.pkthere_harness.command_runner import (
+from ci.pkthere_ci.command_runner import (
     CommandResult,
     CommandRunner,
 )
-from docker.alpine.pkthere_harness.timing import (
+from ci.pkthere_ci.timing import (
     DOCKER_CONTROL_TIMEOUT_SECONDS,
     DOCKER_PROFILE_TIMEOUT_SECONDS,
     DOCKER_REALITY_PROFILE_TIMEOUT_SECONDS,
@@ -137,20 +138,40 @@ class Orchestrator:
                 raise RuntimeError(
                     f"{verdict_service} exited with authoritative status {exit_code}"
                 )
-        except BaseException as primary_error:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            subprocess.SubprocessError,
+            KeyboardInterrupt,
+            SystemExit,
+        ) as primary_error:
             primary = primary_error
         try:
             self._collect(profile)
-        except BaseException as collection_error:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            subprocess.SubprocessError,
+            KeyboardInterrupt,
+            SystemExit,
+        ) as collection_error:
             secondary.append(("artifact collection", collection_error))
         if primary is not None:
             try:
                 self._print_failure_log_tail(profile)
-            except BaseException as log_error:
+            except (OSError, UnicodeError, KeyboardInterrupt, SystemExit) as log_error:
                 secondary.append(("failure log rendering", log_error))
         try:
             self._teardown()
-        except BaseException as teardown_error:
+        except (
+            OSError,
+            RuntimeError,
+            subprocess.SubprocessError,
+            KeyboardInterrupt,
+            SystemExit,
+        ) as teardown_error:
             secondary.append(("teardown", teardown_error))
 
         if primary is None and secondary:
@@ -224,7 +245,7 @@ class Orchestrator:
             f"{profile}-services.out",
         )
         runtime = {
-            "reality": (),
+            "reality": ("reality/runtime/process-lifecycle.jsonl",),
             "topology": (
                 "topology/runtime/node-a.err",
                 "topology/runtime/node-a.out",

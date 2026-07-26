@@ -1,15 +1,61 @@
 from __future__ import annotations
 
-from pathlib import Path
+import socket
 import tempfile
 import unittest
+from pathlib import Path
+from typing import cast
 from unittest.mock import patch
 
+from ci.pkthere_ci.command_runner import CommandResult
 from docker.alpine.pkthere_harness import topology
-from docker.alpine.pkthere_harness.command_runner import CommandResult
 
 
 class VerifierArtifactTests(unittest.TestCase):
+    def test_udp_echo_ignores_stale_reply_without_resending(self) -> None:
+        class ScriptedSocket:
+            def __init__(self) -> None:
+                self.blocking = True
+                self.replies = [
+                    b"stale-earlier-phase",
+                    b"expected-current-phase",
+                ]
+                self.sent: list[bytes] = []
+
+            def setblocking(self, blocking: bool) -> None:
+                self.blocking = blocking
+
+            def settimeout(self, _timeout: float) -> None:
+                self.blocking = True
+
+            def sendto(self, payload: bytes, _peer: object) -> int:
+                self.sent.append(payload)
+                return len(payload)
+
+            def recvfrom(self, _maximum: int) -> tuple[bytes, object]:
+                if not self.blocking:
+                    raise BlockingIOError
+                if self.replies:
+                    return self.replies.pop(0), object()
+                raise TimeoutError
+
+        client = ScriptedSocket()
+        with (
+            patch.dict(
+                "os.environ",
+                {"NODE_A_IP": "127.0.0.1", "CLIENT_UDP_PORT": "5000"},
+                clear=True,
+            ),
+            patch.object(topology, "FLOW_DEADLINE_SECONDS", 0.1),
+        ):
+            topology.require_udp_echo(
+                cast(socket.socket, client),
+                b"expected-current-phase",
+                "scripted correlation",
+            )
+
+        self.assertEqual(client.sent, [b"expected-current-phase"])
+
     def test_four_id_nodes_select_shared_and_single_worker_modes(self) -> None:
         environment = {
             "CLIENT_UDP_PORT": "5000",

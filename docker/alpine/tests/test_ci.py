@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from contextlib import redirect_stderr
 import io
-from pathlib import Path
 import tempfile
 import unittest
+from collections.abc import Mapping, Sequence
+from contextlib import redirect_stderr
+from pathlib import Path
 
-from docker.alpine.ci import Orchestrator
-from docker.alpine.pkthere_harness.command_runner import CommandResult, CommandRunner
-from docker.alpine.pkthere_harness.timing import (
+from ci.pkthere_ci.command_runner import CommandResult, CommandRunner
+from ci.pkthere_ci.timing import (
     DOCKER_PROFILE_TIMEOUT_SECONDS,
     DOCKER_REALITY_PROFILE_TIMEOUT_SECONDS,
 )
+from docker.alpine.ci import Orchestrator
 
 
 class FakeRunner(CommandRunner):
@@ -40,8 +40,9 @@ class FakeRunner(CommandRunner):
         env: Mapping[str, str] | None = None,
         check: bool = True,
         capture_output: bool = False,
+        windows_restricted: bool = False,
     ) -> CommandResult:
-        del cwd, env, check, capture_output
+        del cwd, env, check, capture_output, windows_restricted
         rendered = list(command)
         self.commands.append(rendered)
         self.timeouts.append(timeout_seconds)

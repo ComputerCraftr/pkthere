@@ -1,57 +1,34 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParsedTransport {
-    UdpDatagram,
-    HeaderlessIcmp,
-    Ipv4Icmp,
-    Ipv6Icmp,
-    Ipv4Udp,
-    Ipv6Udp,
-    Unsupported,
-    Malformed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IcmpMalformedReason {
-    TruncatedEchoHeader,
-    InvalidEchoTypeOrCode,
-    InvalidShimFlags,
-    TruncatedSourceId,
-    IllegalFrameFlags,
-    SessionControlMissingReplyId,
-    SessionControlReplyIdLength,
-}
-
-// Public within the crate because send/admission code must agree with the
-// parser on the ICMP tunnel shim wire format.
 pub const SHIM_IS_DATA: u8 = 0x80;
-pub const SHIM_NEGOTIATE_REPLY_ID: u8 = 0x40;
-pub const SHIM_ACK_REPLY_ID: u8 = 0x20;
 pub const SHIM_SOURCE_ID_EQUALS_HEADER: u8 = 0x10;
-pub const SHIM_HAS_REPLY_ID: u8 = 0x08;
-const SHIM_ALLOWED_BITS: u8 = SHIM_IS_DATA
-    | SHIM_NEGOTIATE_REPLY_ID
-    | SHIM_ACK_REPLY_ID
-    | SHIM_SOURCE_ID_EQUALS_HEADER
-    | SHIM_HAS_REPLY_ID;
+pub const SHIM_IS_CADENCE: u8 = 0x04;
+pub const ICMP_TUNNEL_CONTROL_VERSION: u8 = 3;
+pub const ICMP_CONTROL_NEGOTIATE: u8 = 0x01;
+pub const ICMP_CONTROL_NEGOTIATE_ACK: u8 = 0x02;
+pub const ICMP_CONTROL_RESET_REQUIRED: u8 = 0x03;
+pub const ICMP_CONTROL_CHALLENGE_NEGOTIATE: u8 = 0x04;
+pub const ICMP_CONTROL_CHALLENGE_ACK: u8 = 0x05;
+pub const ICMP_CONTROL_GENERATION_ADVANCE: u8 = 0x06;
+pub const ICMP_CONTROL_GENERATION_ADVANCE_ACK: u8 = 0x07;
+pub const ICMP_CONTROL_SESSION_ACTIVATED: u8 = 0x08;
+const SHIM_ALLOWED_BITS: u8 = SHIM_IS_DATA | SHIM_SOURCE_ID_EQUALS_HEADER | SHIM_IS_CADENCE;
 
 // IP protocol numbers parsed from IPv4 Protocol / IPv6 Next Header fields.
 const PROTO_ICMP_V4: usize = 1;
 const PROTO_ICMP_V6: usize = 58;
-const PROTO_UDP: usize = 17;
 
 // Base transport/header lengths.
 const IPV4_MIN_LEN: usize = 20;
 const IPV6_MIN_LEN: usize = 40;
 const ICMP_MIN_LEN: usize = 8;
-const UDP_MIN_LEN: usize = 8;
+const IP_VERSION_OFF: usize = 0;
 
 // IPv6 extension traversal offsets.
 const IPV6_EXT_MIN_LEN: usize = 8;
 const IPV6_FIRST_EXT_OFF: usize = IPV6_MIN_LEN;
 
 // IPv4 fixed header field offsets.
+const IPV4_TOTAL_LENGTH_OFF: usize = 2;
 const IPV4_FRAG_HI_OFF: usize = 6;
 const IPV4_FRAG_LO_OFF: usize = 7;
 const IPV4_PROTO_OFF: usize = 9;
@@ -59,6 +36,8 @@ const IPV4_SRC_IP_OFF: usize = 12;
 const IPV4_DST_IP_OFF: usize = 16;
 
 // IPv6 fixed header/address offsets.
+const IPV6_PAYLOAD_LENGTH_OFF: usize = 4;
+const IPV6_NEXT_HEADER_OFF: usize = 6;
 const IPV6_SRC_IP_OFF: usize = 8;
 const IPV6_DST_IP_OFF: usize = 24;
 const IPV6_ADDR_SEG2_OFF: usize = 4;
@@ -67,6 +46,8 @@ const IPV6_ADDR_SEG4_OFF: usize = 8;
 const IPV6_ADDR_SEG5_OFF: usize = 10;
 const IPV6_ADDR_SEG6_OFF: usize = 12;
 const IPV6_ADDR_SEG7_OFF: usize = 14;
+const IPV6_EXT_NEXT_HEADER_OFF: usize = 0;
+const IPV6_EXT_LENGTH_OFF: usize = 1;
 
 // ICMP Echo and tunnel shim offsets.
 const ICMP_CODE_OFF: usize = 1;
@@ -75,317 +56,91 @@ const ICMP_SEQ_OFF: usize = 6;
 const ICMP_PAYLOAD_OFF: usize = ICMP_MIN_LEN;
 const ICMP_SHIM_FLAGS_LEN: usize = 1;
 const ICMP_EXPLICIT_SOURCE_SHIM_LEN: usize = 3;
-
-// UDP fixed header offsets.
-const UDP_SRC_OFF: usize = 0;
-const UDP_DST_OFF: usize = 2;
-const UDP_PAYLOAD_OFF: usize = UDP_MIN_LEN;
+pub const ICMP_TUNNEL_SESSION_ID_LEN: usize = size_of::<u64>();
+pub const ICMP_TUNNEL_POOL_GENERATION_LEN: usize = size_of::<u64>();
+pub const ICMP_TUNNEL_SESSION_ORDINAL_LEN: usize = size_of::<u32>();
+pub const ICMP_TUNNEL_RESET_CHALLENGE_LEN: usize = size_of::<u64>();
+pub const ICMP_TUNNEL_SESSION_KEY_LEN: usize =
+    ICMP_TUNNEL_POOL_GENERATION_LEN + ICMP_TUNNEL_SESSION_ORDINAL_LEN + ICMP_TUNNEL_SESSION_ID_LEN;
+pub const ICMP_TUNNEL_CONTROL_HEADER_LEN: usize = size_of::<u8>() + size_of::<u8>();
+pub const ICMP_TUNNEL_NEGOTIATE_BODY_LEN: usize =
+    ICMP_TUNNEL_CONTROL_HEADER_LEN + size_of::<u16>() + ICMP_TUNNEL_SESSION_KEY_LEN;
+pub const ICMP_TUNNEL_RESET_REQUIRED_BODY_LEN: usize = ICMP_TUNNEL_CONTROL_HEADER_LEN
+    + size_of::<u8>()
+    + ICMP_TUNNEL_SESSION_ID_LEN
+    + size_of::<u16>()
+    + ICMP_TUNNEL_POOL_GENERATION_LEN
+    + ICMP_TUNNEL_RESET_CHALLENGE_LEN;
+pub const ICMP_TUNNEL_CHALLENGE_BODY_LEN: usize = ICMP_TUNNEL_CONTROL_HEADER_LEN
+    + size_of::<u16>()
+    + ICMP_TUNNEL_RESET_CHALLENGE_LEN
+    + ICMP_TUNNEL_POOL_GENERATION_LEN
+    + size_of::<u8>()
+    + ICMP_TUNNEL_SESSION_KEY_LEN
+    + size_of::<u16>()
+    + ICMP_TUNNEL_SESSION_KEY_LEN;
+pub const ICMP_TUNNEL_GENERATION_ADVANCE_BODY_LEN: usize =
+    ICMP_TUNNEL_CONTROL_HEADER_LEN + ICMP_TUNNEL_SESSION_KEY_LEN + ICMP_TUNNEL_POOL_GENERATION_LEN;
+pub const ICMP_TUNNEL_SESSION_ACTIVATED_BODY_LEN: usize =
+    ICMP_TUNNEL_CONTROL_HEADER_LEN + ICMP_TUNNEL_SESSION_KEY_LEN + size_of::<u16>();
+pub const ICMP_TUNNEL_CONTROL_BODY_LEN: usize = ICMP_TUNNEL_CHALLENGE_BODY_LEN;
+const _: () = assert!(ICMP_TUNNEL_NEGOTIATE_BODY_LEN == 24);
+const _: () = assert!(ICMP_TUNNEL_RESET_REQUIRED_BODY_LEN == 29);
+const _: () = assert!(ICMP_TUNNEL_CHALLENGE_BODY_LEN == 63);
+const _: () = assert!(ICMP_TUNNEL_GENERATION_ADVANCE_BODY_LEN == 30);
+const _: () = assert!(ICMP_TUNNEL_SESSION_ACTIVATED_BODY_LEN == 24);
 
 // IPv6 extension Next Header values relevant to this shallow parser.
 const IPV6_EXT_HOP_BY_HOP: usize = 0;
 const IPV6_EXT_ROUTING: usize = 43;
 const IPV6_EXT_FRAGMENT: usize = 44;
+const IPV6_EXT_ENCAPSULATING_SECURITY_PAYLOAD: usize = 50;
+const IPV6_EXT_AUTHENTICATION: usize = 51;
 const IPV6_EXT_DEST_OPTS: usize = 60;
+const IPV6_ROUTING_SEGMENTS_LEFT_OFF: usize = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WireIcmpIdentity {
-    pub source_id: Option<u16>,
-    pub destination_id: u16,
-}
+mod model;
+pub use model::{
+    IcmpMalformedReason, IpMalformedReason, IpUnsupportedReason, IpVersion, NetworkParseOutcome,
+    ParsedIcmpEcho, ParsedNetworkHeader, ParsedNetworkLayer, ParsedPacketHeaders, ParsedTransport,
+    ParsedUdpHeader, ValidatedNetworkPacket, WireIcmpIdentity,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParsedIcmpEcho {
-    pub identity: WireIcmpIdentity,
-    pub seq: u16,
-    pub is_req: bool,
-    pub shim_flags: Option<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParsedUdpHeader {
-    pub src_port: u16,
-    pub dst_port: u16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ParsedPacketHeaders {
-    pub transport: ParsedTransport,
-    pub src_ip: Option<IpAddr>,
-    pub dst_ip: Option<IpAddr>,
-    pub udp: Option<ParsedUdpHeader>,
-    pub icmp: Option<ParsedIcmpEcho>,
-    pub payload_bounds: (usize, usize),
-    pub icmp_malformed_reason: Option<IcmpMalformedReason>,
-}
+mod extent;
+pub use extent::{DeclaredPacketExtent, Ipv4PacketLengthEncoding};
 
 static DUMMY_BUF: [u8; 1] = [0];
 
-#[inline]
-pub const fn parse_packet_headers(payload: &[u8]) -> ParsedPacketHeaders {
-    let n = payload.len();
-    let non_empty = bool01(n != 0);
-    let b = [&DUMMY_BUF, payload][non_empty];
+#[derive(Clone, Copy)]
+struct KernelInput<'a> {
+    bytes: &'a [u8],
+    captured_len: usize,
+    version_nibble: u8,
+}
 
-    // 1. Base Length Gates
-    let enough_for_base_icmp = has_len(n, ICMP_MIN_LEN);
-    let enough_for_v6_base = has_len(n, IPV6_MIN_LEN);
-
-    // 2. Base IP Header Validation
-    let b0 = byte_at(b, 0, non_empty);
-    let ver = (b0 >> 4) as usize;
-    let ihl = ((b0 as usize) & 0x0f) << 2;
-    let is_v4 = (ver == 4) as usize;
-    let is_v6 = (ver == 6) as usize;
-    let sane_ihl = (ihl >= IPV4_MIN_LEN) as usize;
-
-    let enough_for_v4_base = has_len(n, ihl);
-    let valid_v4_base = is_v4 & sane_ihl & enough_for_v4_base;
-    let valid_v6_base = is_v6 & enough_for_v6_base;
-    let valid_ip_base = valid_v4_base | valid_v6_base;
-
-    let base_proto_or_frag_hi = byte_at(b, IPV4_FRAG_HI_OFF, valid_ip_base);
-    let v6_next0 = base_proto_or_frag_hi as usize;
-    let v6_ext0 = valid_v6_base & is_skippable_v6_ext(v6_next0);
-    let v6_ext0_prefix_ok = v6_ext0 & has_len(n, IPV6_FIRST_EXT_OFF + IPV6_EXT_MIN_LEN);
-
-    let frag_lo_or_ext_next_off = select2_usize(
-        IPV4_FRAG_LO_OFF,
-        valid_v4_base,
-        IPV6_FIRST_EXT_OFF,
-        v6_ext0_prefix_ok,
-    );
-    let proto_or_ext_len_off = select2_usize(
-        IPV4_PROTO_OFF,
-        valid_v4_base,
-        IPV6_FIRST_EXT_OFF + 1,
-        v6_ext0_prefix_ok,
-    );
-    let v4_or_ext0_prefix_ok = valid_v4_base | v6_ext0_prefix_ok;
-    let frag_lo_or_ext_next = byte_at(b, frag_lo_or_ext_next_off, v4_or_ext0_prefix_ok);
-    let proto_or_ext_len = byte_at(b, proto_or_ext_len_off, v4_or_ext0_prefix_ok);
-
-    let (v4_proto, v4_is_fragment) = parse_v4_proto_and_fragment(
-        (proto_or_ext_len as usize) * valid_v4_base,
-        base_proto_or_frag_hi,
-        frag_lo_or_ext_next,
-        valid_v4_base,
-    );
-
-    // 3. IPv4/IPv6 Transport Identification
-    let (is_v4_icmp, is_v4_udp) =
-        parse_v4_transport_candidate(valid_v4_base, v4_proto, v4_is_fragment);
-
-    let v6_ext0_next = (frag_lo_or_ext_next as usize) * v6_ext0_prefix_ok;
-    let v6_ext0_len_units = (proto_or_ext_len as usize) * v6_ext0_prefix_ok;
-
-    let (v6_off1, v6_ext0_full, v6_ext0_truncated) = finish_v6_ext_step(
-        n,
-        IPV6_FIRST_EXT_OFF,
-        v6_ext0,
-        v6_ext0_prefix_ok,
-        v6_ext0_len_units,
-    );
-
-    let (
-        v6_transport_proto,
-        v6_transport_off,
-        valid_v6_transport_base,
-        unsupported_v6_fragment,
-        v6_ext_truncated,
-    ) = parse_v6_transport_candidate(
-        v6_next0,
-        valid_v6_base,
-        v6_ext0,
-        v6_ext0_next,
-        v6_off1,
-        v6_ext0_full,
-        v6_ext0_truncated,
-    );
-
-    let is_v6_icmp = valid_v6_transport_base & ((v6_transport_proto == PROTO_ICMP_V6) as usize);
-    let is_v6_udp = valid_v6_transport_base & ((v6_transport_proto == PROTO_UDP) as usize);
-
-    let looks_like_v4_transport = is_v4_icmp | is_v4_udp;
-    let looks_like_v6_transport = is_v6_icmp | is_v6_udp;
-
-    // 4. Final Transport Validation
-    let has_v4_transport_room = has_len(n, ihl + UDP_MIN_LEN);
-    let has_v6_transport_room = has_len(n, v6_transport_off + UDP_MIN_LEN);
-
-    let v4_trans_ok = looks_like_v4_transport & has_v4_transport_room;
-    let v6_trans_ok = looks_like_v6_transport & has_v6_transport_room;
-
-    let v4_icmp = v4_trans_ok & is_v4_icmp;
-    let v4_udp = v4_trans_ok & is_v4_udp;
-    let v6_icmp = v6_trans_ok & is_v6_icmp;
-    let v6_udp = v6_trans_ok & is_v6_udp;
-    let v4_known_transport = v4_icmp | v4_udp;
-    let v6_known_transport = v6_icmp | v6_udp;
-
-    let transport_off = select2_usize(
-        ihl,
-        v4_known_transport,
-        v6_transport_off,
-        v6_known_transport,
-    );
-    let maybe_headerless = not01(valid_ip_base);
-    let headerless_icmp = maybe_headerless & enough_for_base_icmp;
-
-    let icmp_off = transport_off; // headerless_icmp_off is always 0
-    let have_icmp = v4_icmp | v6_icmp | headerless_icmp;
-
-    // 5. ICMP Specifics
-    let (icmp_ok, icmp_type_ok, icmp_is_req, icmp_seq) =
-        parse_icmp_echo_base(b, icmp_off, have_icmp);
-    let is_req = icmp_is_req != 0;
-
-    let payload_off = icmp_off + ICMP_PAYLOAD_OFF;
-    let has_payload = has_len(n, payload_off + ICMP_SHIM_FLAGS_LEN);
-    let icmp_with_payload = icmp_ok & has_payload;
-
-    let (has_shim, explicit_icmp_src, malformed_shim, shim_flags, shim_reason) =
-        parse_icmp_shim(b, n, payload_off, icmp_with_payload);
-
-    let icmp_parse_ok = icmp_ok & not01(malformed_shim);
-
-    let udp_off = transport_off;
-    let udp_ok = v4_udp | v6_udp;
-    let known_transport = icmp_parse_ok | udp_ok;
-
-    let implicit_icmp_src = icmp_parse_ok & not01(explicit_icmp_src);
-    let icmp_ident_off = icmp_off + ICMP_IDENT_OFF;
-    let udp_src_off = udp_off + UDP_SRC_OFF;
-    let udp_dst_off = udp_off + UDP_DST_OFF;
-    let explicit_icmp_src_off = payload_off + ICMP_SHIM_FLAGS_LEN;
-
-    let transport_src_off = select3_usize(
-        udp_src_off,
-        udp_ok,
-        icmp_ident_off,
-        implicit_icmp_src,
-        explicit_icmp_src_off,
-        explicit_icmp_src,
-    );
-    let transport_dst_off = select2_usize(udp_dst_off, udp_ok, icmp_ident_off, icmp_parse_ok);
-
-    let transport_src_ok = udp_ok | implicit_icmp_src | explicit_icmp_src;
-    let transport_src_id = read_be16(b, transport_src_off, transport_src_ok);
-    let transport_dst_id = read_be16(b, transport_dst_off, known_transport);
-
-    let src_ip_off = select2_usize(
-        IPV4_SRC_IP_OFF,
-        valid_v4_base,
-        IPV6_SRC_IP_OFF,
-        valid_v6_base,
-    );
-    let dst_ip_off = select2_usize(
-        IPV4_DST_IP_OFF,
-        valid_v4_base,
-        IPV6_DST_IP_OFF,
-        valid_v6_base,
-    );
-    let src_ip = parse_detected_ip_at(b, src_ip_off, valid_v4_base, valid_v6_base);
-    let dst_ip = parse_detected_ip_at(b, dst_ip_off, valid_v4_base, valid_v6_base);
-
-    // Adjust ICMP payload bounds to skip the shim header (1 or 3 bytes).
-    let shim_len = select2_usize(
-        ICMP_SHIM_FLAGS_LEN,
-        implicit_icmp_src,
-        ICMP_EXPLICIT_SOURCE_SHIM_LEN,
-        explicit_icmp_src,
-    );
-    let payload_start = select3_usize(
-        payload_off + shim_len,
-        has_shim,
-        payload_off,
-        icmp_parse_ok & not01(has_payload),
-        udp_off + UDP_PAYLOAD_OFF,
-        udp_ok,
-    );
-    let payload_end = select1_usize(n, known_transport);
-    let payload_bounds = (payload_start, payload_end);
-
-    let too_short = not01(enough_for_base_icmp);
-    let invalid_v4_base = is_v4 & not01(valid_v4_base);
-    let invalid_v6_base = is_v6 & not01(valid_v6_base);
-    let v4_truncated = looks_like_v4_transport & not01(has_v4_transport_room);
-    let v6_truncated = looks_like_v6_transport & not01(has_v6_transport_room);
-    let malformed_icmp_echo = have_icmp & icmp_type_ok & not01(icmp_ok);
-
-    let malformed_candidate = too_short
-        | invalid_v4_base
-        | invalid_v6_base
-        | v6_ext_truncated
-        | v4_truncated
-        | v6_truncated
-        | malformed_shim
-        | malformed_icmp_echo;
-
-    let malformed = bool01(known_transport == 0) & malformed_candidate;
-
-    let transport_code = (icmp_parse_ok & headerless_icmp)
-        | ((icmp_parse_ok & v4_icmp) << 1)
-        | ((icmp_parse_ok & v6_icmp) * 3)
-        | (v4_udp << 2)
-        | (v6_udp * 5)
-        | (malformed * 6);
-
-    // IPv4 fragments are intentionally unsupported without reassembly:
-    // nonzero fragment offsets may not contain a transport header, while
-    // MF=1 initial fragments contain only a partial transport payload.
-    let unsupported_fragment = v4_is_fragment | unsupported_v6_fragment;
-    let transport_code = transport_code * not01(unsupported_fragment);
-
-    let transport = [
-        ParsedTransport::Unsupported,
-        ParsedTransport::HeaderlessIcmp,
-        ParsedTransport::Ipv4Icmp,
-        ParsedTransport::Ipv6Icmp,
-        ParsedTransport::Ipv4Udp,
-        ParsedTransport::Ipv6Udp,
-        ParsedTransport::Malformed,
-    ][transport_code];
-
-    ParsedPacketHeaders {
-        transport,
-        src_ip,
-        dst_ip,
-        udp: [
-            None,
-            Some(ParsedUdpHeader {
-                src_port: transport_src_id,
-                dst_port: transport_dst_id,
-            }),
-        ][udp_ok],
-        icmp: [
-            None,
-            Some(ParsedIcmpEcho {
-                identity: WireIcmpIdentity {
-                    source_id: [None, Some(transport_src_id)][has_shim],
-                    destination_id: transport_dst_id,
-                },
-                seq: icmp_seq,
-                is_req,
-                shim_flags: [None, Some(shim_flags)][has_shim],
-            }),
-        ][icmp_parse_ok],
-        payload_bounds,
-        icmp_malformed_reason: first_icmp_malformed_reason(
-            too_short | v4_truncated | v6_truncated,
-            malformed_icmp_echo,
-            shim_reason,
-        ),
+impl<'a> KernelInput<'a> {
+    #[inline]
+    const fn new(payload: &'a [u8]) -> Self {
+        let captured_len = payload.len();
+        let non_empty = bool01(captured_len != 0);
+        let bytes = [&DUMMY_BUF, payload][non_empty];
+        Self {
+            bytes,
+            captured_len,
+            version_nibble: byte_at(bytes, IP_VERSION_OFF, non_empty) >> 4,
+        }
     }
 }
 
 #[inline]
 pub const fn parse_udp_datagram_payload(payload: &[u8]) -> ParsedPacketHeaders {
     ParsedPacketHeaders {
+        network: ParsedNetworkLayer::NotPresent,
         transport: ParsedTransport::UdpDatagram,
-        src_ip: None,
-        dst_ip: None,
         udp: None,
         icmp: None,
+        packet_bounds: (0, payload.len()),
+        transport_bounds: (0, payload.len()),
         payload_bounds: (0, payload.len()),
         icmp_malformed_reason: None,
     }
@@ -407,40 +162,32 @@ const fn parse_fixed_icmp_transport(
     request_type: u8,
     reply_type: u8,
 ) -> ParsedPacketHeaders {
-    let n = payload.len();
-    let non_empty = bool01(n != 0);
-    let b = [&DUMMY_BUF, payload][non_empty];
-    let icmp = parse_fixed_icmp_at(b, n, 0, 1, request_type, reply_type);
+    let input = KernelInput::new(payload);
+    let n = input.captured_len;
+    let icmp = parse_fixed_icmp_at(input.bytes, n, 0, 1, request_type, reply_type);
     let malformed = not01(icmp.parse_ok)
         & (not01(icmp.enough)
             | (icmp.enough & icmp.type_ok & not01(icmp.header_ok))
             | icmp.malformed_shim);
+    let unrelated = not01(icmp.parse_ok | malformed);
     let transport = [
-        ParsedTransport::Unsupported,
-        ParsedTransport::HeaderlessIcmp,
-        ParsedTransport::Malformed,
-    ][icmp.parse_ok | (malformed * 2)];
+        ParsedTransport::NotParsed,
+        ParsedTransport::Icmp,
+        ParsedTransport::MalformedIcmp,
+        ParsedTransport::UnrelatedIcmp,
+    ][icmp.parse_ok | (malformed * 2) | (unrelated * 3)];
+    let transport_end = select1_usize(n, icmp.parse_ok);
 
     ParsedPacketHeaders {
+        network: ParsedNetworkLayer::NotPresent,
         transport,
-        src_ip: None,
-        dst_ip: None,
         udp: None,
-        icmp: [
-            None,
-            Some(ParsedIcmpEcho {
-                identity: WireIcmpIdentity {
-                    source_id: [None, Some(icmp.logical_src_id)][icmp.has_shim],
-                    destination_id: icmp.logical_dst_id,
-                },
-                seq: icmp.seq,
-                is_req: icmp.is_req != 0,
-                shim_flags: [None, Some(icmp.shim_flags)][icmp.has_shim],
-            }),
-        ][icmp.parse_ok],
+        icmp: parsed_icmp(icmp, icmp.parse_ok),
+        packet_bounds: (0, n),
+        transport_bounds: (0, transport_end),
         payload_bounds: (
             select1_usize(icmp.payload_start, icmp.parse_ok),
-            select1_usize(n, icmp.parse_ok),
+            transport_end,
         ),
         icmp_malformed_reason: icmp.malformed_reason,
     }
@@ -448,151 +195,405 @@ const fn parse_fixed_icmp_transport(
 
 #[inline]
 pub const fn parse_ipv4_icmp_packet(payload: &[u8]) -> ParsedPacketHeaders {
-    let n = payload.len();
-    let non_empty = bool01(n != 0);
-    let b = [&DUMMY_BUF, payload][non_empty];
-    let b0 = byte_at(b, 0, non_empty);
-    let is_v4 = ((b0 >> 4) == 4) as usize;
+    parse_ipv4_icmp_packet_with_length(payload, Ipv4PacketLengthEncoding::NetworkTotal)
+}
+
+#[inline]
+pub(crate) const fn parse_ipv4_icmp_packet_with_length(
+    payload: &[u8],
+    length_encoding: Ipv4PacketLengthEncoding,
+) -> ParsedPacketHeaders {
+    parse_network_transport(payload, parse_ipv4_icmp_network(payload, length_encoding))
+}
+
+#[inline]
+pub(crate) const fn parse_ipv4_icmp_network(
+    payload: &[u8],
+    length_encoding: Ipv4PacketLengthEncoding,
+) -> NetworkParseOutcome {
+    let input = KernelInput::new(payload);
+    let n = input.captured_len;
+    let b = input.bytes;
+    if n == 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::MissingHeader,
+        ));
+    }
+    let b0 = byte_at(b, IP_VERSION_OFF, 1);
+    let version_nibble = input.version_nibble;
+    let is_v4 = (version_nibble == 4) as usize;
+    if is_v4 == 0 {
+        return NetworkParseOutcome::Rejected(unexpected_or_missing_version(
+            IpVersion::V4,
+            version_nibble,
+        ));
+    }
     let ihl = ((b0 as usize) & 0x0f) << 2;
     let sane_ihl = (ihl >= IPV4_MIN_LEN) as usize;
-    let base_ok = is_v4 & sane_ihl & has_len(n, ihl);
+    let has_base = has_len(n, IPV4_MIN_LEN);
+    let has_ihl = has_len(n, ihl);
+    if sane_ihl == 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::InvalidHeaderLength,
+        ));
+    }
+    if has_base == 0 || has_ihl == 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::TruncatedHeader,
+        ));
+    }
+    let structural_ok = is_v4 & sane_ihl & has_base & has_ihl;
+    let declared = read_ipv4_declared_length(b, structural_ok, length_encoding);
+    let packet_end = match length_encoding {
+        Ipv4PacketLengthEncoding::NetworkTotal => declared,
+        Ipv4PacketLengthEncoding::DarwinHostPayload => ihl + declared,
+    };
+    if packet_end < ihl {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::InvalidPacketLength,
+        ));
+    }
+    if packet_end > n {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::CaptureTruncated,
+        ));
+    }
+    let length_ok = structural_ok;
+    let base_ok = structural_ok & length_ok;
     let proto = byte_at(b, IPV4_PROTO_OFF, base_ok) as usize;
     let frag_hi = byte_at(b, IPV4_FRAG_HI_OFF, base_ok);
     let frag_lo = byte_at(b, IPV4_FRAG_LO_OFF, base_ok);
-    let (_, fragmented) = parse_v4_proto_and_fragment(proto, frag_hi, frag_lo, base_ok);
-    let candidate = base_ok & (proto == PROTO_ICMP_V4) as usize & not01(fragmented);
-    parse_fixed_ip_icmp(
-        payload,
-        b,
-        ihl,
-        FixedIpIcmpLayout {
-            request_type: 8,
-            reply_type: 0,
-            accepted_transport: ParsedTransport::Ipv4Icmp,
-        },
-        FixedIpEvidence {
-            candidate,
-            malformed_base: is_v4 & not01(base_ok),
-            unsupported_fragment: fragmented,
-            src_ip: parse_ipv4_at(b, IPV4_SRC_IP_OFF, base_ok),
-            dst_ip: parse_ipv4_at(b, IPV4_DST_IP_OFF, base_ok),
-        },
-    )
+    let fragmented = ipv4_fragment_mask(frag_hi, frag_lo, base_ok);
+    let reserved_flag = ipv4_reserved_flag_mask(frag_hi, base_ok);
+    let header = ParsedNetworkHeader {
+        version: IpVersion::V4,
+        source: parse_ipv4_at(b, IPV4_SRC_IP_OFF, base_ok),
+        destination: parse_ipv4_at(b, IPV4_DST_IP_OFF, base_ok),
+        ipv6_flow_label: None,
+        protocol: proto as u8,
+        packet_end,
+        transport_offset: ihl,
+    };
+    if reserved_flag != 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::ReservedIpv4Flag,
+        ));
+    }
+    if fragmented != 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::Fragmented,
+        });
+    }
+    NetworkParseOutcome::Valid(ValidatedNetworkPacket {
+        header,
+        expected_transport: proto == PROTO_ICMP_V4,
+        request_type: 8,
+        reply_type: 0,
+        captured_len: n,
+    })
 }
 
 #[inline]
 pub const fn parse_ipv6_icmp_packet(payload: &[u8]) -> ParsedPacketHeaders {
-    let n = payload.len();
-    let non_empty = bool01(n != 0);
-    let b = [&DUMMY_BUF, payload][non_empty];
-    let b0 = byte_at(b, 0, non_empty);
-    let is_v6 = ((b0 >> 4) == 6) as usize;
-    let base_ok = is_v6 & has_len(n, IPV6_MIN_LEN);
-    let next0 = byte_at(b, IPV4_FRAG_HI_OFF, base_ok) as usize;
+    parse_network_transport(payload, parse_ipv6_icmp_network(payload))
+}
+
+#[inline]
+pub(crate) const fn parse_ipv6_icmp_network(payload: &[u8]) -> NetworkParseOutcome {
+    let input = KernelInput::new(payload);
+    let n = input.captured_len;
+    let b = input.bytes;
+    if n == 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::MissingHeader,
+        ));
+    }
+    let version_nibble = input.version_nibble;
+    let is_v6 = (version_nibble == 6) as usize;
+    if is_v6 == 0 {
+        return NetworkParseOutcome::Rejected(unexpected_or_missing_version(
+            IpVersion::V6,
+            version_nibble,
+        ));
+    }
+    let has_base = has_len(n, IPV6_MIN_LEN);
+    if has_base == 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::TruncatedHeader,
+        ));
+    }
+    let structural_ok = is_v6 & has_base;
+    let payload_len = read_be16(b, IPV6_PAYLOAD_LENGTH_OFF, structural_ok) as usize;
+    if payload_len == 0 {
+        let header = ParsedNetworkHeader {
+            version: IpVersion::V6,
+            source: parse_ipv6_at(b, IPV6_SRC_IP_OFF, structural_ok),
+            destination: parse_ipv6_at(b, IPV6_DST_IP_OFF, structural_ok),
+            ipv6_flow_label: Some(parse_ipv6_flow_label(b, structural_ok)),
+            protocol: byte_at(b, IPV6_NEXT_HEADER_OFF, structural_ok),
+            packet_end: IPV6_MIN_LEN,
+            transport_offset: IPV6_MIN_LEN,
+        };
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::Jumbogram,
+        });
+    }
+    let packet_end = IPV6_MIN_LEN + payload_len;
+    if packet_end > n {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::CaptureTruncated,
+        ));
+    }
+    let base_ok = structural_ok;
+    let next0 = byte_at(b, IPV6_NEXT_HEADER_OFF, base_ok) as usize;
+    if next0 == IPV6_EXT_AUTHENTICATION {
+        return NetworkParseOutcome::Rejected(ipv6_unsupported_base(
+            b,
+            packet_end,
+            next0,
+            IpUnsupportedReason::AuthenticationHeader,
+        ));
+    }
+    if next0 == IPV6_EXT_ENCAPSULATING_SECURITY_PAYLOAD {
+        return NetworkParseOutcome::Rejected(ipv6_unsupported_base(
+            b,
+            packet_end,
+            next0,
+            IpUnsupportedReason::EncryptedPayload,
+        ));
+    }
     let ext0 = base_ok & is_skippable_v6_ext(next0);
-    let ext_prefix = ext0 & has_len(n, IPV6_FIRST_EXT_OFF + IPV6_EXT_MIN_LEN);
-    let ext_next = byte_at(b, IPV6_FIRST_EXT_OFF, ext_prefix) as usize;
-    let ext_len = byte_at(b, IPV6_FIRST_EXT_OFF + 1, ext_prefix) as usize;
-    let (off1, ext_full, ext_truncated) =
-        finish_v6_ext_step(n, IPV6_FIRST_EXT_OFF, ext0, ext_prefix, ext_len);
-    let (proto, off, transport_base, fragmented, ext_truncated) = parse_v6_transport_candidate(
+    let ext_prefix = ext0 & has_len(packet_end, IPV6_FIRST_EXT_OFF + IPV6_EXT_MIN_LEN);
+    let ext_next = byte_at(b, IPV6_FIRST_EXT_OFF + IPV6_EXT_NEXT_HEADER_OFF, ext_prefix) as usize;
+    let ext_len = byte_at(b, IPV6_FIRST_EXT_OFF + IPV6_EXT_LENGTH_OFF, ext_prefix) as usize;
+    let extension =
+        parse_ipv6_extension_extent(packet_end, IPV6_FIRST_EXT_OFF, ext0, ext_prefix, ext_len);
+    let transport = parse_ipv6_transport_evidence(
         next0,
         base_ok,
         ext0,
         ext_next,
-        off1,
-        ext_full,
-        ext_truncated,
+        extension.next_offset,
+        extension.complete,
+        extension.truncated,
     );
-    let candidate = transport_base & (proto == PROTO_ICMP_V6) as usize;
-    parse_fixed_ip_icmp(
-        payload,
-        b,
-        off,
-        FixedIpIcmpLayout {
-            request_type: 128,
-            reply_type: 129,
-            accepted_transport: ParsedTransport::Ipv6Icmp,
+    let header = ParsedNetworkHeader {
+        version: IpVersion::V6,
+        source: parse_ipv6_at(b, IPV6_SRC_IP_OFF, base_ok),
+        destination: parse_ipv6_at(b, IPV6_DST_IP_OFF, base_ok),
+        ipv6_flow_label: Some(parse_ipv6_flow_label(b, base_ok)),
+        protocol: transport.protocol as u8,
+        packet_end,
+        transport_offset: transport.offset,
+    };
+    if transport.extension_truncated != 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Malformed(
+            IpMalformedReason::TruncatedExtension,
+        ));
+    }
+    if next0 == IPV6_EXT_ROUTING
+        && extension.complete != 0
+        && byte_at(
+            b,
+            IPV6_FIRST_EXT_OFF + IPV6_ROUTING_SEGMENTS_LEFT_OFF,
+            extension.complete,
+        ) != 0
+    {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::RoutingHeaderWithSegments,
+        });
+    }
+    if transport.fragmented != 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::Fragmented,
+        });
+    }
+    if transport.extension_chain != 0 {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::ExtensionChain,
+        });
+    }
+    if transport.protocol == IPV6_EXT_AUTHENTICATION {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::AuthenticationHeader,
+        });
+    }
+    if transport.protocol == IPV6_EXT_ENCAPSULATING_SECURITY_PAYLOAD {
+        return NetworkParseOutcome::Rejected(ParsedNetworkLayer::Unsupported {
+            header,
+            reason: IpUnsupportedReason::EncryptedPayload,
+        });
+    }
+    NetworkParseOutcome::Valid(ValidatedNetworkPacket {
+        header,
+        expected_transport: transport.transport_candidate != 0
+            && transport.protocol == PROTO_ICMP_V6,
+        request_type: 128,
+        reply_type: 129,
+        captured_len: n,
+    })
+}
+
+#[inline]
+const fn ipv6_unsupported_base(
+    b: &[u8],
+    packet_end: usize,
+    protocol: usize,
+    reason: IpUnsupportedReason,
+) -> ParsedNetworkLayer {
+    ParsedNetworkLayer::Unsupported {
+        header: ParsedNetworkHeader {
+            version: IpVersion::V6,
+            source: parse_ipv6_at(b, IPV6_SRC_IP_OFF, 1),
+            destination: parse_ipv6_at(b, IPV6_DST_IP_OFF, 1),
+            ipv6_flow_label: Some(parse_ipv6_flow_label(b, 1)),
+            protocol: protocol as u8,
+            packet_end,
+            transport_offset: IPV6_MIN_LEN,
         },
-        FixedIpEvidence {
-            candidate,
-            malformed_base: (is_v6 & not01(base_ok)) | ext_truncated,
-            unsupported_fragment: fragmented,
-            src_ip: parse_ipv6_at(b, IPV6_SRC_IP_OFF, base_ok),
-            dst_ip: parse_ipv6_at(b, IPV6_DST_IP_OFF, base_ok),
-        },
-    )
+        reason,
+    }
+}
+
+#[inline]
+const fn parse_ipv6_flow_label(bytes: &[u8], valid: usize) -> u32 {
+    ((byte_at(bytes, 0, valid) as u32 & 0x0f) << 16)
+        | ((byte_at(bytes, 1, valid) as u32) << 8)
+        | byte_at(bytes, 2, valid) as u32
+}
+
+#[inline]
+pub(crate) const fn parse_network_transport(
+    payload: &[u8],
+    network: NetworkParseOutcome,
+) -> ParsedPacketHeaders {
+    match network {
+        NetworkParseOutcome::Valid(validated) => {
+            if validated.captured_len != payload.len() {
+                return ParsedPacketHeaders::network_only(ParsedNetworkLayer::Malformed(
+                    IpMalformedReason::CaptureTruncated,
+                ));
+            }
+            parse_fixed_ip_icmp(
+                KernelInput::new(payload).bytes,
+                ParsedNetworkLayer::Valid(validated.header),
+                Some(validated.header),
+                FixedIpEvidence {
+                    candidate: validated.expected_transport as usize,
+                    request_type: validated.request_type,
+                    reply_type: validated.reply_type,
+                },
+            )
+        }
+        NetworkParseOutcome::Rejected(network) => ParsedPacketHeaders::network_only(network),
+        NetworkParseOutcome::NotPresent => ParsedPacketHeaders::network_only(
+            ParsedNetworkLayer::Malformed(IpMalformedReason::MissingHeader),
+        ),
+    }
 }
 
 #[inline]
 const fn parse_fixed_ip_icmp(
-    payload: &[u8],
     b: &[u8],
-    icmp_off: usize,
-    layout: FixedIpIcmpLayout,
+    network: ParsedNetworkLayer,
+    header: Option<ParsedNetworkHeader>,
     evidence: FixedIpEvidence,
 ) -> ParsedPacketHeaders {
-    let n = payload.len();
+    let (packet_end, transport_offset) = match header {
+        Some(header) => (header.packet_end, header.transport_offset),
+        None => (0, 0),
+    };
     let icmp = parse_fixed_icmp_at(
         b,
-        n,
-        icmp_off,
+        packet_end,
+        transport_offset,
         evidence.candidate,
-        layout.request_type,
-        layout.reply_type,
+        evidence.request_type,
+        evidence.reply_type,
     );
-    let parse_ok = icmp.parse_ok & not01(evidence.unsupported_fragment);
-    let malformed = not01(parse_ok)
-        & not01(evidence.unsupported_fragment)
-        & (evidence.malformed_base
-            | (evidence.candidate & not01(icmp.enough))
+    let network_valid = matches!(network, ParsedNetworkLayer::Valid(_)) as usize;
+    let parse_ok = icmp.parse_ok & network_valid;
+    let malformed = network_valid
+        & not01(parse_ok)
+        & (evidence.candidate & not01(icmp.enough)
             | (icmp.have_header & icmp.type_ok & not01(icmp.header_ok))
             | icmp.malformed_shim);
+    let unrelated_protocol = network_valid & not01(evidence.candidate) & not01(malformed);
+    let unrelated_icmp = network_valid & evidence.candidate & not01(parse_ok | malformed);
     let transport = [
-        ParsedTransport::Unsupported,
-        layout.accepted_transport,
-        ParsedTransport::Malformed,
-    ][parse_ok | (malformed * 2)];
+        ParsedTransport::NotParsed,
+        ParsedTransport::Icmp,
+        ParsedTransport::MalformedIcmp,
+        ParsedTransport::UnrelatedProtocol,
+        ParsedTransport::UnrelatedIcmp,
+    ][parse_ok | (malformed * 2) | (unrelated_protocol * 3) | (unrelated_icmp * 4)];
+    let packet_end = select1_usize(packet_end, network_valid);
+    let transport_start = select1_usize(transport_offset, network_valid);
+    let transport_end = packet_end;
 
     ParsedPacketHeaders {
+        network,
         transport,
-        src_ip: evidence.src_ip,
-        dst_ip: evidence.dst_ip,
         udp: None,
-        icmp: [
-            None,
-            Some(ParsedIcmpEcho {
-                identity: WireIcmpIdentity {
-                    source_id: [None, Some(icmp.logical_src_id)][icmp.has_shim],
-                    destination_id: icmp.logical_dst_id,
-                },
-                seq: icmp.seq,
-                is_req: icmp.is_req != 0,
-                shim_flags: [None, Some(icmp.shim_flags)][icmp.has_shim],
-            }),
-        ][parse_ok],
+        icmp: parsed_icmp(icmp, parse_ok),
+        packet_bounds: (0, packet_end),
+        transport_bounds: (transport_start, transport_end),
         payload_bounds: (
             select1_usize(icmp.payload_start, parse_ok),
-            select1_usize(n, parse_ok),
+            select1_usize(transport_end, parse_ok),
         ),
         icmp_malformed_reason: icmp.malformed_reason,
     }
 }
 
 #[derive(Clone, Copy)]
-struct FixedIpIcmpLayout {
-    request_type: u8,
-    reply_type: u8,
-    accepted_transport: ParsedTransport,
-}
-
-#[derive(Clone, Copy)]
 struct FixedIpEvidence {
     candidate: usize,
-    malformed_base: usize,
-    unsupported_fragment: usize,
-    src_ip: Option<IpAddr>,
-    dst_ip: Option<IpAddr>,
+    request_type: u8,
+    reply_type: u8,
+}
+
+#[inline]
+const fn unexpected_or_missing_version(
+    expected: IpVersion,
+    version_nibble: u8,
+) -> ParsedNetworkLayer {
+    let observed = match version_nibble {
+        4 => Some(IpVersion::V4),
+        6 => Some(IpVersion::V6),
+        _ => None,
+    };
+    match observed {
+        Some(observed) => ParsedNetworkLayer::UnexpectedVersion {
+            expected,
+            observed: Some(observed),
+        },
+        None => ParsedNetworkLayer::Malformed(IpMalformedReason::InvalidVersion {
+            observed_nibble: version_nibble,
+        }),
+    }
+}
+
+#[inline]
+const fn read_ipv4_declared_length(
+    payload: &[u8],
+    valid: usize,
+    encoding: Ipv4PacketLengthEncoding,
+) -> usize {
+    let bytes = [
+        byte_at(payload, IPV4_TOTAL_LENGTH_OFF, valid),
+        byte_at(payload, IPV4_TOTAL_LENGTH_OFF + 1, valid),
+    ];
+    match encoding {
+        Ipv4PacketLengthEncoding::NetworkTotal => u16::from_be_bytes(bytes) as usize,
+        Ipv4PacketLengthEncoding::DarwinHostPayload => u16::from_ne_bytes(bytes) as usize,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -608,9 +609,27 @@ struct FixedIcmpParse {
     shim_flags: u8,
     logical_src_id: u16,
     logical_dst_id: u16,
+    session_id: u64,
     seq: u16,
     is_req: usize,
     payload_start: usize,
+}
+
+#[inline]
+const fn parsed_icmp(icmp: FixedIcmpParse, parse_ok: usize) -> Option<ParsedIcmpEcho> {
+    [
+        None,
+        Some(ParsedIcmpEcho {
+            identity: WireIcmpIdentity {
+                source_id: [None, Some(icmp.logical_src_id)][icmp.has_shim],
+                destination_id: icmp.logical_dst_id,
+            },
+            session_id: icmp.session_id,
+            seq: icmp.seq,
+            is_req: icmp.is_req != 0,
+            shim_flags: [None, Some(icmp.shim_flags)][icmp.has_shim],
+        }),
+    ][parse_ok]
 }
 
 #[inline]
@@ -632,25 +651,18 @@ const fn parse_fixed_icmp_at(
     let header_ok = have_header & type_ok & (icmp_code == 0) as usize;
     let payload_off = icmp_off + ICMP_PAYLOAD_OFF;
     let has_payload = has_len(n, payload_off + ICMP_SHIM_FLAGS_LEN);
-    let (has_shim, explicit_src, malformed_shim, shim_flags, shim_reason) =
-        parse_icmp_shim(b, n, payload_off, header_ok & has_payload);
-    let parse_ok = header_ok & not01(malformed_shim);
-    let implicit_src = parse_ok & not01(explicit_src);
+    let shim = parse_icmp_shim(b, n, payload_off, header_ok & has_payload);
+    let parse_ok = header_ok & not01(shim.malformed);
+    let implicit_src = parse_ok & not01(shim.explicit_source);
     let src_off = select2_usize(
         icmp_off + ICMP_IDENT_OFF,
         implicit_src,
         payload_off + ICMP_SHIM_FLAGS_LEN,
-        explicit_src,
-    );
-    let shim_len = select2_usize(
-        ICMP_SHIM_FLAGS_LEN,
-        implicit_src,
-        ICMP_EXPLICIT_SOURCE_SHIM_LEN,
-        explicit_src,
+        shim.explicit_source,
     );
     let payload_start = select2_usize(
-        payload_off + shim_len,
-        has_shim,
+        shim.payload_start,
+        shim.has_shim,
         payload_off,
         parse_ok & not01(has_payload),
     );
@@ -661,16 +673,17 @@ const fn parse_fixed_icmp_at(
         have_header,
         type_ok,
         header_ok,
-        malformed_shim,
+        malformed_shim: shim.malformed,
         malformed_reason: first_icmp_malformed_reason(
             candidate & not01(enough),
             have_header & type_ok & not01(header_ok),
-            shim_reason,
+            shim.reason,
         ),
-        has_shim,
-        shim_flags,
-        logical_src_id: read_be16(b, src_off, implicit_src | explicit_src),
+        has_shim: shim.has_shim,
+        shim_flags: shim.flags,
+        logical_src_id: read_be16(b, src_off, implicit_src | shim.explicit_source),
         logical_dst_id: read_be16(b, icmp_off + ICMP_IDENT_OFF, parse_ok),
+        session_id: shim.session_id,
         seq: read_be16(b, icmp_off + ICMP_SEQ_OFF, parse_ok),
         is_req,
         payload_start,
@@ -685,12 +698,23 @@ const fn read_be16(buf: &[u8], off: usize, ok: usize) -> u16 {
 }
 
 #[inline]
+const fn read_be64(buf: &[u8], off: usize, ok: usize) -> u64 {
+    let mut value = 0_u64;
+    let mut index = 0;
+    while index < ICMP_TUNNEL_SESSION_ID_LEN {
+        value = (value << 8) | byte_at(buf, off + index, ok) as u64;
+        index += 1;
+    }
+    value
+}
+
+#[inline]
 const fn byte_at(buf: &[u8], off: usize, ok: usize) -> u8 {
-    // Truly branchless and safe read.
-    // If ok is 0, we read index 0 (safe because buf is always >= 1 byte).
-    // Bitwise mask then returns 0.
-    let mask = 0u8.wrapping_sub((ok != 0) as u8);
-    buf[off * ((ok != 0) as usize)] & mask
+    // Keep every read safe even if an upstream candidate mask is stale.
+    // Invalid reads select the guaranteed byte at index zero and mask it out.
+    let valid = ((ok != 0) as usize) & ((off < buf.len()) as usize);
+    let mask = 0u8.wrapping_sub(valid as u8);
+    buf[off * valid] & mask
 }
 
 #[inline]
@@ -701,18 +725,6 @@ const fn select1_usize(value: usize, ok: usize) -> usize {
 #[inline]
 const fn select2_usize(a: usize, a_ok: usize, b: usize, b_ok: usize) -> usize {
     (a * a_ok) | (b * b_ok)
-}
-
-#[inline]
-const fn select3_usize(
-    a: usize,
-    a_ok: usize,
-    b: usize,
-    b_ok: usize,
-    c: usize,
-    c_ok: usize,
-) -> usize {
-    (a * a_ok) | (b * b_ok) | (c * c_ok)
 }
 
 #[inline]
@@ -730,246 +742,22 @@ const fn has_len(actual: usize, required: usize) -> usize {
     bool01(actual >= required)
 }
 
-#[inline]
-const fn parse_v4_transport_candidate(
-    valid_v4_base: usize,
-    v4_proto: usize,
-    v4_is_fragment: usize,
-) -> (usize, usize) {
-    let valid_v4_transport_base = valid_v4_base & not01(v4_is_fragment);
-    let is_v4_icmp = valid_v4_transport_base & (v4_proto == PROTO_ICMP_V4) as usize;
-    let is_v4_udp = valid_v4_transport_base & (v4_proto == PROTO_UDP) as usize;
-    (is_v4_icmp, is_v4_udp)
-}
+mod control;
+pub use control::icmp_control_body_len;
+use control::{control_session_id_offset, read_control_reply_id};
 
-#[inline]
-const fn parse_icmp_echo_base(
-    b: &[u8],
-    icmp_off: usize,
-    have_icmp: usize,
-) -> (usize, usize, usize, u16) {
-    let icmp_type = byte_at(b, icmp_off, have_icmp);
-    let icmp_code = byte_at(b, icmp_off + ICMP_CODE_OFF, have_icmp);
-    let icmp_v4_req = (icmp_type == 8) as usize;
-    let icmp_v4_reply = (icmp_type == 0) as usize;
-    let icmp_v6_req = (icmp_type == 128) as usize;
-    let icmp_v6_reply = (icmp_type == 129) as usize;
-    let icmp_is_req = icmp_v4_req | icmp_v6_req;
-    let icmp_is_reply = icmp_v4_reply | icmp_v6_reply;
-    let icmp_type_ok = icmp_is_req | icmp_is_reply;
-    let icmp_ok = have_icmp & (icmp_code == 0) as usize & icmp_type_ok;
-    let icmp_seq = read_be16(b, icmp_off + ICMP_SEQ_OFF, icmp_ok);
-    (icmp_ok, icmp_type_ok, icmp_is_req, icmp_seq)
-}
+mod shim;
+use shim::parse_icmp_shim;
 
-#[inline]
-const fn parse_icmp_shim(
-    b: &[u8],
-    n: usize,
-    payload_off: usize,
-    icmp_with_payload: usize,
-) -> (usize, usize, usize, u8, Option<IcmpMalformedReason>) {
-    let shim_flags = byte_at(b, payload_off, icmp_with_payload);
-
-    let shim_low_bits_clear = ((shim_flags & !SHIM_ALLOWED_BITS) == 0) as usize;
-    let shim_has_known_flag = ((shim_flags & SHIM_ALLOWED_BITS) != 0) as usize;
-    let shim_uses_header_id = ((shim_flags & SHIM_SOURCE_ID_EQUALS_HEADER) != 0) as usize;
-    let shim_is_data = ((shim_flags & SHIM_IS_DATA) != 0) as usize;
-    let shim_has_reply_id = ((shim_flags & SHIM_HAS_REPLY_ID) != 0) as usize;
-    let shim_has_negotiation_flags =
-        ((shim_flags & (SHIM_NEGOTIATE_REPLY_ID | SHIM_ACK_REPLY_ID)) != 0) as usize;
-
-    let explicit_shim_has_src_bytes = has_len(n, payload_off + ICMP_EXPLICIT_SOURCE_SHIM_LEN);
-    let basic_flags_ok = shim_low_bits_clear & shim_has_known_flag;
-    let source_shape_ok = shim_uses_header_id | explicit_shim_has_src_bytes;
-    let source_field_len =
-        [ICMP_EXPLICIT_SOURCE_SHIM_LEN, ICMP_SHIM_FLAGS_LEN][shim_uses_header_id];
-    let session_reply_body_len = n.saturating_sub(payload_off + source_field_len);
-    let illegal_data_flags = basic_flags_ok
-        & source_shape_ok
-        & shim_is_data
-        & (shim_has_reply_id | shim_has_negotiation_flags);
-    let session_missing_reply_id =
-        basic_flags_ok & source_shape_ok & not01(shim_is_data) & not01(shim_has_reply_id);
-    let session_reply_id_length_invalid = basic_flags_ok
-        & source_shape_ok
-        & not01(shim_is_data)
-        & shim_has_reply_id
-        & ((session_reply_body_len != 2) as usize);
-    let shim_is_valid = basic_flags_ok
-        & source_shape_ok
-        & not01(illegal_data_flags)
-        & not01(session_missing_reply_id)
-        & not01(session_reply_id_length_invalid);
-
-    let has_shim = icmp_with_payload & shim_is_valid;
-    let explicit_icmp_src = has_shim & not01(shim_uses_header_id);
-    let malformed_shim = icmp_with_payload & not01(shim_is_valid);
-    let invalid_flags = icmp_with_payload & not01(basic_flags_ok);
-    let truncated_source = icmp_with_payload
-        & basic_flags_ok
-        & not01(shim_uses_header_id)
-        & not01(explicit_shim_has_src_bytes);
-    let illegal_frame = icmp_with_payload & basic_flags_ok & source_shape_ok & illegal_data_flags;
-    let missing_reply = icmp_with_payload
-        & basic_flags_ok
-        & source_shape_ok
-        & not01(illegal_frame)
-        & session_missing_reply_id;
-    let invalid_reply_length = icmp_with_payload
-        & basic_flags_ok
-        & source_shape_ok
-        & not01(illegal_frame)
-        & not01(missing_reply)
-        & session_reply_id_length_invalid;
-    let reason_code = invalid_flags
-        | (truncated_source * 2)
-        | (illegal_frame * 3)
-        | (missing_reply * 4)
-        | (invalid_reply_length * 5);
-    let reason = [
-        None,
-        Some(IcmpMalformedReason::InvalidShimFlags),
-        Some(IcmpMalformedReason::TruncatedSourceId),
-        Some(IcmpMalformedReason::IllegalFrameFlags),
-        Some(IcmpMalformedReason::SessionControlMissingReplyId),
-        Some(IcmpMalformedReason::SessionControlReplyIdLength),
-    ][reason_code];
-
-    (
-        has_shim,
-        explicit_icmp_src,
-        malformed_shim,
-        shim_flags,
-        reason,
-    )
-}
-
-#[inline]
-const fn first_icmp_malformed_reason(
-    truncated_echo: usize,
-    invalid_echo: usize,
-    shim_reason: Option<IcmpMalformedReason>,
-) -> Option<IcmpMalformedReason> {
-    let invalid_echo = invalid_echo & not01(truncated_echo);
-    [
-        shim_reason,
-        Some(IcmpMalformedReason::TruncatedEchoHeader),
-        Some(IcmpMalformedReason::InvalidEchoTypeOrCode),
-    ][truncated_echo | (invalid_echo * 2)]
-}
-
-#[inline]
-const fn is_skippable_v6_ext(next: usize) -> usize {
-    ((next == IPV6_EXT_HOP_BY_HOP) as usize)
-        | ((next == IPV6_EXT_ROUTING) as usize)
-        | ((next == IPV6_EXT_DEST_OPTS) as usize)
-}
-
-#[inline]
-const fn parse_v4_proto_and_fragment(
-    proto: usize,
-    frag_hi: u8,
-    frag_lo: u8,
-    valid_v4: usize,
-) -> (usize, usize) {
-    let fragment_field = crate::be16_16(frag_hi, frag_lo);
-    // 0x3fff covers MF + fragment offset bits.
-    let is_fragment = valid_v4 & bool01((fragment_field & 0x3fff) != 0);
-    (proto, is_fragment)
-}
-
-// Resolves only the accepted IPv6 transport candidate:
-//   IPv6 -> transport
-//   IPv6 -> one skippable extension -> transport
-// Deeper extension chains are intentionally unsupported.
-#[inline]
-const fn parse_v6_transport_candidate(
-    next0: usize,
-    valid_v6: usize,
-    ext0: usize,
-    ext0_next: usize,
-    off1: usize,
-    ext0_full: usize,
-    ext0_truncated: usize,
-) -> (usize, usize, usize, usize, usize) {
-    let fragment0 = valid_v6 & bool01(next0 == IPV6_EXT_FRAGMENT);
-    let direct = valid_v6 & not01(ext0) & not01(fragment0);
-    let fragment1 = ext0_full & bool01(ext0_next == IPV6_EXT_FRAGMENT);
-    let ext1 = ext0_full & is_skippable_v6_ext(ext0_next);
-    let after_ext0 = ext0_full & not01(ext1) & not01(fragment1);
-
-    let transport_proto = select2_usize(next0, direct, ext0_next, after_ext0);
-    let transport_off = select2_usize(IPV6_MIN_LEN, direct, off1, after_ext0);
-    let valid_transport = direct | after_ext0;
-    let unsupported_fragment = fragment0 | fragment1;
-    let truncated = ext0_truncated;
-
-    (
-        transport_proto,
-        transport_off,
-        valid_transport,
-        unsupported_fragment,
-        truncated,
-    )
-}
-
-#[inline]
-const fn finish_v6_ext_step(
-    n: usize,
-    off: usize,
-    ext_ok: usize,
-    prefix_ok: usize,
-    len_units: usize,
-) -> (usize, usize, usize) {
-    let len = (len_units + 1) << 3;
-    let next_off = off + len;
-    let full = prefix_ok & has_len(n, next_off);
-    let truncated = ext_ok & ((full == 0) as usize);
-    (next_off, full, truncated)
-}
-
-#[inline]
-const fn parse_detected_ip_at(
-    payload: &[u8],
-    off: usize,
-    valid_v4: usize,
-    valid_v6: usize,
-) -> Option<IpAddr> {
-    let v4 = parse_ipv4_at(payload, off, valid_v4);
-    let v6 = parse_ipv6_at(payload, off, valid_v6);
-    [None, v4, v6][valid_v4 | (valid_v6 * 2)]
-}
-
-#[inline]
-const fn parse_ipv4_at(payload: &[u8], off: usize, valid: usize) -> Option<IpAddr> {
-    let addr = IpAddr::V4(Ipv4Addr::new(
-        byte_at(payload, off, valid),
-        byte_at(payload, off + 1, valid),
-        byte_at(payload, off + 2, valid),
-        byte_at(payload, off + 3, valid),
-    ));
-    [None, Some(addr)][valid]
-}
+mod tail;
+use tail::{
+    first_icmp_malformed_reason, ipv4_fragment_mask, ipv4_reserved_flag_mask, is_skippable_v6_ext,
+    parse_ipv4_at, parse_ipv6_at, parse_ipv6_extension_extent, parse_ipv6_transport_evidence,
+};
 
 #[cfg(test)]
 mod kernels_tests;
 #[cfg(test)]
 mod malformed_tests;
 #[cfg(test)]
-mod tests;
-
-#[inline]
-const fn parse_ipv6_at(payload: &[u8], off: usize, valid: usize) -> Option<IpAddr> {
-    let addr = IpAddr::V6(Ipv6Addr::new(
-        read_be16(payload, off, valid),
-        read_be16(payload, off + 2, valid),
-        read_be16(payload, off + IPV6_ADDR_SEG2_OFF, valid),
-        read_be16(payload, off + IPV6_ADDR_SEG3_OFF, valid),
-        read_be16(payload, off + IPV6_ADDR_SEG4_OFF, valid),
-        read_be16(payload, off + IPV6_ADDR_SEG5_OFF, valid),
-        read_be16(payload, off + IPV6_ADDR_SEG6_OFF, valid),
-        read_be16(payload, off + IPV6_ADDR_SEG7_OFF, valid),
-    ));
-    [None, Some(addr)][valid]
-}
+mod scalar_oracle_tests;

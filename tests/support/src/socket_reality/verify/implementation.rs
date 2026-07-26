@@ -3,80 +3,132 @@ use super::model::{
 };
 use super::raw::verify_forwarder_kernel_evidence;
 use crate::packet_diagnostics::{DiagnosticLogIndex, TraceKey, trace_key};
-use crate::socket_reality::case::{ICMP_DGRAM_FIXED_ID, RealityCase, RealityOperation};
+use crate::socket_reality::case::{RealityCase, RealityOperation};
 use crate::socket_reality::evidence::{
     CallResult, ConnectedFilterEvidence, DatagramReceiveEvidence, DirectSocketEvidence,
-    ForwarderEvidence, IcmpDgramEvidence, ProbeSocketEvidence, ProbeSocketId, RawReceiveEvidence,
-    RealityEvidence, ReceiveApi, ReceiveEvidence, SocketCall,
+    ForwarderEvidence, ProbeSocketEvidence, ProbeSocketId, RawReceiveEvidence, RealityEvidence,
+    ReceiveApi, ReceiveEvidence, SocketCall,
 };
 use pkthere_socket_policy::{
-    IcmpKernelIdPolicy, IcmpPolicyIntent, IcmpSocketIdCapability, PeerSourceRequirement,
-    ReceiveSyscall, ResolvedSocketPolicy, SocketEvidenceKey, SocketRole, TimeoutAction,
-    ip_version_for_domain, resolve_socket_policy_with_icmp_intent, socket_post_bind_policy,
+    IcmpChecksumMode, IcmpKernelIdPolicy, IcmpPolicyIntent, Ipv4HeaderAction,
+    PeerSourceRequirement, PeerVerification, ProtocolPolicyIntent, ReceiveSyscall,
+    ResolvedSocketPolicy, SocketCaptureAction, SocketEvidenceKey, SocketPathContext, SocketRole,
+    TimeoutAction, ip_version_for_domain, listener_worker_socket_policy,
+    resolve_listener_socket_policy_for_creation_path_with_protocol_intent,
+    resolve_socket_policy_for_creation_path_with_protocol_intent, socket_post_bind_policy,
 };
 use pkthere_wire::SupportedProtocol;
+use pkthere_wire::checksum::checksum16_bytes;
 use pkthere_wire::packet_headers::{
     self, IpVersion, ParsedPacketHeaders, ReceiveHeaderMode, select_receive_parser,
 };
 use serde_json::Value;
-use socket2::{Domain, Type};
+use socket2::Domain;
 use std::net::SocketAddr;
 
 pub fn verify(
     requested: RealityCase,
     evidence: &RealityEvidence,
 ) -> Result<VerifiedReality, VerificationError> {
-    require_case_contract(requested)?;
+    verify_observation(requested, evidence, None)
+}
+
+pub(super) fn verify_observation(
+    requested: RealityCase,
+    evidence: &RealityEvidence,
+    unavailable: Option<&crate::socket_reality::evidence::OsErrorEvidence>,
+) -> Result<VerifiedReality, VerificationError> {
+    super::contract::require_case_contract(requested)?;
     let timeout_action = if requested.operation == RealityOperation::ListenerRelock {
         TimeoutAction::Drop
     } else {
         TimeoutAction::Exit
     };
-    let debug_unconnected = matches!(
-        requested.operation,
-        RealityOperation::UpstreamReconnect | RealityOperation::ListenerRelock
-    ) && !requested.connected;
-    let policy = resolve_socket_policy_with_icmp_intent(
-        requested.policy_role,
-        requested.protocol,
-        requested.socket_type,
-        timeout_action,
-        debug_unconnected,
-        requested.domain,
-        IcmpPolicyIntent::default(),
-    );
+    let debug_unconnected = requested.connection_scenario.debug_force_unconnected();
+    let protocol_intent = match requested.protocol {
+        SupportedProtocol::UDP => ProtocolPolicyIntent::Udp,
+        SupportedProtocol::ICMP => ProtocolPolicyIntent::Icmp(IcmpPolicyIntent::default()),
+    };
+    let policy = if requested.operation == RealityOperation::ListenerRelock {
+        resolve_listener_socket_policy_for_creation_path_with_protocol_intent(
+            protocol_intent,
+            requested.socket_type,
+            timeout_action,
+            debug_unconnected,
+            SocketPathContext {
+                family: requested.domain,
+                creation_path: requested.socket_path,
+            },
+            listener_worker_socket_policy(2, false),
+        )
+    } else {
+        resolve_socket_policy_for_creation_path_with_protocol_intent(
+            requested.policy_role,
+            protocol_intent,
+            requested.socket_type,
+            timeout_action,
+            debug_unconnected,
+            SocketPathContext {
+                family: requested.domain,
+                creation_path: requested.socket_path,
+            },
+        )
+    };
     let creation_policy = super::creation::verify_creation_policy(requested, policy)?;
-    let facts = match (requested.operation, evidence) {
-        (RealityOperation::DatagramReceiveEvidence, RealityEvidence::DatagramReceive(evidence)) => {
-            verify_datagram(requested, policy, evidence)?
+    let facts = if let Some(error) = unavailable {
+        DerivedFacts::SocketUnavailable {
+            failure_class: super::availability::classify_creation_failure(error),
+            raw_os_error: error.raw_os_error,
         }
-        (RealityOperation::ConnectedPeerFiltering, RealityEvidence::ConnectedFilter(evidence)) => {
-            verify_connected_filter(requested, policy, evidence)?
-        }
-        (
-            RealityOperation::IcmpDgramReceiveId | RealityOperation::IcmpDgramFixedId,
-            RealityEvidence::IcmpDgram(evidence),
-        ) => verify_icmp_dgram(requested, policy, evidence)?,
-        (RealityOperation::ReusePortFanout, RealityEvidence::ReusePortFanout(evidence)) => {
-            super::reuse_port::verify_reuse_port_fanout(evidence)?
-        }
-        (RealityOperation::RawReceiveEvidence, RealityEvidence::RawReceive(evidence)) => {
-            verify_raw_receive(requested, policy, evidence)?
-        }
-        (RealityOperation::RawFourIdForwarding, RealityEvidence::RawFourId(evidence)) => {
-            verify_raw_four_id(requested, policy, evidence)?
-        }
-        (
-            RealityOperation::UpstreamReconnect
-            | RealityOperation::ListenerRelock
-            | RealityOperation::ListenerRebind,
-            RealityEvidence::Lifecycle(evidence),
-        ) => super::lifecycle::verify_lifecycle(requested, policy, evidence)?,
-        _ => {
-            return Err(error(format!(
-                "evidence variant does not execute requested operation {:?}",
-                requested.operation
-            )));
+    } else {
+        match (requested.operation, evidence) {
+            (
+                RealityOperation::DatagramReceiveEvidence,
+                RealityEvidence::DatagramReceive(evidence),
+            ) => verify_datagram(requested, policy, evidence)?,
+            (
+                RealityOperation::DatagramDisconnect,
+                RealityEvidence::DatagramDisconnect(evidence),
+            ) => super::disconnect::verify(evidence)?,
+            (RealityOperation::SocketDisconnect, RealityEvidence::SocketDisconnect(evidence)) => {
+                super::disconnect::verify_socket(requested, evidence)?
+            }
+            (
+                RealityOperation::ConnectedPeerFiltering,
+                RealityEvidence::ConnectedFilter(evidence),
+            ) => verify_connected_filter(requested, policy, evidence)?,
+            (
+                RealityOperation::IcmpDgramReceiveId | RealityOperation::IcmpDgramFixedId,
+                RealityEvidence::IcmpDgram(evidence),
+            ) => super::icmp_dgram::verify(requested, policy, evidence)?,
+            (RealityOperation::IcmpDgramSharedId, RealityEvidence::IcmpDgramSharedId(evidence)) => {
+                super::icmp_dgram::verify_shared_id(requested, policy, evidence)?
+            }
+            (RealityOperation::ReusePortFanout, RealityEvidence::ReusePortFanout(evidence)) => {
+                super::reuse_port::verify_reuse_port_fanout(evidence)?
+            }
+            (
+                RealityOperation::ListenerOwnerReplacement,
+                RealityEvidence::ListenerOwnerReplacement(evidence),
+            ) => super::reuse_port::verify_listener_owner_replacement(requested, evidence)?,
+            (RealityOperation::RawReceiveEvidence, RealityEvidence::RawReceive(evidence)) => {
+                verify_raw_receive(requested, policy, evidence)?
+            }
+            (RealityOperation::RawFourIdForwarding, RealityEvidence::RawFourId(evidence)) => {
+                verify_raw_four_id(requested, policy, evidence)?
+            }
+            (
+                RealityOperation::UpstreamReconnect
+                | RealityOperation::ListenerRelock
+                | RealityOperation::ListenerRebind,
+                RealityEvidence::Lifecycle(evidence),
+            ) => super::lifecycle::verify_lifecycle(requested, policy, evidence)?,
+            _ => {
+                return Err(error(format!(
+                    "evidence variant does not execute requested operation {:?}",
+                    requested.operation
+                )));
+            }
         }
     };
     Ok(VerifiedReality {
@@ -136,7 +188,7 @@ fn verify_datagram(
         return Err(error("UDP receive bytes differ from sent probe payload"));
     }
     let parsed = packet_headers::parse_udp_datagram_payload(&received.1.bytes);
-    if parsed.src_ip.is_some() || parsed.dst_ip.is_some() || parsed.udp.is_some() {
+    if parsed.source_ip().is_some() || parsed.destination_ip().is_some() || parsed.udp.is_some() {
         return Err(error(
             "UDP DGRAM receive unexpectedly contained IP or UDP headers",
         ));
@@ -263,131 +315,16 @@ fn verify_connected_filter(
     })
 }
 
-fn verify_icmp_dgram(
-    requested: RealityCase,
-    policy: ResolvedSocketPolicy,
-    evidence: &IcmpDgramEvidence,
-) -> Result<DerivedFacts, VerificationError> {
-    let socket = require_socket(&evidence.direct, evidence.socket)?;
-    require_create_dimensions(socket, requested)?;
-    let requested_bind_id = match requested.operation {
-        RealityOperation::IcmpDgramReceiveId => 0,
-        RealityOperation::IcmpDgramFixedId => ICMP_DGRAM_FIXED_ID,
-        _ => return Err(error("invalid ICMP DGRAM reality operation")),
-    };
-    if !socket.create.result.is_ok() {
-        return Err(error(
-            "production policy permits ICMP DGRAM but socket creation failed",
-        ));
-    }
-    let connected = socket
-        .calls
-        .iter()
-        .any(|event| matches!(&event.call, SocketCall::Connect { result, .. } if result.is_ok()));
-    if !connected {
-        return Err(error(
-            "ICMP DGRAM receive evidence has no successful connect lifecycle event",
-        ));
-    }
-    let bound_id = socket
-        .calls
-        .iter()
-        .find_map(|event| match &event.call {
-            SocketCall::Bind { requested, result } if result.is_ok() => Some(requested.port()),
-            _ => None,
-        })
-        .ok_or_else(|| error("ICMP DGRAM receive evidence has no successful bind event"))?;
-    if bound_id != requested_bind_id {
-        return Err(error(format!(
-            "ICMP DGRAM bound requested ID {bound_id}, expected {requested_bind_id}"
-        )));
-    }
-    let connected_id = socket
-        .calls
-        .iter()
-        .find_map(|event| match &event.call {
-            SocketCall::Connect { target, result } if result.is_ok() => Some(target.port()),
-            _ => None,
-        })
-        .expect("successful connect was checked above");
-    if connected_id != requested_bind_id {
-        return Err(error(format!(
-            "ICMP DGRAM connected to ID {connected_id}, expected {requested_bind_id}"
-        )));
-    }
-    let kernel_addr = last_getsockname(socket)?;
-    let received = successful_receives(socket)
-        .next_back()
-        .ok_or_else(|| error("ICMP DGRAM produced no receive evidence"))?;
-    let sent = successful_sends(socket)
-        .next_back()
-        .ok_or_else(|| error("ICMP DGRAM produced no successful send evidence"))?;
-    if received.0 != ReceiveApi::Recv || policy.receive_syscall(true) != ReceiveSyscall::Recv {
-        return Err(error("connected ICMP DGRAM probe did not use recv"));
-    }
-    let parsed = parse_received_icmp(requested.domain, policy.receive_header, &received.1.bytes);
-    let icmp = parsed
-        .icmp
-        .ok_or_else(|| error("ICMP DGRAM receive bytes did not contain a valid Echo header"))?;
-    let sent_icmp = parse_icmp_transport(requested.domain, sent)
-        .icmp
-        .ok_or_else(|| error("ICMP DGRAM send bytes did not contain a valid Echo header"))?;
-    if sent_icmp.seq != icmp.seq {
-        return Err(error(format!(
-            "ICMP DGRAM response sequence {} differs from sent sequence {}",
-            icmp.seq, sent_icmp.seq
-        )));
-    }
-    if policy.evidence_policy(true).peer_source != PeerSourceRequirement::ConnectedKernel {
-        return Err(error(
-            "ICMP DGRAM layout/source policy disagrees with measured evidence",
-        ));
-    }
-    let id_policy = policy
-        .icmp
-        .ok_or_else(|| error("ICMP DGRAM policy omitted ICMP ID capability"))?;
-    if id_policy.id_capability == IcmpSocketIdCapability::DisjointIds {
-        return Err(error(
-            "ICMP DGRAM production policy incorrectly advertises disjoint receive IDs",
-        ));
-    }
-    let expected_receive_id = if requested_bind_id != 0 {
-        if !id_policy.fixed_ids_honored {
-            return Err(error(
-                "production policy does not advertise fixed ICMP DGRAM ID preservation",
-            ));
-        }
-        requested_bind_id
-    } else if kernel_addr.port() != 0 {
-        kernel_addr.port()
-    } else if id_policy.fixed_ids_honored {
-        sent_icmp.identity.destination_id
-    } else {
-        return Err(error(
-            "ICMP DGRAM getsockname exposed no receive ID and policy cannot preserve a fixed ID",
-        ));
-    };
-    if icmp.identity.destination_id != expected_receive_id {
-        return Err(error(format!(
-            "wire Echo ID {} differs from effective DGRAM receive ID {}",
-            icmp.identity.destination_id, expected_receive_id
-        )));
-    }
-    Ok(DerivedFacts::IcmpDgram {
-        requested_bind_id,
-        requested_echo_id: sent_icmp.identity.destination_id,
-        kernel_receive_id: kernel_addr.port(),
-        observed_echo_id: icmp.identity.destination_id,
-        sequence: icmp.seq,
-        byte_count: received.1.bytes.len(),
-    })
-}
-
 fn verify_raw_receive(
     requested: RealityCase,
     policy: ResolvedSocketPolicy,
     evidence: &RawReceiveEvidence,
 ) -> Result<DerivedFacts, VerificationError> {
+    if policy.peer_verification != PeerVerification::RequirePeerNetworkAddress {
+        return Err(error(
+            "production RAW policy does not verify connected peers by network address",
+        ));
+    }
     let icmp_policy = policy
         .icmp
         .ok_or_else(|| error("RAW policy omitted ICMP policy"))?;
@@ -422,9 +359,39 @@ fn verify_raw_receive(
                     "RAW direct evidence did not preserve a successful bind request with ID 0",
                 ));
             }
+            let ipv4_header_included = if requested.domain == Domain::IPV4 {
+                let observed = socket
+                    .calls
+                    .iter()
+                    .filter_map(|event| match &event.call {
+                        SocketCall::GetHeaderIncludedV4 {
+                            result: CallResult::Ok(value),
+                        } => Some(*value),
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| {
+                        error("RAW IPv4 evidence omitted the kernel IP_HDRINCL state")
+                    })?;
+                let expected = policy.send_policy.ip_header
+                    == pkthere_socket_policy::IpHeaderMode::Ipv4HeaderIncluded;
+                if observed != expected {
+                    return Err(error(format!(
+                        "kernel IP_HDRINCL state {observed} differs from resolved send policy {expected}"
+                    )));
+                }
+                Some(observed)
+            } else {
+                None
+            };
             let sent = successful_sends(socket)
                 .next_back()
                 .ok_or_else(|| error("RAW direct evidence has no successful send"))?;
+            verify_sent_icmp_transport_checksum(
+                policy.send_policy.icmp_checksum,
+                requested.domain,
+                sent,
+            )?;
             let sent_icmp = parse_icmp_transport(requested.domain, sent)
                 .icmp
                 .ok_or_else(|| error("RAW send evidence omitted a valid Echo header"))?;
@@ -447,8 +414,7 @@ fn verify_raw_receive(
             {
                 return Err(error("unconnected RAW probe did not use recv_from"));
             }
-            let parsed =
-                parse_received_icmp(requested.domain, policy.receive_header, &received.1.bytes);
+            let parsed = parse_received_icmp(requested.domain, policy, &received.1.bytes)?;
             let icmp = parsed
                 .icmp
                 .ok_or_else(|| error("RAW receive bytes did not contain a valid Echo header"))?;
@@ -464,19 +430,23 @@ fn verify_raw_receive(
                     icmp.identity.source_id, requested_source_id
                 )));
             }
-            let ip_header_present = parsed.src_ip.is_some();
+            let ip_header_present = parsed.source_ip().is_some();
             let source_metadata_present = received.1.source.is_some();
             verify_raw_source_policy(policy, ip_header_present, source_metadata_present)?;
+            let id_observation =
+                require_untrusted_raw_kernel_id(kernel_addr.port(), icmp.identity.destination_id)?;
             Ok(DerivedFacts::RawReceive {
                 kernel_addr,
                 observed_source_id: requested_source_id,
                 observed_echo_id: icmp.identity.destination_id,
                 ip_header_present,
                 source_metadata_present,
-                id_observation: classify_raw(
-                    Some(kernel_addr.port()),
-                    Some(icmp.identity.destination_id),
-                ),
+                ipv4_header_included,
+                connected_filtering: super::model::RawConnectedFilteringEvidence::NotMeasured,
+                destination_packet_info:
+                    super::model::RawDestinationPacketInfoEvidence::NotMeasured,
+                icmp_checksum_authority: policy.send_policy.icmp_checksum,
+                id_observation,
             })
         }
         RawReceiveEvidence::ProductionForwarder(evidence) => {
@@ -485,16 +455,20 @@ fn verify_raw_receive(
                 requested.domain,
                 requested.policy_role,
             )?;
+            let id_observation =
+                require_untrusted_raw_kernel_id(observed.kernel_addr.port(), observed.echo_id)?;
             Ok(DerivedFacts::RawReceive {
                 kernel_addr: observed.kernel_addr,
                 observed_source_id: observed.source_id,
                 observed_echo_id: observed.echo_id,
                 ip_header_present: observed.ip_header_present,
                 source_metadata_present: observed.source_metadata_present,
-                id_observation: classify_raw(
-                    Some(observed.kernel_addr.port()),
-                    Some(observed.echo_id),
-                ),
+                ipv4_header_included: None,
+                connected_filtering: super::model::RawConnectedFilteringEvidence::NotMeasured,
+                destination_packet_info:
+                    super::model::RawDestinationPacketInfoEvidence::NotMeasured,
+                icmp_checksum_authority: policy.send_policy.icmp_checksum,
+                id_observation,
             })
         }
     }
@@ -505,6 +479,11 @@ fn verify_raw_four_id(
     policy: ResolvedSocketPolicy,
     evidence: &ForwarderEvidence,
 ) -> Result<DerivedFacts, VerificationError> {
+    if policy.peer_verification != PeerVerification::RequirePeerNetworkAddress {
+        return Err(error(
+            "production RAW four-ID policy does not verify connected peers by network address",
+        ));
+    }
     let icmp = policy
         .icmp
         .ok_or_else(|| error("RAW four-ID policy omitted ICMP policy"))?;
@@ -521,7 +500,8 @@ fn verify_raw_four_id(
     let post_bind = socket_post_bind_policy(requested.socket_path);
     if requested.socket_path
         == crate::socket_reality::case::RealitySocketPath::WindowsProtocolZeroCapture
-        && (!post_bind.enable_windows_rcvall || !post_bind.set_ipv4_header_included)
+        && (post_bind.capture != SocketCaptureAction::WindowsReceiveAllIp
+            || post_bind.ipv4_header != Ipv4HeaderAction::ApplicationIncluded)
     {
         return Err(error(
             "protocol-zero RAW forwarding lacks required post-bind capture setup policy",
@@ -529,7 +509,10 @@ fn verify_raw_four_id(
     }
     for role in [SocketRole::Listener, SocketRole::Upstream] {
         let observed = verify_forwarder_kernel_evidence(evidence, requested.domain, role)?;
-        if post_bind.enable_windows_rcvall && !observed.ip_header_present {
+        require_untrusted_raw_kernel_id(observed.kernel_addr.port(), observed.echo_id)?;
+        if post_bind.capture == SocketCaptureAction::WindowsReceiveAllIp
+            && !observed.ip_header_present
+        {
             return Err(error(format!(
                 "{role:?} protocol-zero capture produced no IPv4 header evidence"
             )));
@@ -571,18 +554,17 @@ fn verify_raw_four_id(
                 continue;
             };
             let key = parse_evidence_key(value)?;
-            let kernel_addr = dump
-                .value
-                .pointer("/socket/local_kernel_addr")
-                .and_then(Value::as_str)
-                .ok_or_else(|| error("packet dump omitted local_kernel_addr"))?;
             let matching = diagnostics.socket_evidence().any(|line| {
                 line.value.get("key") == Some(value)
-                    && line.value.get("getsockname").and_then(Value::as_str) == Some(kernel_addr)
+                    && line
+                        .value
+                        .get("getsockname")
+                        .and_then(Value::as_str)
+                        .is_some()
             });
             if !matching {
                 return Err(error(
-                    "packet dump kernel address lacks same-generation socket evidence",
+                    "packet dump lacks same-generation getsockname evidence",
                 ));
             }
             keys.push(key);
@@ -609,72 +591,6 @@ fn verify_raw_four_id(
     })
 }
 
-fn require_case_contract(case: RealityCase) -> Result<(), VerificationError> {
-    let valid = match case.operation {
-        RealityOperation::DatagramReceiveEvidence => {
-            case.protocol == SupportedProtocol::UDP
-                && case.socket_type == Type::DGRAM
-                && case.policy_role == SocketRole::Listener
-                && !case.connected
-        }
-        RealityOperation::ConnectedPeerFiltering => {
-            case.protocol == SupportedProtocol::UDP
-                && case.socket_type == Type::DGRAM
-                && case.connected
-        }
-        RealityOperation::IcmpDgramReceiveId | RealityOperation::IcmpDgramFixedId => {
-            case.protocol == SupportedProtocol::ICMP
-                && case.socket_type == Type::DGRAM
-                && case.policy_role == SocketRole::Upstream
-                && case.connected
-        }
-        RealityOperation::ReusePortFanout => {
-            case.protocol == SupportedProtocol::UDP
-                && case.socket_type == Type::DGRAM
-                && case.policy_role == SocketRole::Listener
-                && !case.connected
-        }
-        RealityOperation::RawReceiveEvidence => {
-            case.protocol == SupportedProtocol::ICMP
-                && case.socket_type == Type::RAW
-                && !case.connected
-        }
-        RealityOperation::RawFourIdForwarding => {
-            case.domain == Domain::IPV4
-                && case.protocol == SupportedProtocol::ICMP
-                && case.socket_type == Type::RAW
-                && case.policy_role == SocketRole::Upstream
-                && !case.connected
-        }
-        RealityOperation::UpstreamReconnect => {
-            case.protocol == SupportedProtocol::UDP
-                && case.socket_type == Type::DGRAM
-                && case.policy_role == SocketRole::Upstream
-                && case.target_domain.is_some()
-        }
-        RealityOperation::ListenerRelock => {
-            case.protocol == SupportedProtocol::UDP
-                && case.socket_type == Type::DGRAM
-                && case.policy_role == SocketRole::Listener
-                && case.target_domain == Some(case.domain)
-        }
-        RealityOperation::ListenerRebind => {
-            case.protocol == SupportedProtocol::UDP
-                && case.socket_type == Type::DGRAM
-                && case.policy_role == SocketRole::Listener
-                && !case.connected
-                && case.target_domain.is_some()
-        }
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(error(format!(
-            "requested case has an invalid dimension combination: {case:?}"
-        )))
-    }
-}
-
 fn require_direct_dimensions(
     evidence: &DirectSocketEvidence,
     requested: RealityCase,
@@ -686,7 +602,7 @@ fn require_direct_dimensions(
     Ok(())
 }
 
-fn require_create_dimensions(
+pub(super) fn require_create_dimensions(
     socket: &ProbeSocketEvidence,
     requested: RealityCase,
 ) -> Result<(), VerificationError> {
@@ -718,7 +634,7 @@ fn require_create_dimensions(
     Ok(())
 }
 
-fn require_socket(
+pub(super) fn require_socket(
     evidence: &DirectSocketEvidence,
     id: ProbeSocketId,
 ) -> Result<&ProbeSocketEvidence, VerificationError> {
@@ -727,7 +643,9 @@ fn require_socket(
         .ok_or_else(|| error(format!("direct evidence omitted probe socket {id:?}")))
 }
 
-fn last_getsockname(socket: &ProbeSocketEvidence) -> Result<SocketAddr, VerificationError> {
+pub(super) fn last_getsockname(
+    socket: &ProbeSocketEvidence,
+) -> Result<SocketAddr, VerificationError> {
     socket
         .calls
         .iter()
@@ -741,7 +659,7 @@ fn last_getsockname(socket: &ProbeSocketEvidence) -> Result<SocketAddr, Verifica
         .ok_or_else(|| error("socket has no successful getsockname evidence"))
 }
 
-fn successful_receives(
+pub(super) fn successful_receives(
     socket: &ProbeSocketEvidence,
 ) -> impl DoubleEndedIterator<Item = (ReceiveApi, &ReceiveEvidence)> {
     socket.calls.iter().filter_map(|event| match &event.call {
@@ -753,7 +671,9 @@ fn successful_receives(
     })
 }
 
-fn successful_sends(socket: &ProbeSocketEvidence) -> impl DoubleEndedIterator<Item = &[u8]> {
+pub(super) fn successful_sends(
+    socket: &ProbeSocketEvidence,
+) -> impl DoubleEndedIterator<Item = &[u8]> {
     socket.calls.iter().filter_map(|event| match &event.call {
         SocketCall::Send {
             bytes,
@@ -764,22 +684,62 @@ fn successful_sends(socket: &ProbeSocketEvidence) -> impl DoubleEndedIterator<It
     })
 }
 
-fn parse_icmp_transport(domain: Domain, bytes: &[u8]) -> ParsedPacketHeaders {
+pub(super) fn parse_icmp_transport(domain: Domain, bytes: &[u8]) -> ParsedPacketHeaders {
     match ip_version_for_domain(domain).expect("reality cases use IP socket domains") {
         IpVersion::V4 => packet_headers::parse_icmp_v4_transport(bytes),
         IpVersion::V6 => packet_headers::parse_icmp_v6_transport(bytes),
     }
 }
 
-fn parse_received_icmp(
+pub(super) fn verify_sent_icmp_transport_checksum(
+    checksum_mode: IcmpChecksumMode,
     domain: Domain,
-    receive_header: ReceiveHeaderMode,
+    packet: &[u8],
+) -> Result<(), VerificationError> {
+    let checksum = packet
+        .get(2..4)
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+        .map(u16::from_be_bytes)
+        .ok_or_else(|| error("ICMP checksum evidence omitted the Echo checksum field"))?;
+    match checksum_mode {
+        IcmpChecksumMode::KernelComputed if checksum != 0 => Err(error(format!(
+            "kernel-computed checksum policy emitted nonzero checksum {checksum:#06x}"
+        ))),
+        IcmpChecksumMode::ApplicationComputed if domain != Domain::IPV4 => Err(error(
+            "application-computed checksum policy was selected for ICMPv6",
+        )),
+        IcmpChecksumMode::ApplicationComputed if checksum16_bytes(packet) != 0 => Err(error(
+            "application-computed ICMP checksum does not validate to zero",
+        )),
+        IcmpChecksumMode::KernelComputed | IcmpChecksumMode::ApplicationComputed => Ok(()),
+    }
+}
+
+pub(super) fn parse_received_icmp(
+    domain: Domain,
+    policy: ResolvedSocketPolicy,
     bytes: &[u8],
-) -> ParsedPacketHeaders {
+) -> Result<ParsedPacketHeaders, VerificationError> {
     let version = ip_version_for_domain(domain).expect("direct probes use IP socket domains");
-    select_receive_parser(SupportedProtocol::ICMP, version, receive_header)
-        .expect("production policy must select a strict ICMP parser")
-        .parse(bytes)
+    let parser = select_receive_parser(
+        SupportedProtocol::ICMP,
+        version,
+        policy.receive_header,
+        policy.ipv4_receive_length,
+    )
+    .expect("production policy must select a strict ICMP parser");
+    let network = parser.parse_network(bytes);
+    let parsed = parser.parse_transport(bytes, network);
+    parser.declared_extent(parsed, bytes).ok_or_else(|| {
+        error(format!(
+            "captured ICMP packet extent disagrees with production receive policy \
+             (header={:?}, ipv4_length={:?}, bytes={})",
+            policy.receive_header,
+            policy.ipv4_receive_length,
+            bytes.len()
+        ))
+    })?;
+    Ok(parsed)
 }
 
 fn verify_raw_source_policy(
@@ -808,6 +768,21 @@ fn classify_raw(kernel_id: Option<u16>, wire_id: Option<u16>) -> RawIdObservatio
         }
         (Some(_), Some(_)) => RawIdObservation::MismatchObserved,
         _ => RawIdObservation::EvidenceUnavailable,
+    }
+}
+
+pub(super) fn require_untrusted_raw_kernel_id(
+    kernel_id: u16,
+    wire_id: u16,
+) -> Result<RawIdObservation, VerificationError> {
+    let observation = classify_raw(Some(kernel_id), Some(wire_id));
+    if observation == RawIdObservation::MismatchObserved {
+        Ok(observation)
+    } else {
+        Err(error(format!(
+            "RAW getsockname port {kernel_id} did not demonstrate separation from wire Echo ID \
+             {wire_id}"
+        )))
     }
 }
 

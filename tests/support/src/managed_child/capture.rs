@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -22,30 +23,53 @@ impl CapturedOutput {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum OutputStream {
+    #[default]
+    Stdout,
+    Stderr,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct OutputCursor {
-    pub(super) stdout_offset: usize,
+    pub(super) stream: OutputStream,
+    pub(super) byte_offset: usize,
     pub(super) partial_line: Vec<u8>,
+    pub(super) complete_lines: VecDeque<String>,
 }
 
 impl OutputCursor {
     pub fn take_lines(&mut self, snapshot: &CapturedOutput) -> Vec<String> {
-        if self.stdout_offset < snapshot.stdout.len() {
+        self.ingest(snapshot);
+        self.complete_lines.drain(..).collect()
+    }
+
+    pub(super) fn next_line(&mut self, snapshot: &CapturedOutput) -> Option<String> {
+        self.ingest(snapshot);
+        self.complete_lines.pop_front()
+    }
+
+    fn ingest(&mut self, snapshot: &CapturedOutput) {
+        let (bytes, closed) = match self.stream {
+            OutputStream::Stdout => (&snapshot.stdout, snapshot.stdout_closed),
+            OutputStream::Stderr => (&snapshot.stderr, snapshot.stderr_closed),
+        };
+        if self.byte_offset < bytes.len() {
             self.partial_line
-                .extend_from_slice(&snapshot.stdout[self.stdout_offset..]);
-            self.stdout_offset = snapshot.stdout.len();
+                .extend_from_slice(&bytes[self.byte_offset..]);
+            self.byte_offset = bytes.len();
         }
 
-        let mut lines = Vec::new();
         while let Some(newline) = self.partial_line.iter().position(|byte| *byte == b'\n') {
             let line = self.partial_line.drain(..=newline).collect::<Vec<_>>();
-            lines.push(String::from_utf8_lossy(&line).into_owned());
+            self.complete_lines
+                .push_back(String::from_utf8_lossy(&line).into_owned());
         }
-        if snapshot.stdout_closed && !self.partial_line.is_empty() {
-            lines.push(String::from_utf8_lossy(&self.partial_line).into_owned());
+        if closed && !self.partial_line.is_empty() {
+            self.complete_lines
+                .push_back(String::from_utf8_lossy(&self.partial_line).into_owned());
             self.partial_line.clear();
         }
-        lines
     }
 }
 
@@ -101,15 +125,22 @@ impl CaptureBuffer {
     }
 
     pub(super) fn snapshot(&self) -> CapturedOutput {
+        self.snapshot_with_generation().0
+    }
+
+    pub(super) fn snapshot_with_generation(&self) -> (CapturedOutput, u64) {
         let (lock, _) = &*self.inner;
         let state = lock.lock().expect("managed child capture lock");
-        CapturedOutput {
-            stdout: state.stdout.bytes.clone(),
-            stderr: state.stderr.bytes.clone(),
-            stdout_closed: state.stdout.closed,
-            stderr_closed: state.stderr.closed,
-            capture_errors: state.errors.clone(),
-        }
+        (
+            CapturedOutput {
+                stdout: state.stdout.bytes.clone(),
+                stderr: state.stderr.bytes.clone(),
+                stdout_closed: state.stdout.closed,
+                stderr_closed: state.stderr.closed,
+                capture_errors: state.errors.clone(),
+            },
+            state.generation,
+        )
     }
 
     pub(super) fn wait_for_change(&self, generation: u64, deadline: Instant, poll: Duration) {

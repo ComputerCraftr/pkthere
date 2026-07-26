@@ -7,13 +7,16 @@ from pathlib import Path
 
 LOG_DIR = Path("/logs")
 PKTHERE = "/usr/local/libexec/pkthere/pkthere"
+PKTHERE_AUTHORITY_AUDIT = "/usr/local/libexec/pkthere/pkthere-authority-audit"
 TEST_APP = "/usr/local/libexec/pkthere/pkthere-priv"
 SOCKET_REALITY_TEST = "/usr/local/libexec/pkthere/socket-reality-test"
+PRIVILEGED_SOCKET_REALITY_TEST = "/usr/local/libexec/pkthere/socket-reality-test-priv"
 ICMP_INTEGRATION_TEST = "/usr/local/libexec/pkthere/icmp-integration-test"
 TOPOLOGY_VERIFIER = "/usr/local/libexec/pkthere/topology-verifier"
 WORKER_MODES_TEST = "/usr/local/libexec/pkthere/worker-modes-test"
 PKTHERE_TEST_SUPPORT_TEST = "/usr/local/libexec/pkthere/pkthere-test-support-test"
 PKTHERE_UNIT_TEST = "/usr/local/libexec/pkthere/pkthere-unit-test"
+STRESS_TEST = "/usr/local/libexec/pkthere/stress-test"
 
 
 def required(name: str) -> str:

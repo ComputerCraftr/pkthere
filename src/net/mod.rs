@@ -8,5 +8,4 @@ pub(crate) mod payload;
 pub(crate) mod session;
 pub(crate) mod sock_mgr;
 pub(crate) mod socket;
-mod socket_errors;
 pub(crate) mod sync_icmp;

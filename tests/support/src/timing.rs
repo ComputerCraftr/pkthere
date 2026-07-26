@@ -44,8 +44,13 @@ pub const CAPTURE_DRAIN_WAIT: Duration = Duration::from_millis(500);
 /// Full termination, forced-reap, and output-capture budget for an owned child.
 pub const CHILD_CLEANUP_WAIT: Duration = Duration::from_secs(2);
 
-/// Maximum time to serialize RAW ICMP integration tests across processes.
-pub const RAW_ICMP_LOCK_WAIT: Duration = Duration::from_secs(6);
+/// Maximum time to serialize ICMP wire tests across processes.
+///
+/// One test binary can schedule several independently bounded ICMP scenarios
+/// concurrently. The last waiter therefore needs a queue deadline longer than
+/// one scenario's six-second event deadline; this remains a harness bound, not
+/// a protocol timeout.
+pub const RAW_ICMP_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// Standard observation window for CLI tests that expect a process to remain alive.
 pub const CLI_OBSERVATION_WAIT: Duration = Duration::from_millis(500);
@@ -62,11 +67,32 @@ pub const SOCKET_WITNESS_POLL: Duration = Duration::from_millis(50);
 /// Timeout for one direct socket-reality receive operation.
 pub const SOCKET_REALITY_RECEIVE_WAIT: Duration = Duration::from_secs(1);
 
+/// Per-attempt observation window for the repeated datagram disconnect probe.
+pub const SOCKET_DISCONNECT_OBSERVATION_WAIT: Duration = Duration::from_millis(25);
+
 /// Standard duration for stress tests.
 pub const STRESS_TEST_DURATION: Duration = Duration::from_secs(20);
+
+/// Sustained load window for the Alpine multi-worker authority owner.
+pub const DISTRIBUTED_STRESS_DURATION: Duration = Duration::from_secs(10);
+
+/// Idle bound used after the Alpine distributed stress load stops.
+pub const DISTRIBUTED_STRESS_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle and handshake timeout used by release stress owners.
+///
+/// This remains comfortably above ordinary scheduler jitter while still
+/// bounding shutdown after each sustained-load phase.
+pub const STRESS_FORWARDER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Additional time for stress replies already admitted by the forwarder to drain.
 pub const STRESS_DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 /// Short pause between stress-test send bursts.
 pub const STRESS_SEND_PAUSE: Duration = Duration::from_micros(50);
+
+/// Keepalive cadence while dropped replies have saturated the stress response window.
+pub const STRESS_STALL_KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Sleep cadence while the stress response window is saturated.
+pub const STRESS_STALL_POLL_INTERVAL: Duration = Duration::from_millis(5);

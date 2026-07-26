@@ -1,33 +1,31 @@
 # syntax=docker/dockerfile:1.7
 
-ARG ALPINE_IMAGE=alpine:latest
+ARG RUST_IMAGE=rust:1.97.1-alpine@sha256:3c38f3f82c2f3d73da3b38e18d279393a04cb43ddded0e35088a8c3324d40900
 ARG BUILD_PROFILE=portable
 ARG TARGET_CPU=generic
 
 # ---------- Toolchain (cached) ----------
-FROM ${ALPINE_IMAGE} AS toolchain
-ARG BUILD_PROFILE
-ARG TARGET_CPU
+FROM ${RUST_IMAGE} AS toolchain
 RUN apk add --no-cache \
     bash \
     binutils \
     build-base \
-    cargo \
     clang \
     file \
     findutils \
     git \
     linux-headers \
     lld \
-    musl-dev \
-    rust
+    musl-dev
+ARG BUILD_PROFILE
+ARG TARGET_CPU
 WORKDIR /src
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV CC=clang \
     CXX=clang++ \
     PKTHERE_BUILD_PROFILE=${BUILD_PROFILE} \
     PKTHERE_TARGET_CPU=${TARGET_CPU} \
-    RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld -C target-feature=+crt-static -C relocation-model=pic -C link-arg=-static-pie -C link-arg=-Wl,--eh-frame-hdr -C target-cpu=${TARGET_CPU}"
+    RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=lld -C link-arg=-Wno-unused-command-line-argument -C target-feature=+crt-static -C target-cpu=${TARGET_CPU}"
 
 RUN case "$PKTHERE_BUILD_PROFILE" in \
     portable) \
@@ -51,14 +49,21 @@ RUN case "$PKTHERE_BUILD_PROFILE" in \
 
 # ---------- Build ----------
 FROM toolchain AS builder
+ARG TARGETARCH
 WORKDIR /src/repo
 COPY . /src/repo
 
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/repo/target \
-    cargo build --locked --release -p pkthere --bin pkthere \
-    && install -D -m 0755 target/release/pkthere /artifacts/pkthere
+    case "$TARGETARCH" in \
+    arm64) rust_target=aarch64-unknown-linux-musl ;; \
+    amd64) rust_target=x86_64-unknown-linux-musl ;; \
+    *) echo "unsupported build architecture: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && cargo build --locked --release --target "$rust_target" -p pkthere --bin pkthere \
+    && install -D -m 0755 "target/$rust_target/release/pkthere" /artifacts/pkthere \
+    && printf '%s\n' "$rust_target" > /artifacts/evidence-rust-target.txt
 
 # ---------- Verify linked static ELF ----------
 RUN mkdir -p /artifacts/evidence \
@@ -71,6 +76,7 @@ RUN mkdir -p /artifacts/evidence \
     "$PKTHERE_BUILD_PROFILE" \
     "$PKTHERE_TARGET_CPU" \
     > /artifacts/evidence/build-profile.txt \
+    && mv /artifacts/evidence-rust-target.txt /artifacts/evidence/rust-target.txt \
     && rustc -vV > /artifacts/evidence/rustc.txt \
     && cargo -V > /artifacts/evidence/cargo.txt \
     && file /artifacts/pkthere \

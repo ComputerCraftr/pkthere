@@ -1,11 +1,12 @@
 use pkthere_socket_policy::ReceiveSyscall;
-use socket2::{SockAddr, Socket};
+use socket2::Socket;
 use std::io;
 use std::mem::MaybeUninit;
+use std::net::SocketAddr;
 
 /// Per-worker storage for one receive operation.
 pub(crate) struct ReceiveBuffer<const CAPACITY: usize> {
-    bytes: [MaybeUninit<u8>; CAPACITY],
+    pub(super) bytes: [MaybeUninit<u8>; CAPACITY],
 }
 
 impl<const CAPACITY: usize> ReceiveBuffer<CAPACITY> {
@@ -15,7 +16,7 @@ impl<const CAPACITY: usize> ReceiveBuffer<CAPACITY> {
         }
     }
 
-    fn initialized_prefix(&self, length: usize) -> io::Result<&[u8]> {
+    pub(super) fn initialized_prefix(&self, length: usize) -> io::Result<&[u8]> {
         if length > CAPACITY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -31,7 +32,7 @@ impl<const CAPACITY: usize> ReceiveBuffer<CAPACITY> {
 
 pub(crate) struct ReceivedPacket<'a> {
     bytes: &'a [u8],
-    source: Option<SockAddr>,
+    source: Option<SocketAddr>,
 }
 
 impl<'a> ReceivedPacket<'a> {
@@ -41,8 +42,8 @@ impl<'a> ReceivedPacket<'a> {
     }
 
     #[inline]
-    pub(crate) fn source(&self) -> Option<&SockAddr> {
-        self.source.as_ref()
+    pub(crate) const fn source(&self) -> Option<SocketAddr> {
+        self.source
     }
 }
 
@@ -51,10 +52,18 @@ pub(super) fn receive<'a, const CAPACITY: usize>(
     syscall: ReceiveSyscall,
     buffer: &'a mut ReceiveBuffer<CAPACITY>,
 ) -> io::Result<ReceivedPacket<'a>> {
+    let _operation =
+        crate::authority::audited_operation(crate::authority::OperationId::SocketReceive);
     let (length, source) = match syscall {
         ReceiveSyscall::Recv => (socket.recv(&mut buffer.bytes)?, None),
         ReceiveSyscall::RecvFrom => {
             let (length, source) = socket.recv_from(&mut buffer.bytes)?;
+            let source = source.as_socket().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IP receive returned non-IP source metadata",
+                )
+            })?;
             (length, Some(source))
         }
     };
@@ -62,41 +71,4 @@ pub(super) fn receive<'a, const CAPACITY: usize>(
     // first `length` bytes.
     let bytes = buffer.initialized_prefix(length)?;
     Ok(ReceivedPacket { bytes, source })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ReceiveBuffer;
-    use std::io::ErrorKind;
-
-    #[test]
-    fn initialized_receive_prefix_handles_zero_capacity_and_reuse() {
-        let mut buffer = ReceiveBuffer::<8>::new();
-        assert!(
-            buffer
-                .initialized_prefix(0)
-                .expect("zero prefix")
-                .is_empty()
-        );
-
-        for (slot, byte) in buffer.bytes.iter_mut().zip(*b"12345678") {
-            slot.write(byte);
-        }
-        assert_eq!(
-            buffer.initialized_prefix(8).expect("capacity prefix"),
-            b"12345678"
-        );
-
-        for (slot, byte) in buffer.bytes.iter_mut().zip(*b"new") {
-            slot.write(byte);
-        }
-        assert_eq!(buffer.initialized_prefix(3).expect("reused prefix"), b"new");
-        assert_eq!(
-            buffer
-                .initialized_prefix(9)
-                .expect_err("oversize prefix")
-                .kind(),
-            ErrorKind::InvalidData
-        );
-    }
 }

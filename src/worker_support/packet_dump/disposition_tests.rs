@@ -13,9 +13,11 @@ const fn coverage_owner(disposition: PacketDisposition) -> &'static str {
             "injected sender component"
         }
         PacketDisposition::DropDuplicate => "sequence component and privileged replay",
+        PacketDisposition::DropRateLimited => "sequence work-budget component",
         PacketDisposition::DropHandshakePending => "handshake integration",
         PacketDisposition::DropSyncReplaced => "sync buffer component",
         PacketDisposition::DropFlowConflict => "flow admission component",
+        PacketDisposition::DropStaleAuthority => "topology authority component",
         PacketDisposition::DropSyncInvalid => "sync sequence component",
         PacketDisposition::DropNoActiveFlow => "worker routing component",
         PacketDisposition::HandshakeTimeoutDrop => "timeout topology",

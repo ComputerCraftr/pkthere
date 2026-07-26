@@ -6,11 +6,13 @@ use pkthere_test_support::fixtures::{
 use pkthere_test_support::forwarder::{ForwarderConfig, ForwarderSession, launch_forwarder};
 use pkthere_test_support::matrix::spawn_echo_or_skip;
 use pkthere_test_support::network::{bind_udp_client, render_icmp_arg};
-use pkthere_test_support::packet_diagnostics::{DiagnosticLogIndex, TraceKey};
+use pkthere_test_support::packet_diagnostics::{
+    DiagnosticKind, DiagnosticLogIndex, TraceKey, parse_diagnostic_line,
+};
 use pkthere_test_support::raw_icmp::acquire_icmp_dgram_session_lock;
 use pkthere_test_support::timing::{MAX_WAIT_SECS, RAW_ICMP_LOCK_WAIT};
 use socket2::Domain;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 fn assert_lifecycle_invariants(
     stderr: &str,
@@ -19,6 +21,8 @@ fn assert_lifecycle_invariants(
 ) {
     let index = DiagnosticLogIndex::parse("", stderr).expect("forwarder emitted valid diagnostics");
     let stages = index.trace_stages();
+    let mut consumed_cadence = false;
+    let mut consumed_session_control = false;
 
     for (key, packet_stages) in &stages {
         if packet_stages.disposition.is_empty() {
@@ -78,59 +82,67 @@ fn assert_lifecycle_invariants(
                     disposition, "consume-cadence",
                     "cadence event must terminate with consume-cadence"
                 );
+                consumed_cadence = true;
             } else if event_kind == Some("session-control") {
-                assert_eq!(
-                    disposition, "consume-session-control",
-                    "session-control event must terminate with consume-session-control"
+                assert!(
+                    matches!(disposition, "consume-session-control" | "drop-duplicate"),
+                    "session-control event must be consumed once or rejected as a duplicate, got {disposition}"
                 );
+                consumed_session_control |= disposition == "consume-session-control";
             }
         }
     }
+
+    if check_cadence_or_ack {
+        assert!(consumed_cadence, "expected one consumed cadence event");
+        assert!(
+            consumed_session_control,
+            "expected one consumed session-control event"
+        );
+    }
 }
 
-fn lifecycle_snapshot_is_terminal(stderr: &str) -> bool {
-    let Ok(index) = DiagnosticLogIndex::parse("", stderr) else {
-        return false;
-    };
-    let stages = index.trace_stages();
-    !stages.is_empty()
-        && stages.values().all(|packet| {
-            packet.received.len() == 1
-                && packet.admission.len() == 1
-                && packet.disposition.len() == 1
-        })
-}
-
-fn poll_session_logs_until<F>(
-    session: &mut ForwarderSession,
-    timeout: Duration,
-    mut predicate: F,
-) -> String
-where
-    F: FnMut(&str) -> bool,
-{
+fn wait_for_packet_dispositions(session: &mut ForwarderSession, expected: &[&str]) {
+    let mut observed = vec![false; expected.len()];
     session
-        .wait_for_output(
-            Instant::now() + timeout,
-            "lifecycle stderr predicate",
-            |output| predicate(&output.stderr_lossy()),
+        .wait_for_stderr_line(
+            Instant::now() + MAX_WAIT_SECS,
+            "packet disposition diagnostics",
+            |line| {
+                let (kind, value) = parse_diagnostic_line(line).ok().flatten()?;
+                if kind != DiagnosticKind::Packet || value["stage"] != "disposition" {
+                    return None;
+                }
+                let disposition = value["disposition"].as_str()?;
+                for (index, expected) in expected.iter().enumerate() {
+                    if disposition == *expected {
+                        observed[index] = true;
+                    }
+                }
+                observed.iter().all(|seen| *seen).then_some(())
+            },
         )
         .unwrap_or_else(|error| {
+            let failure = serde_json::json!({
+                "schema": 1,
+                "event": "forwarder-wait",
+                "expected": expected,
+                "observed": observed,
+                "error": error.to_string(),
+            });
             panic!(
-                "timeout waiting for lifecycle stderr predicate: {error}\n{}",
+                "pkthere-test-failure {failure}\n{}",
                 session.diagnostic_snapshot(80)
             )
-        })
-        .stderr_lossy()
+        });
 }
 
 #[test]
 fn lifecycle_forwarded_and_filtered() {
     let family = Domain::IPV4;
     let client = bind_udp_client(family).expect("client bind");
-    let Some((up_addr, _upstream_echo)) = spawn_echo_or_skip(family) else {
-        return;
-    };
+    let (up_addr, _upstream_echo) =
+        spawn_echo_or_skip(family).expect("IPv4 UDP echo server is required");
     let there = format!("UDP:{up_addr}");
 
     let mut session = launch_forwarder(ForwarderConfig {
@@ -167,13 +179,12 @@ fn lifecycle_forwarded_and_filtered() {
         .send(LIFECYCLE_OVERSIZE_PAYLOAD)
         .expect("send oversized lifecycle payload");
 
-    let stderr = poll_session_logs_until(&mut session, MAX_WAIT_SECS, |err| {
-        err.contains("filtered") && err.contains("forwarded") && lifecycle_snapshot_is_terminal(err)
-    });
+    wait_for_packet_dispositions(&mut session, &["filtered", "forwarded"]);
 
-    session
+    let completed = session
         .terminate(Instant::now() + MAX_WAIT_SECS)
         .expect("terminate lifecycle forwarder");
+    let stderr = completed.output.stderr_lossy();
     let expected_keys = DiagnosticLogIndex::parse("", &stderr)
         .expect("valid diagnostics")
         .received_trace_keys();
@@ -181,6 +192,10 @@ fn lifecycle_forwarded_and_filtered() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_os = "macos")),
+    ignore = "debug kernel-echo cadence requires the reality-backed ICMP DGRAM path"
+)]
 fn lifecycle_cadence_consumed() {
     let _icmp_guard = acquire_icmp_dgram_session_lock(
         Instant::now() + RAW_ICMP_LOCK_WAIT,
@@ -218,15 +233,15 @@ fn lifecycle_cadence_consumed() {
         .send(LIFECYCLE_ACCEPTED_PAYLOAD)
         .expect("send lifecycle cadence payload");
 
-    let stderr = poll_session_logs_until(&mut session, MAX_WAIT_SECS, |err| {
-        err.contains("consume-cadence")
-            && err.contains("consume-session-control")
-            && lifecycle_snapshot_is_terminal(err)
-    });
+    wait_for_packet_dispositions(
+        &mut session,
+        &["consume-cadence", "consume-session-control"],
+    );
 
-    session
+    let completed = session
         .terminate(Instant::now() + MAX_WAIT_SECS)
         .expect("terminate lifecycle forwarder");
+    let stderr = completed.output.stderr_lossy();
     let expected_keys = DiagnosticLogIndex::parse("", &stderr)
         .expect("valid diagnostics")
         .received_trace_keys();
@@ -234,6 +249,10 @@ fn lifecycle_cadence_consumed() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_os = "macos")),
+    ignore = "handshake lifecycle requires the reality-backed ICMP DGRAM path"
+)]
 fn lifecycle_pending_payload_and_timeout() {
     let _icmp_guard = acquire_icmp_dgram_session_lock(
         Instant::now() + RAW_ICMP_LOCK_WAIT,
@@ -274,15 +293,15 @@ fn lifecycle_pending_payload_and_timeout() {
         .send(LIFECYCLE_PENDING_FOLLOWUP_PAYLOAD)
         .expect("send follow-up pending lifecycle payload");
 
-    let stderr = poll_session_logs_until(&mut session, MAX_WAIT_SECS, |err| {
-        err.contains("handshake-timeout-drop")
-            && err.contains("drop-handshake-pending")
-            && lifecycle_snapshot_is_terminal(err)
-    });
+    wait_for_packet_dispositions(
+        &mut session,
+        &["handshake-timeout-drop", "drop-handshake-pending"],
+    );
 
-    session
+    let completed = session
         .terminate(Instant::now() + MAX_WAIT_SECS)
         .expect("terminate lifecycle forwarder");
+    let stderr = completed.output.stderr_lossy();
     let expected_keys = DiagnosticLogIndex::parse("", &stderr)
         .expect("valid diagnostics")
         .received_trace_keys();
@@ -290,6 +309,10 @@ fn lifecycle_pending_payload_and_timeout() {
 }
 
 #[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_os = "macos")),
+    ignore = "handshake lifecycle requires the reality-backed ICMP DGRAM path"
+)]
 fn lifecycle_buffered_payload_reset() {
     let _icmp_guard = acquire_icmp_dgram_session_lock(
         Instant::now() + RAW_ICMP_LOCK_WAIT,
@@ -327,18 +350,17 @@ fn lifecycle_buffered_payload_reset() {
         .send(LIFECYCLE_ACCEPTED_PAYLOAD)
         .expect("send buffered lifecycle payload");
 
-    let stderr = poll_session_logs_until(&mut session, MAX_WAIT_SECS, |err| {
-        err.contains("handshake-reset-drop") && lifecycle_snapshot_is_terminal(err)
-    });
+    wait_for_packet_dispositions(&mut session, &["handshake-reset-drop"]);
 
     assert!(
         session.is_running().expect("query forwarder status"),
         "forwarder process must still be running when reset drop occurred"
     );
 
-    session
+    let completed = session
         .terminate(Instant::now() + MAX_WAIT_SECS)
         .expect("terminate lifecycle forwarder");
+    let stderr = completed.output.stderr_lossy();
     let expected_keys = DiagnosticLogIndex::parse("", &stderr)
         .expect("valid diagnostics")
         .received_trace_keys();

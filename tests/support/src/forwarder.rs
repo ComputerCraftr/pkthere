@@ -3,6 +3,7 @@ use crate::managed_child::{
     CapturedOutput, ChildHarnessError, ChildIdentity, ChildLimits, CompletedChild, ManagedChild,
     OutputCursor, ProcessExit,
 };
+use crate::packet_diagnostics::{DiagnosticKind, parse_diagnostic_line};
 use crate::runtime_io::{parse_listen_addr, strip_log_prefix};
 use crate::timing::MAX_WAIT_SECS;
 
@@ -46,6 +47,7 @@ pub struct ForwarderSession {
     child: Option<ManagedChild>,
     completed: Option<CompletedChild>,
     stdout_cursor: OutputCursor,
+    stderr_cursor: OutputCursor,
     pub listen_addr: SocketAddr,
     command_arguments: Vec<String>,
     command_line: String,
@@ -97,22 +99,19 @@ impl ForwarderSession {
         event: &str,
         mut predicate: impl FnMut(&CapturedOutput) -> bool,
     ) -> io::Result<CapturedOutput> {
-        loop {
-            let snapshot = self.output_snapshot();
-            if predicate(&snapshot) {
-                return Ok(snapshot);
-            }
-            let Some(child) = self.child.as_mut() else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    format!("forwarder completed before {event}"),
-                ));
-            };
-            let generation = child.output_generation();
-            match child.wait_for_output_change(generation, deadline) {
-                Ok(_) => {}
-                Err(error) => return Err(child_error(error)),
-            }
+        if let Some(child) = self.child.as_mut() {
+            return child
+                .wait_for_output_snapshot(deadline, event, predicate)
+                .map_err(child_error);
+        }
+        let snapshot = self.output_snapshot();
+        if predicate(&snapshot) {
+            Ok(snapshot)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("forwarder completed before {event}"),
+            ))
         }
     }
 
@@ -142,6 +141,35 @@ impl ForwarderSession {
                 })
         };
         self.stdout_cursor = cursor;
+        result
+    }
+
+    pub fn wait_for_stderr_line<T>(
+        &mut self,
+        deadline: Instant,
+        event: &str,
+        parser: impl FnMut(&str) -> Option<T>,
+    ) -> io::Result<T> {
+        let mut cursor = std::mem::take(&mut self.stderr_cursor);
+        let result = if self.child.is_some() {
+            self.child_mut()?
+                .wait_for_line(&mut cursor, deadline, event, parser)
+                .map_err(child_error)
+        } else {
+            let snapshot = self.output_snapshot();
+            let mut parser = parser;
+            cursor
+                .take_lines(&snapshot)
+                .into_iter()
+                .find_map(|line| parser(&line))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("forwarder completed before {event}"),
+                    )
+                })
+        };
+        self.stderr_cursor = cursor;
         result
     }
 
@@ -314,6 +342,7 @@ fn try_launch_forwarder_with_extra_args(
     )
     .map_err(child_error)?;
     let mut cursor = child.output_cursor();
+    let mut stderr_cursor = child.stderr_cursor();
     let listen_result = child.wait_for_line(
         &mut cursor,
         Instant::now() + MAX_WAIT_SECS,
@@ -349,15 +378,53 @@ fn try_launch_forwarder_with_extra_args(
         }
     };
 
+    if config.debug_logs.contains(&"handles") {
+        wait_for_worker_pair_ready(&mut child, &mut stderr_cursor).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("forwarding workers did not become ready: {error}"),
+            )
+        })?;
+    }
+
     Ok(ForwarderSession {
         child: Some(child),
         completed: None,
         stdout_cursor: cursor,
+        stderr_cursor,
         listen_addr,
         command_arguments,
         command_line,
         diagnostic_label,
     })
+}
+
+fn wait_for_worker_pair_ready(
+    child: &mut ManagedChild,
+    cursor: &mut OutputCursor,
+) -> io::Result<()> {
+    let deadline = Instant::now() + MAX_WAIT_SECS;
+    let mut c2u_ready = false;
+    let mut u2c_ready = false;
+    while !(c2u_ready && u2c_ready) {
+        let direction = child
+            .wait_for_line(cursor, deadline, "worker readiness", |line| {
+                let (kind, value) = parse_diagnostic_line(line).ok().flatten()?;
+                (kind == DiagnosticKind::Runtime
+                    && value["diagnostic_schema"] == 3
+                    && value["event"] == "worker-ready"
+                    && value["worker_pair"] == 0)
+                    .then(|| value["direction"].as_str().map(str::to_owned))
+                    .flatten()
+            })
+            .map_err(child_error)?;
+        match direction.as_str() {
+            "c2u" => c2u_ready = true,
+            "u2c" => u2c_ready = true,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn child_error(error: ChildHarnessError) -> io::Error {
@@ -446,22 +513,4 @@ fn render_output_tail(text: &str, max_lines: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::render_session_diagnostics;
-
-    #[test]
-    fn diagnostics_include_latest_stats_and_both_output_tails() {
-        let rendered = render_session_diagnostics(
-            "node-a",
-            "pkthere --here UDP:127.0.0.1:0",
-            None,
-            "boot\n[INFO] {\"locked\":true}\nlast stdout",
-            "first stderr\nlast stderr",
-            2,
-        );
-        assert!(rendered.contains("node-a"));
-        assert!(rendered.contains("{\"locked\":true}"));
-        assert!(rendered.contains("last stdout"));
-        assert!(rendered.contains("last stderr"));
-    }
-}
+mod tests;

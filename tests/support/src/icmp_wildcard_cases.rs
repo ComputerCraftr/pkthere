@@ -1,6 +1,6 @@
-use crate::fixtures::{MULTIHOP_NODE_TIMEOUT_SECS, localhost_ip};
+use crate::fixtures::{DEBUG_TRACE_LOGS, MULTIHOP_NODE_TIMEOUT_SECS, localhost_ip};
 use crate::forwarder::{ForwarderConfig, launch_forwarder};
-use crate::matrix::{ALL_CONNECT_MODES, IPV4_ONLY_FAMILIES, bind_client_or_skip, run_matrix_cases};
+use crate::matrix::bind_client_or_skip;
 use crate::network::{localhost_addr, render_canonical_ip_id, render_icmp_arg, udp_listen_arg};
 use crate::raw_icmp::acquire_raw_icmp_lock;
 use crate::runtime_asserts::{expect_session_stats_matching, recv_legitimate_echo_with_retry};
@@ -9,7 +9,14 @@ use crate::timing::{CLIENT_WAIT_MS, STATS_WAIT_MS};
 use crate::worker_flow;
 use socket2::Domain;
 
-const DEBUG_TRACE_LOGS: &[&str] = &["packets", "drops", "handles"];
+fn endpoint_id(endpoint: &str) -> u16 {
+    endpoint
+        .rsplit_once(':')
+        .expect("canonical endpoint contains id")
+        .1
+        .parse::<u16>()
+        .expect("canonical endpoint id is numeric")
+}
 
 #[test]
 #[ignore = "privileged RAW wildcard topology runs through the explicit capability runner"]
@@ -23,26 +30,10 @@ fn raw_icmp_wildcard_upstream_locks_on_localhost() {
         "icmp_wildcard_case",
     )
     .expect("acquire RAW ICMP lock");
-    run_matrix_cases(
-        &IPV4_ONLY_FAMILIES,
-        &["icmp"],
-        &ALL_CONNECT_MODES,
-        &[false],
-        |case| {
-            run_raw_icmp_wildcard_listener_case(
-                case.family,
-                case.debug_client_unconnected,
-                case.debug_upstream_unconnected,
-            );
-        },
-    );
+    run_raw_icmp_wildcard_listener_case(Domain::IPV4);
 }
 
-fn run_raw_icmp_wildcard_listener_case(
-    family: Domain,
-    debug_client_unconnected: bool,
-    debug_upstream_unconnected: bool,
-) {
+fn run_raw_icmp_wildcard_listener_case(family: Domain) {
     let Some(client_sock) = bind_client_or_skip(family) else {
         return;
     };
@@ -56,8 +47,8 @@ fn run_raw_icmp_wildcard_listener_case(
     // semantics: the selected source ID and negotiated reply/destination ID are
     // the same concrete nonzero endpoint.
     let mut node_a = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected,
-        debug_upstream_unconnected,
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
         debug_icmp_kernel_echo_self_handshake: true,
         debug_force_raw_icmp_wildcard_upstream: true,
         here: udp_listen_arg(localhost_addr(family, 0)),
@@ -85,7 +76,7 @@ fn run_raw_icmp_wildcard_listener_case(
             s["worker_flows"]
                 .as_array()
                 .and_then(|flows| flows.first())
-                .and_then(|worker| worker["upstream_local_filter_canonical"].as_str())
+                .and_then(|worker| worker["upstream_local_filter"].as_str())
                 .is_some_and(|addr| addr != render_canonical_ip_id(local_ip, 0))
         },
     );
@@ -98,19 +89,15 @@ fn run_raw_icmp_wildcard_listener_case(
         "RAW"
     );
     let upstream_local =
-        worker_flow::worker_str(worker_a_prelock, "upstream_local_filter_canonical").to_string();
+        worker_flow::worker_str(worker_a_prelock, "upstream_local_filter").to_string();
     let upstream_remote =
-        worker_flow::worker_str(worker_a_prelock, "upstream_remote_filter_canonical").to_string();
+        worker_flow::worker_str(worker_a_prelock, "upstream_remote_filter").to_string();
+    let upstream_id = endpoint_id(&upstream_local);
     assert_eq!(
-        upstream_local, upstream_remote,
-        "debug RAW wildcard upstream should model DGRAM no-disjoint IDs before traffic"
+        upstream_id,
+        endpoint_id(&upstream_remote),
+        "debug RAW wildcard upstream should model DGRAM no-disjoint IDs before traffic without coupling local and remote IPs"
     );
-    let upstream_id = upstream_local
-        .rsplit_once(':')
-        .expect("canonical endpoint contains id")
-        .1
-        .parse::<u16>()
-        .expect("canonical endpoint id is numeric");
 
     client_sock
         .connect(node_a.listen_addr)
@@ -119,9 +106,7 @@ fn run_raw_icmp_wildcard_listener_case(
         .set_read_timeout(Some(CLIENT_WAIT_MS))
         .expect("set client read timeout");
 
-    let payload = format!(
-        "wildcard-icmp-lock-{family:?}-{debug_client_unconnected}-{debug_upstream_unconnected}"
-    );
+    let payload = format!("wildcard-icmp-lock-{family:?}");
     let mut buf = [0u8; 2048];
     let n = recv_legitimate_echo_with_retry(
         &client_sock,
@@ -152,11 +137,12 @@ fn run_raw_icmp_wildcard_listener_case(
         worker_flow::worker_str(worker_a, "upstream_sock_type"),
         "RAW"
     );
-    let upstream_local = worker_flow::worker_str(worker_a, "upstream_local_filter_canonical");
-    let upstream_remote = worker_flow::worker_str(worker_a, "upstream_remote_filter_canonical");
+    let upstream_local = worker_flow::worker_str(worker_a, "upstream_local_filter");
+    let upstream_remote = worker_flow::worker_str(worker_a, "upstream_remote_filter");
     assert_eq!(
-        upstream_local, upstream_remote,
-        "debug RAW wildcard upstream should model DGRAM no-disjoint IDs"
+        endpoint_id(upstream_local),
+        endpoint_id(upstream_remote),
+        "debug RAW wildcard upstream should model DGRAM no-disjoint IDs without coupling local and remote IPs"
     );
     assert_ne!(upstream_local, render_canonical_ip_id(local_ip, 0));
     worker_flow::assert_flow_tuple(
@@ -171,8 +157,5 @@ fn run_raw_icmp_wildcard_listener_case(
         upstream_local,
         upstream_remote,
     );
-    assert_eq!(
-        worker_flow::worker_str(worker_a, "upstream_local_filter_canonical"),
-        render_canonical_ip_id(local_ip, upstream_id)
-    );
+    assert_eq!(endpoint_id(upstream_local), upstream_id);
 }

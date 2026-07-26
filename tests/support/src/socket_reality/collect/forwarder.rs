@@ -6,6 +6,7 @@ use crate::forwarder::{
 };
 use crate::matrix::bind_client_or_skip;
 use crate::network::{localhost_addr, render_icmp_arg, spawn_udp_echo_server, udp_listen_arg};
+use crate::packet_diagnostics::{DiagnosticKind, parse_diagnostic_line};
 use crate::runtime_asserts::wait_for_session_stats_matching;
 use crate::socket_reality::case::RealityCase;
 use crate::socket_reality::evidence::{
@@ -13,7 +14,7 @@ use crate::socket_reality::evidence::{
     ForwarderLifecycleEvidence, ForwarderProcessEvidence,
 };
 use crate::socket_reality::witness::{
-    ClientSendObservation, UdpWitness, client_send_observation, probe_payload,
+    ClientSendObservation, UdpWitness, client_send_observation, parse_probe_id, probe_payload,
 };
 use crate::timing::{
     CLIENT_WAIT_MS, DRAIN_WAIT_MS, MAX_WAIT_SECS, RETRY_RECV_WAIT_MS, STATS_WAIT_MS,
@@ -38,21 +39,22 @@ const NEGATIVE_WINDOW: Duration = DRAIN_WAIT_MS;
 static NEXT_LIFECYCLE_FILE: AtomicU64 = AtomicU64::new(1);
 
 pub fn collect_raw_four_id(case: &RealityCase) -> io::Result<ForwarderEvidence> {
-    if case.domain != Domain::IPV4
+    if !matches!(case.domain, Domain::IPV4 | Domain::IPV6)
         || case.protocol != SupportedProtocol::ICMP
         || case.socket_type != Type::RAW
-        || case.connected
+        || case.connection_scenario
+            != crate::socket_reality::case::ConnectionScenario::DirectUnconnected
     {
         return Err(io::Error::other(format!(
             "RAW four-ID collector does not support case {case:?}"
         )));
     }
 
-    let client = bind_client_or_skip(Domain::IPV4)
-        .ok_or_else(|| io::Error::other("IPv4 UDP client bind unavailable"))?;
-    let echo_server = spawn_udp_echo_server(Domain::IPV4)?;
+    let client = bind_client_or_skip(case.domain)
+        .ok_or_else(|| io::Error::other("UDP client bind unavailable for RAW reality domain"))?;
+    let echo_server = spawn_udp_echo_server(case.domain)?;
     let udp_upstream = echo_server.address();
-    let local_ip = localhost_ip(Domain::IPV4);
+    let local_ip = localhost_ip(case.domain);
 
     let node_b_here = render_icmp_arg(local_ip, SERVER_LISTEN_ID);
     let node_b_there = format!("UDP:{udp_upstream}");
@@ -78,7 +80,7 @@ pub fn collect_raw_four_id(case: &RealityCase) -> io::Result<ForwarderEvidence> 
         icmp_handshake_timeout_secs: None,
     });
 
-    let node_a_here = udp_listen_arg(localhost_addr(Domain::IPV4, 0));
+    let node_a_here = udp_listen_arg(localhost_addr(case.domain, 0));
     let node_a_there = render_icmp_arg(local_ip, SERVER_LISTEN_ID);
     let mut node_a = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
@@ -168,33 +170,32 @@ fn collect_upstream_reconnect(case: &RealityCase) -> io::Result<ForwarderLifecyc
         format!("UDP:{}", witness_a.local_addr()),
         10,
     );
-    config.debug_upstream_unconnected = !case.connected;
+    config.debug_upstream_unconnected = case.connection_scenario.debug_force_unconnected();
     let mut session = launch_forwarder_with_extra_args(config, &extra);
     let client = configured_client(session.listen_addr)?;
     let started = Instant::now();
     let mut sends = Vec::new();
     let mut receives = Vec::new();
     send_probe_until_reply(
+        &session,
         &client,
         session.listen_addr,
         1,
         1,
         started,
-        &mut sends,
-        &mut receives,
-    );
+        (&mut sends, &mut receives),
+    )?;
     write_resolver_revision(&resolver_path, 2, None, Some(witness_b.local_addr()))?;
     wait_for_resolver_revision(&mut session, 2)?;
-    wait_for_worker_refresh_after_revision(&mut session, 2, "c2u")?;
     send_probe_until_reply(
+        &session,
         &client,
         session.listen_addr,
         2,
         2,
         started,
-        &mut sends,
-        &mut receives,
-    );
+        (&mut sends, &mut receives),
+    )?;
     thread::sleep(NEGATIVE_WINDOW);
     let command_arguments = session.command_arguments().to_vec();
     let process = capture_process(&mut session, "lifecycle-forwarder", command_arguments)?;
@@ -235,26 +236,25 @@ fn collect_listener_rebind(case: &RealityCase) -> io::Result<ForwarderLifecycleE
     let mut sends = Vec::new();
     let mut receives = Vec::new();
     send_probe_until_reply(
+        &session,
         &client_a,
         listen_a,
         11,
         1,
         started,
-        &mut sends,
-        &mut receives,
-    );
+        (&mut sends, &mut receives),
+    )?;
     write_resolver_revision(&resolver_path, 2, Some(listen_b), None)?;
     wait_for_resolver_revision(&mut session, 2)?;
-    wait_for_worker_refresh_after_revision(&mut session, 2, "c2u")?;
     send_probe_until_reply(
+        &session,
         &client_b,
         listen_b,
         12,
         2,
         started,
-        &mut sends,
-        &mut receives,
-    );
+        (&mut sends, &mut receives),
+    )?;
     send_probe_without_reply(&client_a, listen_a, 13, 3, started, &mut sends);
     thread::sleep(NEGATIVE_WINDOW);
     let command_arguments = session.command_arguments().to_vec();
@@ -277,33 +277,41 @@ fn collect_listener_relock(case: &RealityCase) -> io::Result<ForwarderLifecycleE
         format!("UDP:{}", upstream.local_addr()),
         REALITY_RELOCK_TIMEOUT_SECS,
     );
-    config.debug_client_unconnected = !case.connected;
-    let mut session = launch_forwarder(config);
+    config.debug_client_unconnected = case.connection_scenario.debug_force_unconnected();
+    let mut session = launch_forwarder_with_extra_args(
+        config,
+        &[
+            "--workers".to_string(),
+            "2".to_string(),
+            "--worker-flow-mode".to_string(),
+            "shared-flow".to_string(),
+        ],
+    );
     let client_a = configured_unconnected_client(case.domain)?;
     let client_b = configured_unconnected_client(case.domain)?;
     let started = Instant::now();
     let mut sends = Vec::new();
     let mut receives = Vec::new();
     send_probe_until_reply(
+        &session,
         &client_a,
         session.listen_addr,
         21,
         1,
         started,
-        &mut sends,
-        &mut receives,
-    );
+        (&mut sends, &mut receives),
+    )?;
     send_probe_without_reply(&client_b, session.listen_addr, 22, 2, started, &mut sends);
-    wait_for_log(&mut session, "watchdog publish disconnect")?;
+    wait_for_flow_clear_commit(&mut session)?;
     send_probe_until_reply(
+        &session,
         &client_b,
         session.listen_addr,
         23,
         3,
         started,
-        &mut sends,
-        &mut receives,
-    );
+        (&mut sends, &mut receives),
+    )?;
     let client_b_key = client_b.local_addr()?.to_string();
     let stats = wait_for_session_stats_matching(&mut session, STATS_WAIT_MS, |stats| {
         stats["worker_flows"].as_array().is_some_and(|flows| {
@@ -402,7 +410,7 @@ fn send_probe(
     started: Instant,
     sends: &mut Vec<ClientSendObservation>,
     receives: &mut Vec<ClientReceiveEvidence>,
-) {
+) -> bool {
     let payload = probe_payload(probe_id);
     let source = socket.local_addr().expect("client getsockname");
     let result = if socket.peer_addr().ok() == Some(destination) {
@@ -427,25 +435,41 @@ fn send_probe(
         }
         Err(error) => CallResult::OsError((&error).into()),
     };
+    let Some((observed_probe_id, matched)) = classify_probe_reply(&payload, &result) else {
+        return false;
+    };
     receives.push(ClientReceiveEvidence {
-        probe_id,
+        probe_id: observed_probe_id,
         payload: result,
     });
+    matched
+}
+
+pub(super) fn classify_probe_reply(
+    expected_payload: &[u8],
+    result: &CallResult<Vec<u8>>,
+) -> Option<(u64, bool)> {
+    let received = result.as_ok()?;
+    Some((parse_probe_id(received)?, received == expected_payload))
 }
 
 fn send_probe_until_reply(
+    session: &ForwarderSession,
     socket: &UdpSocket,
     destination: SocketAddr,
     probe_id: u64,
     sequence: u64,
     started: Instant,
-    sends: &mut Vec<ClientSendObservation>,
-    receives: &mut Vec<ClientReceiveEvidence>,
-) {
+    evidence: (
+        &mut Vec<ClientSendObservation>,
+        &mut Vec<ClientReceiveEvidence>,
+    ),
+) -> io::Result<()> {
+    let (sends, receives) = evidence;
     let deadline = Instant::now() + CLIENT_WAIT_MS;
     let mut attempt = 0;
     while Instant::now() < deadline {
-        send_probe(
+        let matched = send_probe(
             socket,
             destination,
             probe_id,
@@ -454,14 +478,20 @@ fn send_probe_until_reply(
             sends,
             receives,
         );
-        if receives.last().is_some_and(|receive| {
-            receive.probe_id == probe_id && receive.payload.as_ok().is_some()
-        }) {
-            return;
+        if matched {
+            return Ok(());
         }
         attempt = attempt.saturating_add(1);
         thread::sleep(TEST_RETRY_INTERVAL);
     }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "lifecycle probe {probe_id} did not receive a reply from {destination} within {:?}\n{}",
+            CLIENT_WAIT_MS,
+            session.diagnostic_snapshot(100),
+        ),
+    ))
 }
 
 fn send_probe_without_reply(
@@ -500,7 +530,7 @@ fn resolver_args(path: &Path, mode: &str) -> Vec<String> {
     ]
 }
 
-fn resolver_path() -> PathBuf {
+pub(super) fn resolver_path() -> PathBuf {
     std::env::temp_dir().join(format!(
         "pkthere-reality-resolver-{}-{}.json",
         std::process::id(),
@@ -508,7 +538,7 @@ fn resolver_path() -> PathBuf {
     ))
 }
 
-fn write_resolver_revision(
+pub(super) fn write_resolver_revision(
     path: &Path,
     revision: u64,
     listen_addr: Option<SocketAddr>,
@@ -568,35 +598,37 @@ fn wait_for_resolver_revision(session: &mut ForwarderSession, revision: u64) -> 
     })
 }
 
-fn wait_for_worker_refresh_after_revision(
-    session: &mut ForwarderSession,
-    revision: u64,
-    direction: &str,
-) -> io::Result<()> {
-    let revision_needle = format!("\"revision\":{revision}");
-    let refresh_needle = format!("[{direction}] refresh_handles_and_cache");
-    wait_for_output(session, |stderr| {
-        stderr
-            .find(&revision_needle)
-            .is_some_and(|revision_at| stderr[revision_at..].contains(&refresh_needle))
-    })
-}
-
-fn wait_for_log(session: &mut ForwarderSession, needle: &str) -> io::Result<()> {
-    wait_for_output(session, |stderr| stderr.contains(needle))
+fn wait_for_flow_clear_commit(session: &mut ForwarderSession) -> io::Result<()> {
+    session.wait_for_stderr_line(
+        Instant::now() + MAX_WAIT_SECS,
+        "socket-reality flow-clear commit",
+        |line| {
+            let (kind, value) = parse_diagnostic_line(line).ok().flatten()?;
+            (kind == DiagnosticKind::Runtime
+                && value["diagnostic_schema"] == 3
+                && value["event"] == "flow-clear-committed")
+                .then_some(())
+        },
+    )
 }
 
 fn wait_for_output(
     session: &mut ForwarderSession,
     predicate: impl Fn(&str) -> bool,
 ) -> io::Result<()> {
-    session
+    let result = session
         .wait_for_output(
             Instant::now() + MAX_WAIT_SECS,
             "socket-reality lifecycle evidence",
             |output| predicate(&output.stderr_lossy()),
         )
-        .map(|_| ())
+        .map(|_| ());
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{error}\n{}", session.diagnostic_snapshot(100)),
+        )
+    })
 }
 
 fn reserve_port(bind: SocketAddr) -> io::Result<u16> {
@@ -637,37 +669,4 @@ fn capture_process(
         stderr,
         exit_status: status,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{resolver_path, write_resolver_revision};
-    use serde_json::Value;
-    use std::fs;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    #[test]
-    fn resolver_writer_atomically_replaces_complete_revisions() {
-        let path = resolver_path();
-        write_resolver_revision(
-            &path,
-            1,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12002)),
-            None,
-        )
-        .expect("write first revision");
-        write_resolver_revision(
-            &path,
-            2,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12003)),
-            None,
-        )
-        .expect("replace with second revision");
-
-        let value: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read revision"))
-            .expect("complete JSON");
-        assert_eq!(value["revision"], 2);
-        assert_eq!(value["listen_addr"], "127.0.0.1:12003");
-        fs::remove_file(path).expect("remove resolver fixture");
-    }
 }

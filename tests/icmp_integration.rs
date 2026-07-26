@@ -1,6 +1,6 @@
 use pkthere_test_support::fixtures::{
-    ICMP_CADENCE_PAYLOAD, ICMP_STRAY_PAYLOAD, ICMP_SYNC_PAYLOAD, INDEPENDENT_IDS_PAYLOAD,
-    LEGIT_PAYLOAD_1, LEGIT_PAYLOAD_2, MULTIHOP_NODE_TIMEOUT_SECS, MULTIHOP_PAYLOAD,
+    DEBUG_TRACE_LOGS, ICMP_CADENCE_PAYLOAD, ICMP_STRAY_PAYLOAD, ICMP_SYNC_PAYLOAD,
+    INDEPENDENT_IDS_PAYLOAD, LEGIT_PAYLOAD_1, MULTIHOP_NODE_TIMEOUT_SECS, MULTIHOP_PAYLOAD,
     QUICK_STATS_TIMEOUT_SECS, WRONG_PEER_LEGIT_PORT_ID, WRONG_PEER_STRAY_PORT_ID,
     WRONG_PEER_TARGET_PORT_ID, localhost_ip,
 };
@@ -16,11 +16,11 @@ use pkthere_test_support::packet_diagnostics::DiagnosticLogIndex;
 use pkthere_test_support::raw_icmp::{acquire_icmp_dgram_session_lock, acquire_raw_icmp_lock};
 use pkthere_test_support::runtime_asserts::{
     expect_no_echo, expect_session_stats_json, expect_session_stats_matching,
-    recv_legitimate_echo_with_retry, wait_for_locked_client,
+    recv_legitimate_echo_with_retry, send_until_session_stats_matching, wait_for_locked_client,
 };
 use pkthere_test_support::timing::{
-    CLIENT_WAIT_MS, MAX_WAIT_SECS, RAW_ICMP_LOCK_WAIT, STATS_WAIT_MS, TEST_RETRY_INTERVAL,
-    TIMEOUT_SECS,
+    CHILD_CLEANUP_WAIT, CLIENT_WAIT_MS, MAX_WAIT_SECS, RAW_ICMP_LOCK_WAIT, STATS_WAIT_MS,
+    TEST_RETRY_INTERVAL, TIMEOUT_SECS,
 };
 use pkthere_test_support::worker_flow;
 
@@ -36,8 +36,6 @@ const MULTIHOP_NODE3_LISTEN_ID: u16 = 1303;
 const MULTIHOP_NODE3_REPLY_ID: u16 = 1404;
 const ICMP_ENDPOINT_NODE_ERR: &str = "could not launch ICMP endpoint node on raw-capable host";
 const ICMP_MIDDLE_NODE_ERR: &str = "could not launch pure ICMP middle node";
-const DEBUG_TRACE_LOGS: &[&str] = &["packets", "drops", "handles"];
-
 fn bind_ipv4_client() -> std::net::UdpSocket {
     bind_udp_client(Domain::IPV4).expect(IPV4_CLIENT_BIND_ERR)
 }
@@ -121,6 +119,7 @@ fn expect_two_way_payload_stats(
             && stats["u2c_bytes"].as_u64().expect("missing u2c_bytes") == payload_len as u64
             && stats["c2u_pkts"].as_u64().expect("missing c2u_pkts") == 2
             && stats["u2c_pkts"].as_u64().expect("missing u2c_pkts") == 2
+            && worker_flow::find_locked_worker_flow(stats).is_some()
     })
 }
 
@@ -175,7 +174,13 @@ fn icmp_sync_mode_forwards_payload_and_tracks_bytes() {
     let mut buf = [0u8; 2048];
     let n = client_sock
         .recv(&mut buf)
-        .expect("recv initial sync reply from ICMP forwarder");
+        .unwrap_or_else(|error| {
+            let (stdout, stderr) =
+                snapshot_forwarder_output(&session).expect("snapshot failed handshake output");
+            panic!(
+                "recv initial sync reply from ICMP forwarder: {error}\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+            )
+        });
     assert!(n >= 1, "expected at least 1-byte echoed payload, got {}", n);
     assert_eq!(
         &buf[..n],
@@ -273,7 +278,13 @@ fn icmp_sync_cadence_packets_do_not_prevent_timeout_exit() {
         }
     }
 
-    assert!(saw_echo, "expected to receive echoed non-empty payload");
+    if !saw_echo {
+        let (stdout, stderr) =
+            snapshot_forwarder_output(&session).expect("snapshot failed cadence handshake output");
+        panic!(
+            "expected to receive echoed non-empty payload\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+        );
+    }
     assert!(
         !saw_cadence_as_udp_user_data,
         "ICMP cadence/control traffic must not be surfaced as UDP user payload"
@@ -285,7 +296,11 @@ fn icmp_sync_cadence_packets_do_not_prevent_timeout_exit() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= exit_deadline {
-                    panic!("forwarder did not exit on timeout while cadence packets were active");
+                    let (stdout, stderr) = snapshot_forwarder_output(&session)
+                        .expect("snapshot cadence timeout output");
+                    panic!(
+                        "forwarder did not exit on timeout while cadence packets were active\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+                    );
                 }
                 std::thread::sleep(TEST_RETRY_INTERVAL);
             }
@@ -293,7 +308,13 @@ fn icmp_sync_cadence_packets_do_not_prevent_timeout_exit() {
         }
     };
 
-    assert!(status.success, "forwarder did not exit cleanly: {status}");
+    if !status.success {
+        let (stdout, stderr) =
+            snapshot_forwarder_output(&session).expect("snapshot failed timeout exit output");
+        panic!(
+            "forwarder did not exit cleanly: {status}\n=== stdout ===\n{stdout}\n=== stderr ===\n{stderr}"
+        );
+    }
     drop(handshake_guard);
 
     let stats = expect_session_stats_json(&mut session, STATS_WAIT_MS, "stats after timeout");
@@ -469,7 +490,14 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     let payload = MULTIHOP_PAYLOAD;
     client_sock.send(payload).expect("send multihop payload");
     let mut buf = [0u8; 2048];
-    let n = client_sock.recv(&mut buf).expect("recv multihop reply");
+    let n = client_sock.recv(&mut buf).unwrap_or_else(|error| {
+        panic!(
+            "recv multihop reply: {error}\n{}\n{}\n{}",
+            node1.diagnostic_snapshot(120),
+            node2.diagnostic_snapshot(120),
+            node3.diagnostic_snapshot(120),
+        )
+    });
     assert_eq!(&buf[..n], payload);
 
     client_sock
@@ -478,10 +506,14 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
     let n = client_sock
         .recv(&mut buf)
         .expect("recv multihop zero-length reply");
-    assert_eq!(
-        n, 0,
-        "expected zero-length UDP reply through multihop ICMP bridge"
-    );
+    if n != 0 {
+        panic!(
+            "expected zero-length UDP reply through multihop ICMP bridge, received {n} bytes\n{}\n{}\n{}",
+            node1.diagnostic_snapshot(120),
+            node2.diagnostic_snapshot(120),
+            node3.diagnostic_snapshot(120),
+        );
+    }
 
     expect_no_echo(&client_sock, &mut buf);
 
@@ -493,8 +525,7 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         expect_two_way_payload_stats(&mut node3, payload.len(), "missing final node 3 stats");
 
     let node1_worker = worker_flow::locked_worker_flow(&stats1_final);
-    let node1_upstream_local =
-        worker_flow::worker_str(node1_worker, "upstream_local_filter_canonical");
+    let node1_upstream_local = worker_flow::worker_str(node1_worker, "upstream_local_filter");
     let node2_worker = worker_flow::locked_worker_flow(&stats2_final);
     let node3_worker = worker_flow::locked_worker_flow(&stats3_final);
     assert_eq!(node2_worker["client_sock_type"], "RAW");
@@ -517,11 +548,11 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
         node1_upstream_local,
     );
     assert_eq!(
-        worker_flow::worker_str(node2_worker, "upstream_remote_filter_canonical"),
+        worker_flow::worker_str(node2_worker, "upstream_remote_filter"),
         node3_listen
     );
     assert_eq!(
-        worker_flow::worker_str(node2_worker, "upstream_local_filter_canonical"),
+        worker_flow::worker_str(node2_worker, "upstream_local_filter"),
         node2_reply
     );
     worker_flow::assert_flow_tuple(
@@ -542,8 +573,8 @@ fn icmp_sync_multihop_bridge_preserves_payload_through_pure_icmp_node() {
 #[ignore = "privileged pure-RAW topology runs through the explicit capability runner"]
 fn test_raw_icmp_independent_ids() {
     assert!(
-        pkthere_test_support::runtime_capability::raw_to_bound_raw_icmp_requests(),
-        "pure-RAW topology requires its runtime platform and privilege capability"
+        pkthere_test_support::runtime_capability::production_raw_icmp_forwarding(),
+        "RAW forwarding topology requires its runtime platform and privilege capability"
     );
     let _raw_icmp_guard = acquire_raw_icmp_lock(
         Instant::now() + RAW_ICMP_LOCK_WAIT,
@@ -650,11 +681,11 @@ fn test_raw_icmp_independent_ids() {
 
     let worker_a = worker_flow::locked_worker_flow(&stats_a);
     assert_eq!(
-        worker_flow::worker_str(worker_a, "upstream_local_filter_canonical"),
+        worker_flow::worker_str(worker_a, "upstream_local_filter"),
         client_reply
     );
     assert_eq!(
-        worker_flow::worker_str(worker_a, "upstream_remote_filter_canonical"),
+        worker_flow::worker_str(worker_a, "upstream_remote_filter"),
         server_listen
     );
     worker_flow::assert_flow_tuple(
@@ -672,7 +703,7 @@ fn test_raw_icmp_independent_ids() {
 
     let worker_b = worker_flow::locked_worker_flow(&stats_b);
     assert_eq!(
-        worker_flow::worker_str(worker_b, "listen_local_filter_canonical"),
+        worker_flow::worker_str(worker_b, "listener_local_filter"),
         server_listen
     );
     worker_flow::assert_flow_tuple(
@@ -693,8 +724,8 @@ fn test_raw_icmp_independent_ids() {
 #[ignore = "privileged pure-RAW topology runs through the explicit capability runner"]
 fn raw_icmp_locked_flow_rejects_wrong_source_id() {
     assert!(
-        pkthere_test_support::runtime_capability::raw_to_bound_raw_icmp_requests(),
-        "pure-RAW topology requires its runtime platform and privilege capability"
+        pkthere_test_support::runtime_capability::production_raw_icmp_forwarding(),
+        "RAW forwarding topology requires its runtime platform and privilege capability"
     );
     let _raw_icmp_guard = acquire_raw_icmp_lock(
         Instant::now() + RAW_ICMP_LOCK_WAIT,
@@ -711,12 +742,12 @@ fn raw_icmp_locked_flow_rejects_wrong_source_id() {
 
     // Wrong-source topology:
     //   legit:1111 -> target:4141, target replies to legit:1111
-    //   stray:2222 -> target:4141, target would reply to stray:2222
+    //   stray:2222 -> target:4141
     // The first legit packet locks target's ICMP listener flow by source ID
-    // 1111. A later packet with the same destination ID but source ID 2222 must
-    // be rejected by admission even though the raw listener is unconnected.
+    // 1111. A later frame with the same destination ID but source ID 2222 must
+    // be rejected by admission even though the RAW listener is unconnected.
     let mut node_target = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: true,
+        debug_client_unconnected: false,
         debug_upstream_unconnected: false,
         debug_icmp_kernel_echo_self_handshake: false,
         debug_force_raw_icmp_wildcard_upstream: false,
@@ -760,35 +791,9 @@ fn raw_icmp_locked_flow_rejects_wrong_source_id() {
         icmp_handshake_timeout_secs: None,
     });
 
-    // node_stray forwards UDP -> ICMP target ID 4141, source/reply ID 2222.
-    let node_stray = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
-        debug_icmp_kernel_echo_self_handshake: false,
-        debug_force_raw_icmp_wildcard_upstream: false,
-        here: udp_listen_arg(localhost_addr(Domain::IPV4, 0)),
-        there: render_icmp_arg(local_ip, WRONG_PEER_TARGET_PORT_ID),
-        here_source_id: None,
-        here_reply_id: None,
-        there_source_id: Some(WRONG_PEER_STRAY_PORT_ID),
-        there_reply_id: Some(WRONG_PEER_STRAY_PORT_ID),
-        timeout_action: "exit",
-        timeout_secs: Some(WRONG_SOURCE_TEST_TIMEOUT_SECS),
-        max_payload: None,
-        fast_stats: true,
-        stats_interval_mins: None,
-        icmp_sync_pps: None,
-        debug_logs: &[],
-        diagnostic_label: Some("stray"),
-        icmp_handshake_timeout_secs: None,
-    });
-
     client_legit
         .connect(node_legit.listen_addr)
         .expect("connect legit client");
-    client_stray
-        .connect(node_stray.listen_addr)
-        .expect("connect stray client");
 
     let mut buf = [0u8; 2048];
 
@@ -811,9 +816,49 @@ fn raw_icmp_locked_flow_rejects_wrong_source_id() {
 
     wait_for_locked_client(&mut node_target, MAX_WAIT_SECS).expect("node_target lock");
 
-    // 2. Stray client sends from ID 2222; must be rejected by node_target.
-    client_stray.send(ICMP_STRAY_PAYLOAD).expect("send stray");
-    expect_no_echo(&client_stray, &mut buf);
+    // 2. Stop the legitimate RAW sender before starting the stray sender.
+    // Windows protocol-zero capture is interface-global, so keeping both
+    // senders alive would test capture contention rather than target admission.
+    node_legit
+        .finish(Instant::now() + CHILD_CLEANUP_WAIT)
+        .expect("finish legitimate RAW sender");
+    let node_stray = launch_forwarder(ForwarderConfig {
+        debug_client_unconnected: false,
+        debug_upstream_unconnected: false,
+        debug_icmp_kernel_echo_self_handshake: false,
+        debug_force_raw_icmp_wildcard_upstream: false,
+        here: udp_listen_arg(localhost_addr(Domain::IPV4, 0)),
+        there: render_icmp_arg(local_ip, WRONG_PEER_TARGET_PORT_ID),
+        here_source_id: None,
+        here_reply_id: None,
+        there_source_id: Some(WRONG_PEER_STRAY_PORT_ID),
+        there_reply_id: Some(WRONG_PEER_STRAY_PORT_ID),
+        timeout_action: "exit",
+        timeout_secs: Some(WRONG_SOURCE_TEST_TIMEOUT_SECS),
+        max_payload: None,
+        fast_stats: true,
+        stats_interval_mins: None,
+        icmp_sync_pps: None,
+        debug_logs: &[],
+        diagnostic_label: Some("stray"),
+        icmp_handshake_timeout_secs: None,
+    });
+    client_stray
+        .connect(node_stray.listen_addr)
+        .expect("connect stray client");
+    send_until_session_stats_matching(
+        &client_stray,
+        ICMP_STRAY_PAYLOAD,
+        &mut node_target,
+        STATS_WAIT_MS,
+        "node_target did not account the injected wrong source",
+        |stats| {
+            stats["wrong_source_drops"]
+                .as_u64()
+                .expect("missing wrong_source_drops")
+                >= 1
+        },
+    );
 
     // Explicitly verify the drop log for node_target
     let (stdout, stderr) = snapshot_forwarder_output(&node_target).expect("snapshot output");
@@ -829,32 +874,14 @@ fn raw_icmp_locked_flow_rejects_wrong_source_id() {
         "node_target should have logged a packet drop for the stray client {}",
         stray_addr
     );
-
-    // 3. Legit client still works.
-    let n = recv_legitimate_echo_with_retry(
-        &client_legit,
-        LEGIT_PAYLOAD_2,
-        &mut buf,
-        "legit",
-        "echo 2",
-    )
-    .unwrap_or_else(|error| {
-        panic!(
-            "{error}\nnode target:\n{}\nnode legit:\n{}",
-            node_target.diagnostic_snapshot(80),
-            node_legit.diagnostic_snapshot(80)
-        )
-    });
-    assert_eq!(&buf[..n], LEGIT_PAYLOAD_2);
-
-    // 4. Verify both legitimate payloads were admitted. The retry helper may
-    // produce additional legitimate admissions before Windows delivers the
-    // corresponding RAW replies; the stray source is verified by its drop log.
-    let stats = expect_session_stats_matching(
-        &mut node_target,
-        STATS_WAIT_MS,
-        "node_target final stats",
-        |s| s["c2u_pkts"].as_u64().expect("missing c2u_pkts") >= 2,
+    assert!(
+        node_target.is_running().expect("query target status"),
+        "wrong-source traffic must not terminate the locked target"
     );
-    assert!(stats["c2u_pkts"].as_u64().expect("c2u_pkts") >= 2);
+    node_stray
+        .finish(Instant::now() + CHILD_CLEANUP_WAIT)
+        .expect("finish stray RAW sender");
+    node_target
+        .finish(Instant::now() + CHILD_CLEANUP_WAIT)
+        .expect("finish RAW admission target");
 }

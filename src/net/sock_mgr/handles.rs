@@ -3,7 +3,9 @@ use crate::endpoint::LogicalEndpoint;
 use crate::flow_key::{ClientFlowKey, SocketLegFlow};
 use crate::flow_state::DroppedReplyIdHandshake;
 use crate::net::managed_socket::ManagedSocket;
-use pkthere_socket_policy::{ListenerWorkerSocketPolicy, ResolvedSocketPolicy, SocketEvidenceKey};
+use pkthere_socket_policy::{
+    ListenerWorkerSocketPolicy, ResolvedSocketPolicy, SocketEvidenceKey, UpstreamWorkerSocketPolicy,
+};
 use socket2::Type;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -50,7 +52,6 @@ impl SocketHandles {
 }
 
 pub(crate) struct PublishedUpdate {
-    pub(crate) version: StateVersion,
     pub(crate) handles: SocketHandles,
 }
 
@@ -61,15 +62,13 @@ pub(crate) struct ClearedClientFlow {
 
 impl PublishedUpdate {
     pub(crate) fn new(handles: SocketHandles) -> Self {
-        Self {
-            version: handles.version,
-            handles,
-        }
+        Self { handles }
     }
 }
 
 pub(crate) struct SocketManagerInit {
     pub(crate) socket_slot: u32,
+    pub(crate) worker_io_lanes: usize,
     pub(crate) client_sock: ManagedSocket,
     pub(crate) listen_local_filter: LogicalEndpoint,
     pub(crate) listen_local_kernel_addr: SocketAddr,
@@ -86,25 +85,40 @@ pub(crate) struct SocketManagerInit {
     pub(crate) upstream_proto: SupportedProtocol,
     pub(crate) upstream_debug_unconnected: bool,
     pub(crate) upstream_icmp_kernel_echo_self_handshake: bool,
+    pub(crate) upstream_worker_socket_policy: UpstreamWorkerSocketPolicy,
+    pub(crate) shared_upstream_identity: Option<
+        Arc<
+            crate::authority::AuthorityOnceLock<
+                crate::authority::tags::IdentityAllocation,
+                SharedUpstreamIdentity,
+            >,
+        >,
+    >,
     pub(crate) force_raw_icmp_wildcard_upstream: bool,
     pub(crate) timeout_act: TimeoutAction,
     pub(crate) debug_handles: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SharedUpstreamIdentity {
+    pub(crate) source_id: u16,
+    pub(crate) reply_id: u16,
+    pub(crate) remote_id: u16,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SocketStateSnapshot {
+    pub version: StateVersion,
     pub locked_flow: Option<ClientFlowKey>,
     pub listener_flow: SocketLegFlow,
     pub listener_connected: bool,
     pub client_proto: SupportedProtocol,
     pub listen_local_filter: LogicalEndpoint,
-    pub listen_local_kernel_addr: SocketAddr,
     pub listen_evidence_key: SocketEvidenceKey,
     pub listen_sock_type: Type,
     pub listen_policy: ResolvedSocketPolicy,
     pub upstream_remote_filter: LogicalEndpoint,
     pub upstream_local_filter: LogicalEndpoint,
-    pub upstream_local_kernel_addr: SocketAddr,
     pub upstream_evidence_key: SocketEvidenceKey,
     pub upstream_flow: SocketLegFlow,
     pub upstream_connected: bool,

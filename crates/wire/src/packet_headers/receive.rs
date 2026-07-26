@@ -1,15 +1,11 @@
+use super::kernels::{parse_ipv4_icmp_network, parse_ipv6_icmp_network, parse_network_transport};
 use super::{
+    DeclaredPacketExtent, IpVersion, Ipv4PacketLengthEncoding, NetworkParseOutcome,
     ParsedPacketHeaders, parse_icmp_v4_transport, parse_icmp_v6_transport, parse_ipv4_icmp_packet,
     parse_ipv6_icmp_packet, parse_udp_datagram_payload,
 };
 use crate::SupportedProtocol;
 use std::fmt;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IpVersion {
-    V4,
-    V6,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReceiveHeaderMode {
@@ -27,6 +23,7 @@ pub struct ReceiveParserKernel {
     protocol: SupportedProtocol,
     version: IpVersion,
     mode: ReceiveHeaderMode,
+    ipv4_length: Ipv4PacketLengthEncoding,
 }
 
 impl PartialEq for ReceiveParserKernel {
@@ -35,15 +32,52 @@ impl PartialEq for ReceiveParserKernel {
             && self.protocol == other.protocol
             && self.version == other.version
             && self.mode == other.mode
+            && self.ipv4_length == other.ipv4_length
     }
 }
 
 impl Eq for ReceiveParserKernel {}
 
 impl ReceiveParserKernel {
+    /// Validates packet structure, endpoint identity fields, and declared
+    /// extents. It deliberately does not revalidate IPv4, UDP, ICMP, or
+    /// ICMPv6 checksums: the selected receive-socket policy is the checksum
+    /// integrity authority for packets delivered to these kernels.
     #[inline]
-    pub fn parse(self, bytes: &[u8]) -> ParsedPacketHeaders {
-        (self.parse)(bytes)
+    pub fn parse_network(self, bytes: &[u8]) -> NetworkParseOutcome {
+        match (self.protocol, self.version, self.mode) {
+            (_, _, ReceiveHeaderMode::PayloadOnly | ReceiveHeaderMode::TransportHeaderOnly) => {
+                NetworkParseOutcome::NotPresent
+            }
+            (SupportedProtocol::ICMP, IpVersion::V4, ReceiveHeaderMode::IpHeaderIncluded) => {
+                parse_ipv4_icmp_network(bytes, self.ipv4_length)
+            }
+            (SupportedProtocol::ICMP, IpVersion::V6, ReceiveHeaderMode::IpHeaderIncluded) => {
+                parse_ipv6_icmp_network(bytes)
+            }
+            _ => NetworkParseOutcome::NotPresent,
+        }
+    }
+
+    #[inline]
+    pub fn parse_transport(
+        self,
+        bytes: &[u8],
+        network: NetworkParseOutcome,
+    ) -> ParsedPacketHeaders {
+        match network {
+            NetworkParseOutcome::NotPresent => (self.parse)(bytes),
+            NetworkParseOutcome::Valid(_) | NetworkParseOutcome::Rejected(_) => {
+                parse_network_transport(bytes, network)
+            }
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn parse(self, bytes: &[u8]) -> ParsedPacketHeaders {
+        let network = self.parse_network(bytes);
+        self.parse_transport(bytes, network)
     }
 
     #[inline]
@@ -64,6 +98,15 @@ impl ReceiveParserKernel {
     #[inline]
     pub const fn mode(self) -> ReceiveHeaderMode {
         self.mode
+    }
+
+    #[inline]
+    pub fn declared_extent(
+        self,
+        parsed: ParsedPacketHeaders,
+        bytes: &[u8],
+    ) -> Option<DeclaredPacketExtent> {
+        parsed.declared_extent(bytes)
     }
 }
 
@@ -90,6 +133,7 @@ pub fn select_receive_parser(
     protocol: SupportedProtocol,
     version: IpVersion,
     mode: ReceiveHeaderMode,
+    ipv4_length: Ipv4PacketLengthEncoding,
 ) -> Result<ReceiveParserKernel, UnsupportedReceiveLayout> {
     let (parse, name): (PacketParserFn, &'static str) = match (protocol, version, mode) {
         (SupportedProtocol::UDP, _, ReceiveHeaderMode::PayloadOnly) => {
@@ -121,103 +165,9 @@ pub fn select_receive_parser(
         protocol,
         version,
         mode,
+        ipv4_length,
     })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{IpVersion, ReceiveHeaderMode, select_receive_parser};
-    use crate::SupportedProtocol;
-
-    #[test]
-    fn selector_covers_supported_layouts_and_rejects_cross_protocol_modes() {
-        let cases = [
-            (
-                SupportedProtocol::UDP,
-                IpVersion::V4,
-                ReceiveHeaderMode::PayloadOnly,
-                "udp-datagram-payload",
-            ),
-            (
-                SupportedProtocol::UDP,
-                IpVersion::V6,
-                ReceiveHeaderMode::PayloadOnly,
-                "udp-datagram-payload",
-            ),
-            (
-                SupportedProtocol::ICMP,
-                IpVersion::V4,
-                ReceiveHeaderMode::TransportHeaderOnly,
-                "icmpv4-transport",
-            ),
-            (
-                SupportedProtocol::ICMP,
-                IpVersion::V6,
-                ReceiveHeaderMode::TransportHeaderOnly,
-                "icmpv6-transport",
-            ),
-            (
-                SupportedProtocol::ICMP,
-                IpVersion::V4,
-                ReceiveHeaderMode::IpHeaderIncluded,
-                "ipv4-icmp-packet",
-            ),
-            (
-                SupportedProtocol::ICMP,
-                IpVersion::V6,
-                ReceiveHeaderMode::IpHeaderIncluded,
-                "ipv6-icmp-packet",
-            ),
-        ];
-        for (protocol, version, mode, expected) in cases {
-            assert_eq!(
-                select_receive_parser(protocol, version, mode)
-                    .expect("supported parser")
-                    .name(),
-                expected
-            );
-        }
-        let mut combinations = 0;
-        let mut supported = 0;
-        for protocol in [SupportedProtocol::UDP, SupportedProtocol::ICMP] {
-            for version in [IpVersion::V4, IpVersion::V6] {
-                for mode in [
-                    ReceiveHeaderMode::PayloadOnly,
-                    ReceiveHeaderMode::TransportHeaderOnly,
-                    ReceiveHeaderMode::IpHeaderIncluded,
-                ] {
-                    combinations += 1;
-                    let expected = protocol == SupportedProtocol::UDP
-                        && mode == ReceiveHeaderMode::PayloadOnly
-                        || protocol == SupportedProtocol::ICMP
-                            && mode != ReceiveHeaderMode::PayloadOnly;
-                    assert_eq!(
-                        select_receive_parser(protocol, version, mode).is_ok(),
-                        expected,
-                        "unexpected selector result for {protocol:?}/{version:?}/{mode:?}"
-                    );
-                    supported += usize::from(expected);
-                }
-            }
-        }
-        assert_eq!(combinations, 12);
-        assert_eq!(supported, 6);
-
-        let udp_v4 = select_receive_parser(
-            SupportedProtocol::UDP,
-            IpVersion::V4,
-            ReceiveHeaderMode::PayloadOnly,
-        )
-        .expect("IPv4 UDP parser");
-        let udp_v6 = select_receive_parser(
-            SupportedProtocol::UDP,
-            IpVersion::V6,
-            ReceiveHeaderMode::PayloadOnly,
-        )
-        .expect("IPv6 UDP parser");
-        assert_eq!(udp_v4.name(), udp_v6.name());
-        assert_ne!(udp_v4, udp_v6);
-        assert_eq!(udp_v4.version(), IpVersion::V4);
-        assert_eq!(udp_v6.version(), IpVersion::V6);
-    }
-}
+mod tests;

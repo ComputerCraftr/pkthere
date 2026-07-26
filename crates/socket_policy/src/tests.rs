@@ -1,46 +1,203 @@
 use super::{
-    IcmpChecksumMode, IcmpKernelIdPolicy, IcmpPolicyIntent, IcmpSocketIdCapability,
-    IcmpWildcardIdPolicy, IpHeaderMode, LockedPeerMode, SocketCreationPath, SocketEvidenceKey,
-    SocketPlatform, SocketReresolveMode, SocketReuseCapability, SocketRole, StartupPeerMode,
-    TimeoutAction, TimeoutClearMode, current_icmp_platform_capabilities,
-    datagram_disconnect_capability, icmp_platform_capabilities, listener_relock_capability,
-    listener_socket_creation_policy, listener_socket_setup_policy, listener_worker_socket_policy,
-    resolve_icmp_socket_policy_with_intent, resolve_socket_policy_with_icmp_intent,
-    socket_post_bind_policy, socket_reuse_capability_for_family, upstream_pre_connect_bind_id,
-    upstream_reresolve_capability, upstream_socket_creation_policy,
+    IcmpChecksumMode, IcmpPolicyIntent, IpHeaderMode, ListenerLockLifecycle, ProtocolPolicyIntent,
+    ResolvedSocketPolicy, SocketCreationPath, SocketLifecycleContext, SocketPathContext,
+    SocketPlatform, SocketPolicyContext, SocketReresolveMode, SocketReuseCapability, SocketRole,
+    StartupPeerMode, TimeoutAction, current_icmp_platform_capabilities,
+    datagram_disconnect_evidence, listener_relock_capability, listener_socket_creation_policy,
+    listener_worker_socket_policy, resolve_icmp_socket_policy_with_intent,
+    resolve_listener_socket_policy_for_creation_path_with_lifecycle,
+    resolve_socket_policy_for_creation_path_with_lifecycle, upstream_reresolve_capability,
+    upstream_socket_bind_policy, upstream_socket_creation_policy,
 };
 use pkthere_wire::SupportedProtocol;
 use pkthere_wire::packet_headers::ReceiveHeaderMode;
 use socket2::{Domain, Protocol, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-#[path = "tests/peer_verification.rs"]
+fn datagram_disconnect_capability(
+    protocol: SupportedProtocol,
+    family: Domain,
+) -> super::DatagramDisconnectCapability {
+    datagram_disconnect_evidence(protocol, family)
+        .measured()
+        .expect("current test platform has measured UDP disconnect evidence")
+}
+
+mod evidence_tests;
 mod peer_verification_tests;
+mod platform_capability_tests;
 
 fn assert_capability(actual: SocketReuseCapability, expected: SocketReuseCapability) {
     assert_eq!(actual, expected);
 }
 
-#[test]
-fn replacement_evidence_key_changes_domain_and_generation_but_not_slot() {
-    let original = SocketEvidenceKey::initial(
-        SocketRole::Upstream,
-        7,
-        "[::1]:0".parse().expect("IPv6 socket address"),
-    );
-    let replacement = original.replacement("127.0.0.1:0".parse().expect("IPv4 socket address"));
+fn exact_test_policy(
+    role: SocketRole,
+    proto: SupportedProtocol,
+    sock_type: Type,
+    timeout_action: TimeoutAction,
+    debug_unconnected: bool,
+    family: Domain,
+) -> ResolvedSocketPolicy {
+    exact_test_policy_with_icmp_intent(
+        role,
+        proto,
+        sock_type,
+        timeout_action,
+        debug_unconnected,
+        family,
+        IcmpPolicyIntent::default(),
+    )
+}
 
-    assert_eq!(replacement.process_id, original.process_id);
-    assert_eq!(replacement.role, original.role);
-    assert_eq!(replacement.socket_slot, original.socket_slot);
-    assert_eq!(replacement.generation, original.generation + 1);
-    assert_eq!(original.domain, Domain::IPV6);
-    assert_eq!(replacement.domain, Domain::IPV4);
+fn exact_test_reuse_capability(
+    role: SocketRole,
+    proto: SupportedProtocol,
+    sock_type: Type,
+    timeout_action: TimeoutAction,
+    debug_unconnected: bool,
+    family: Domain,
+) -> SocketReuseCapability {
+    exact_test_policy(
+        role,
+        proto,
+        sock_type,
+        timeout_action,
+        debug_unconnected,
+        family,
+    )
+    .reuse
+}
+
+fn exact_test_policy_with_icmp_intent(
+    role: SocketRole,
+    proto: SupportedProtocol,
+    sock_type: Type,
+    timeout_action: TimeoutAction,
+    debug_unconnected: bool,
+    family: Domain,
+    icmp_intent: IcmpPolicyIntent,
+) -> ResolvedSocketPolicy {
+    let protocol_intent = match proto {
+        SupportedProtocol::UDP => {
+            assert_eq!(icmp_intent, IcmpPolicyIntent::default());
+            ProtocolPolicyIntent::Udp
+        }
+        SupportedProtocol::ICMP => ProtocolPolicyIntent::Icmp(icmp_intent),
+    };
+    let creation_path = super::inferred_socket_creation_path(proto, sock_type, family);
+    let worker = listener_worker_socket_policy(1, false);
+    let unspecified = if family == Domain::IPV6 {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    };
+    let concrete = if family == Domain::IPV6 {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    let requested_ip = if role == SocketRole::Listener {
+        concrete
+    } else {
+        let preliminary = resolve_socket_policy_for_creation_path_with_lifecycle(
+            role,
+            protocol_intent,
+            sock_type,
+            timeout_action,
+            debug_unconnected,
+            SocketPolicyContext {
+                path: SocketPathContext {
+                    family,
+                    creation_path,
+                },
+                lifecycle: SocketLifecycleContext::for_requested_bind(
+                    SocketAddr::new(unspecified, 0),
+                    false,
+                    false,
+                ),
+            },
+        );
+        let bind = upstream_socket_bind_policy(preliminary, 0, 0);
+        if bind.address == super::UpstreamBindAddress::RouteSelected {
+            concrete
+        } else {
+            unspecified
+        }
+    };
+    let requested_bind = SocketAddr::new(requested_ip, 0);
+    let lifecycle = SocketLifecycleContext::for_requested_bind(
+        requested_bind,
+        role == SocketRole::Listener && worker.reuse_address,
+        role == SocketRole::Listener && worker.reuse_port,
+    );
+    let context = SocketPolicyContext {
+        path: SocketPathContext {
+            family,
+            creation_path,
+        },
+        lifecycle,
+    };
+    match role {
+        SocketRole::Listener => resolve_listener_socket_policy_for_creation_path_with_lifecycle(
+            protocol_intent,
+            sock_type,
+            timeout_action,
+            debug_unconnected,
+            context,
+            worker,
+        ),
+        SocketRole::Upstream => resolve_socket_policy_for_creation_path_with_lifecycle(
+            role,
+            protocol_intent,
+            sock_type,
+            timeout_action,
+            debug_unconnected,
+            context,
+        ),
+    }
+}
+
+fn resolve_listener_test_policy(
+    protocol_intent: ProtocolPolicyIntent,
+    sock_type: Type,
+    timeout_action: TimeoutAction,
+    debug_unconnected: bool,
+    family: Domain,
+    worker: super::ListenerWorkerSocketPolicy,
+) -> ResolvedSocketPolicy {
+    let ip = if family == Domain::IPV6 {
+        IpAddr::V6(Ipv6Addr::LOCALHOST)
+    } else {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    };
+    resolve_listener_socket_policy_for_creation_path_with_lifecycle(
+        protocol_intent,
+        sock_type,
+        timeout_action,
+        debug_unconnected,
+        SocketPolicyContext {
+            path: SocketPathContext {
+                family,
+                creation_path: super::inferred_socket_creation_path(
+                    protocol_intent.protocol(),
+                    sock_type,
+                    family,
+                ),
+            },
+            lifecycle: SocketLifecycleContext::for_requested_bind(
+                SocketAddr::new(ip, 0),
+                worker.reuse_address,
+                worker.reuse_port,
+            ),
+        },
+        worker,
+    )
 }
 
 #[test]
 fn listener_udp_dgram_matrix_tracks_timeout_and_disconnect_reuse_policy() {
-    let exit_policy = socket_reuse_capability_for_family(
+    let exit_policy = exact_test_reuse_capability(
         SocketRole::Listener,
         SupportedProtocol::UDP,
         Type::DGRAM,
@@ -52,13 +209,11 @@ fn listener_udp_dgram_matrix_tracks_timeout_and_disconnect_reuse_policy() {
         exit_policy,
         SocketReuseCapability {
             startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::ConnectAfterLock,
-            reresolve_mode: SocketReresolveMode::ReconnectInPlace,
-            timeout_clear_mode: TimeoutClearMode::ProcessExit,
+            reresolve_mode: SocketReresolveMode::ProcessExitOnly,
         },
     );
 
-    let drop_policy = socket_reuse_capability_for_family(
+    let drop_policy = exact_test_reuse_capability(
         SocketRole::Listener,
         SupportedProtocol::UDP,
         Type::DGRAM,
@@ -66,37 +221,18 @@ fn listener_udp_dgram_matrix_tracks_timeout_and_disconnect_reuse_policy() {
         false,
         Domain::IPV4,
     );
-    let (locked_peer_mode, reresolve_mode, timeout_clear_mode) = if cfg!(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd"
-    )) {
-        (
-            LockedPeerMode::StayUnconnected,
-            SocketReresolveMode::ReplaceSocket,
-            TimeoutClearMode::NoConnectedState,
-        )
-    } else {
-        (
-            LockedPeerMode::ConnectAfterLock,
-            SocketReresolveMode::ReconnectInPlace,
-            TimeoutClearMode::DisconnectSocket,
-        )
-    };
     assert_capability(
         drop_policy,
         SocketReuseCapability {
             startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode,
-            reresolve_mode,
-            timeout_clear_mode,
+            reresolve_mode: SocketReresolveMode::ReplaceSocket,
         },
     );
 }
 
 #[test]
 fn listener_raw_icmp_exit_stays_unconnected_and_not_reconnectable() {
-    let policy = socket_reuse_capability_for_family(
+    let policy = exact_test_reuse_capability(
         SocketRole::Listener,
         SupportedProtocol::ICMP,
         Type::RAW,
@@ -108,52 +244,44 @@ fn listener_raw_icmp_exit_stays_unconnected_and_not_reconnectable() {
         policy,
         SocketReuseCapability {
             startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::StayUnconnected,
             reresolve_mode: SocketReresolveMode::ReplaceSocket,
-            timeout_clear_mode: TimeoutClearMode::NoConnectedState,
         },
     );
 }
 
 #[test]
-fn macos_ipv6_udp_listener_drop_uses_unconnected_policy() {
-    let policy = socket_reuse_capability_for_family(
-        SocketRole::Listener,
-        SupportedProtocol::UDP,
-        Type::DGRAM,
-        TimeoutAction::Drop,
-        false,
-        Domain::IPV6,
-    );
-
-    let expected = if cfg!(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "linux",
-        target_os = "android"
-    )) {
-        SocketReuseCapability {
-            startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::StayUnconnected,
-            reresolve_mode: SocketReresolveMode::ReplaceSocket,
-            timeout_clear_mode: TimeoutClearMode::NoConnectedState,
+fn listener_disconnect_requires_complete_safe_relock_contract() {
+    for family in [Domain::IPV4, Domain::IPV6] {
+        let policy = exact_test_reuse_capability(
+            SocketRole::Listener,
+            SupportedProtocol::UDP,
+            Type::DGRAM,
+            TimeoutAction::Drop,
+            false,
+            family,
+        );
+        assert!(
+            !datagram_disconnect_capability(SupportedProtocol::UDP, family)
+                .supports_safe_same_descriptor_relock()
+        );
+        if matches!(
+            SocketPlatform::current(),
+            SocketPlatform::Macos | SocketPlatform::Ios
+        ) {
+            assert_capability(
+                policy,
+                SocketReuseCapability {
+                    startup_peer_mode: StartupPeerMode::Unconnected,
+                    reresolve_mode: SocketReresolveMode::ReplaceSocket,
+                },
+            );
         }
-    } else {
-        SocketReuseCapability {
-            startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::ConnectAfterLock,
-            reresolve_mode: SocketReresolveMode::ReconnectInPlace,
-            timeout_clear_mode: TimeoutClearMode::DisconnectSocket,
-        }
-    };
-
-    assert_capability(policy, expected);
+    }
 }
 
 #[test]
 fn upstream_dgram_reconnect_policy_is_independent_from_listener_policy() {
-    let listener = socket_reuse_capability_for_family(
+    let listener = exact_test_reuse_capability(
         SocketRole::Listener,
         SupportedProtocol::UDP,
         Type::DGRAM,
@@ -161,7 +289,7 @@ fn upstream_dgram_reconnect_policy_is_independent_from_listener_policy() {
         false,
         Domain::IPV4,
     );
-    let upstream = socket_reuse_capability_for_family(
+    let upstream = exact_test_reuse_capability(
         SocketRole::Upstream,
         SupportedProtocol::UDP,
         Type::DGRAM,
@@ -170,35 +298,15 @@ fn upstream_dgram_reconnect_policy_is_independent_from_listener_policy() {
         Domain::IPV4,
     );
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
-    {
-        assert_eq!(listener.locked_peer_mode, LockedPeerMode::StayUnconnected);
-        assert_eq!(
-            upstream.reresolve_mode,
-            SocketReresolveMode::ReconnectInPlace
-        );
-        assert_eq!(listener.startup_peer_mode, StartupPeerMode::Unconnected);
-        assert_eq!(upstream.startup_peer_mode, StartupPeerMode::Connected);
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-    {
-        assert_eq!(
-            listener.reresolve_mode,
-            SocketReresolveMode::ReconnectInPlace
-        );
-        assert_eq!(
-            upstream.reresolve_mode,
-            SocketReresolveMode::ReconnectInPlace
-        );
-        assert_eq!(listener.startup_peer_mode, StartupPeerMode::Unconnected);
-        assert_eq!(upstream.startup_peer_mode, StartupPeerMode::Connected);
-    }
+    assert_eq!(listener.reresolve_mode, SocketReresolveMode::ReplaceSocket);
+    assert_eq!(upstream.reresolve_mode, SocketReresolveMode::ReplaceSocket);
+    assert_eq!(listener.startup_peer_mode, StartupPeerMode::Unconnected);
+    assert_eq!(upstream.startup_peer_mode, StartupPeerMode::Connected);
 }
 
 #[test]
 fn raw_icmp_upstream_uses_platform_peer_mode() {
-    let policy = socket_reuse_capability_for_family(
+    let policy = exact_test_reuse_capability(
         SocketRole::Upstream,
         SupportedProtocol::ICMP,
         Type::RAW,
@@ -206,27 +314,16 @@ fn raw_icmp_upstream_uses_platform_peer_mode() {
         false,
         Domain::IPV4,
     );
-    let expected = if cfg!(windows) {
-        SocketReuseCapability {
-            startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::StayUnconnected,
-            reresolve_mode: SocketReresolveMode::MetadataOnlyWhenUnconnected,
-            timeout_clear_mode: TimeoutClearMode::NoConnectedState,
-        }
-    } else {
-        SocketReuseCapability {
-            startup_peer_mode: StartupPeerMode::Connected,
-            locked_peer_mode: LockedPeerMode::ConnectAfterLock,
-            reresolve_mode: SocketReresolveMode::ReplaceSocket,
-            timeout_clear_mode: TimeoutClearMode::ProcessExit,
-        }
+    let expected = SocketReuseCapability {
+        startup_peer_mode: StartupPeerMode::Connected,
+        reresolve_mode: SocketReresolveMode::ReplaceSocket,
     };
     assert_capability(policy, expected);
 }
 
 #[test]
-fn windows_raw_icmp_upstream_uses_unconnected_rcvall_path_even_with_debug_override() {
-    let policy = socket_reuse_capability_for_family(
+fn debug_unconnected_remains_authoritative_for_raw_capture() {
+    let policy = exact_test_reuse_capability(
         SocketRole::Upstream,
         SupportedProtocol::ICMP,
         Type::RAW,
@@ -238,7 +335,6 @@ fn windows_raw_icmp_upstream_uses_unconnected_rcvall_path_even_with_debug_overri
     #[cfg(windows)]
     {
         assert_eq!(policy.startup_peer_mode, StartupPeerMode::Unconnected);
-        assert_eq!(policy.locked_peer_mode, LockedPeerMode::StayUnconnected);
         assert_eq!(
             policy.reresolve_mode,
             SocketReresolveMode::MetadataOnlyWhenUnconnected
@@ -252,36 +348,40 @@ fn windows_raw_icmp_upstream_uses_unconnected_rcvall_path_even_with_debug_overri
 }
 
 #[test]
-fn send_policy_defines_icmp_checksum_and_ip_header_modes() {
-    for role in [SocketRole::Listener, SocketRole::Upstream] {
-        let policy = resolve_socket_policy_with_icmp_intent(
-            role,
-            SupportedProtocol::ICMP,
-            Type::RAW,
-            TimeoutAction::Drop,
-            false,
-            Domain::IPV4,
-            IcmpPolicyIntent::default(),
-        );
+fn protocol_zero_capture_uses_raw_l3_connected_startup_when_not_forced_unconnected() {
+    let policy = resolve_socket_policy_for_creation_path_with_lifecycle(
+        SocketRole::Upstream,
+        ProtocolPolicyIntent::Icmp(IcmpPolicyIntent::default()),
+        Type::RAW,
+        TimeoutAction::Drop,
+        false,
+        SocketPolicyContext {
+            path: SocketPathContext {
+                family: Domain::IPV4,
+                creation_path: SocketCreationPath::WindowsProtocolZeroCapture,
+            },
+            lifecycle: SocketLifecycleContext::direct_default(),
+        },
+    );
 
-        assert_eq!(
-            policy.send_policy.ip_header,
-            if cfg!(windows) {
-                IpHeaderMode::Ipv4HeaderIncluded
-            } else {
-                IpHeaderMode::PayloadOnly
-            }
-        );
-        assert_eq!(
-            policy.send_policy.icmp_checksum,
-            IcmpChecksumMode::ApplicationComputed
-        );
-    }
+    assert_eq!(
+        policy.receive_capture_scope,
+        super::ReceiveCaptureScope::InterfaceIpv4
+    );
+    assert_eq!(policy.reuse.startup_peer_mode, StartupPeerMode::Connected);
+    assert_eq!(
+        policy.reuse.reresolve_mode,
+        SocketReresolveMode::ReplaceSocket
+    );
+    assert_eq!(
+        policy.peer_verification,
+        super::PeerVerification::RequirePeerNetworkAddress
+    );
 }
 
 #[test]
 fn receive_header_policy_selects_the_socket_wire_layout() {
-    let udp = resolve_socket_policy_with_icmp_intent(
+    let udp = exact_test_policy_with_icmp_intent(
         SocketRole::Upstream,
         SupportedProtocol::UDP,
         Type::DGRAM,
@@ -293,7 +393,7 @@ fn receive_header_policy_selects_the_socket_wire_layout() {
     assert_eq!(udp.receive_header, ReceiveHeaderMode::PayloadOnly);
 
     for family in [Domain::IPV4, Domain::IPV6] {
-        let dgram = resolve_socket_policy_with_icmp_intent(
+        let dgram = exact_test_policy_with_icmp_intent(
             SocketRole::Upstream,
             SupportedProtocol::ICMP,
             Type::DGRAM,
@@ -302,16 +402,15 @@ fn receive_header_policy_selects_the_socket_wire_layout() {
             family,
             IcmpPolicyIntent::default(),
         );
-        let expected =
-            if family == Domain::IPV4 && cfg!(any(target_os = "macos", target_os = "ios")) {
-                ReceiveHeaderMode::IpHeaderIncluded
-            } else {
-                ReceiveHeaderMode::TransportHeaderOnly
-            };
+        let expected = if family == Domain::IPV4 {
+            current_icmp_platform_capabilities().icmp_v4_dgram_receive_header
+        } else {
+            ReceiveHeaderMode::TransportHeaderOnly
+        };
         assert_eq!(dgram.receive_header, expected);
     }
 
-    let raw_v4 = resolve_socket_policy_with_icmp_intent(
+    let raw_v4 = exact_test_policy_with_icmp_intent(
         SocketRole::Listener,
         SupportedProtocol::ICMP,
         Type::RAW,
@@ -322,7 +421,7 @@ fn receive_header_policy_selects_the_socket_wire_layout() {
     );
     assert_eq!(raw_v4.receive_header, ReceiveHeaderMode::IpHeaderIncluded);
 
-    let raw_v6 = resolve_socket_policy_with_icmp_intent(
+    let raw_v6 = exact_test_policy_with_icmp_intent(
         SocketRole::Listener,
         SupportedProtocol::ICMP,
         Type::RAW,
@@ -339,7 +438,7 @@ fn receive_header_policy_selects_the_socket_wire_layout() {
 
 #[test]
 fn linux_android_icmp_dgram_policy_uses_kernel_checksum() {
-    let policy = resolve_socket_policy_with_icmp_intent(
+    let policy = exact_test_policy_with_icmp_intent(
         SocketRole::Upstream,
         SupportedProtocol::ICMP,
         Type::DGRAM,
@@ -350,7 +449,7 @@ fn linux_android_icmp_dgram_policy_uses_kernel_checksum() {
     );
     assert_eq!(
         policy.send_policy.icmp_checksum,
-        if cfg!(any(target_os = "linux", target_os = "android")) {
+        if current_icmp_platform_capabilities().kernel_computed_dgram_checksum {
             IcmpChecksumMode::KernelComputed
         } else {
             IcmpChecksumMode::ApplicationComputed
@@ -360,33 +459,53 @@ fn linux_android_icmp_dgram_policy_uses_kernel_checksum() {
 }
 
 #[test]
-fn udp_disconnect_capability_distinguishes_reconnect_from_listener_receive_reuse() {
+fn udp_disconnect_capability_requires_queue_isolation_for_safe_relock() {
     let capability = datagram_disconnect_capability(SupportedProtocol::UDP, Domain::IPV4);
-    if cfg!(any(unix, windows)) {
-        assert!(capability.disconnect_call_supported);
+    let platform = SocketPlatform::current();
+    if matches!(
+        platform,
+        SocketPlatform::Linux
+            | SocketPlatform::Android
+            | SocketPlatform::Macos
+            | SocketPlatform::Ios
+            | SocketPlatform::Windows
+            | SocketPlatform::Freebsd
+    ) {
+        assert!(capability.association_clear_supported);
         assert!(capability.reconnect_after_disconnect_supported);
+    } else {
+        assert!(!capability.association_clear_supported);
+        assert!(!capability.reconnect_after_disconnect_supported);
     }
-    if cfg!(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "freebsd"
-    )) {
-        assert!(!capability.listener_original_bind_receive_after_disconnect_supported);
-    }
+    assert!(!capability.stale_receive_queue_isolated);
+    assert!(!capability.supports_safe_same_descriptor_relock());
+    assert_eq!(
+        capability.preserves_every_requested_bind(),
+        platform == SocketPlatform::Windows
+    );
 }
 
 #[test]
 fn role_specific_socket_capabilities_match_reuse_policy() {
     let upstream =
         upstream_reresolve_capability(SupportedProtocol::UDP, Type::DGRAM, false, Domain::IPV4);
+    let disconnect = datagram_disconnect_capability(SupportedProtocol::UDP, Domain::IPV4);
     assert_eq!(
         upstream.reresolve_mode(),
-        SocketReresolveMode::ReconnectInPlace
+        if disconnect.supports_safe_same_descriptor_relock() {
+            SocketReresolveMode::ReconnectInPlace
+        } else {
+            SocketReresolveMode::ReplaceSocket
+        }
     );
-    if cfg!(any(unix, windows)) {
-        assert!(upstream.can_disconnect());
-        assert!(upstream.can_reconnect_to_new_target());
-    }
+    assert_eq!(
+        upstream.can_disconnect(),
+        disconnect.association_clear_supported
+    );
+    assert_eq!(
+        upstream.can_reconnect_to_new_target(),
+        upstream.reresolve_mode() == SocketReresolveMode::ReconnectInPlace
+    );
 
     let listener = listener_relock_capability(
         SupportedProtocol::UDP,
@@ -395,21 +514,26 @@ fn role_specific_socket_capabilities_match_reuse_policy() {
         false,
         Domain::IPV4,
     );
+    let listener_disconnect = datagram_disconnect_capability(SupportedProtocol::UDP, Domain::IPV4);
     assert_eq!(
         listener.can_relock_to_new_peer(),
-        listener.can_lock_connected() && listener.can_disconnect_lock()
+        listener.can_lock_connected()
+            && listener.can_disconnect_lock()
+            && listener_disconnect.supports_safe_same_descriptor_relock()
     );
-    if !listener.can_receive_on_original_bind_after_disconnect() {
+    if !listener_disconnect.supports_safe_same_descriptor_relock()
+        && !listener.lifecycle.connects_after_lock()
+    {
         assert_eq!(
-            listener.timeout_clear_mode,
-            TimeoutClearMode::NoConnectedState
+            listener.lifecycle,
+            ListenerLockLifecycle::StayUnconnectedReplaceOnClear
         );
     }
 }
 
 #[test]
 fn udp_upstream_debug_unconnected_uses_metadata_only_policy() {
-    let policy = socket_reuse_capability_for_family(
+    let policy = exact_test_reuse_capability(
         SocketRole::Upstream,
         SupportedProtocol::UDP,
         Type::DGRAM,
@@ -422,21 +546,16 @@ fn udp_upstream_debug_unconnected_uses_metadata_only_policy() {
         policy,
         SocketReuseCapability {
             startup_peer_mode: StartupPeerMode::Unconnected,
-            locked_peer_mode: LockedPeerMode::StayUnconnected,
             reresolve_mode: SocketReresolveMode::MetadataOnlyWhenUnconnected,
-            timeout_clear_mode: TimeoutClearMode::NoConnectedState,
         },
     );
 }
 
 #[test]
 fn dgram_upstream_protocols_share_connected_default_and_debug_override() {
-    let mut protocols = vec![SupportedProtocol::UDP];
-    if current_icmp_platform_capabilities().datagram_echo_sockets {
-        protocols.push(SupportedProtocol::ICMP);
-    }
+    let protocols = [SupportedProtocol::UDP, SupportedProtocol::ICMP];
     for proto in protocols {
-        let default_policy = socket_reuse_capability_for_family(
+        let default_policy = exact_test_reuse_capability(
             SocketRole::Upstream,
             proto,
             Type::DGRAM,
@@ -448,13 +567,11 @@ fn dgram_upstream_protocols_share_connected_default_and_debug_override() {
             default_policy,
             SocketReuseCapability {
                 startup_peer_mode: StartupPeerMode::Connected,
-                locked_peer_mode: LockedPeerMode::ConnectAfterLock,
-                reresolve_mode: SocketReresolveMode::ReconnectInPlace,
-                timeout_clear_mode: TimeoutClearMode::ProcessExit,
+                reresolve_mode: SocketReresolveMode::ReplaceSocket,
             },
         );
 
-        let debug_policy = socket_reuse_capability_for_family(
+        let debug_policy = exact_test_reuse_capability(
             SocketRole::Upstream,
             proto,
             Type::DGRAM,
@@ -466,9 +583,7 @@ fn dgram_upstream_protocols_share_connected_default_and_debug_override() {
             debug_policy,
             SocketReuseCapability {
                 startup_peer_mode: StartupPeerMode::Unconnected,
-                locked_peer_mode: LockedPeerMode::StayUnconnected,
                 reresolve_mode: SocketReresolveMode::MetadataOnlyWhenUnconnected,
-                timeout_clear_mode: TimeoutClearMode::NoConnectedState,
             },
         );
     }
@@ -477,44 +592,29 @@ fn dgram_upstream_protocols_share_connected_default_and_debug_override() {
 #[test]
 fn timeout_drop_forces_unconnected_only_when_listener_policy_requires_it() {
     assert_eq!(
-        socket_reuse_capability_for_family(
-            SocketRole::Listener,
-            SupportedProtocol::ICMP,
+        resolve_listener_test_policy(
+            ProtocolPolicyIntent::Icmp(IcmpPolicyIntent::default()),
             Type::RAW,
             TimeoutAction::Drop,
             false,
             Domain::IPV4,
+            listener_worker_socket_policy(1, false),
         )
-        .locked_peer_mode,
-        LockedPeerMode::StayUnconnected
+        .listener_lifecycle,
+        Some(ListenerLockLifecycle::StayUnconnected)
     );
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
     assert_eq!(
-        socket_reuse_capability_for_family(
-            SocketRole::Listener,
-            SupportedProtocol::UDP,
+        resolve_listener_test_policy(
+            ProtocolPolicyIntent::Udp,
             Type::DGRAM,
             TimeoutAction::Drop,
             false,
             Domain::IPV4,
+            listener_worker_socket_policy(1, false),
         )
-        .locked_peer_mode,
-        LockedPeerMode::StayUnconnected
-    );
-
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
-    assert_eq!(
-        socket_reuse_capability_for_family(
-            SocketRole::Listener,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Drop,
-            false,
-            Domain::IPV4,
-        )
-        .locked_peer_mode,
-        LockedPeerMode::ConnectAfterLock
+        .listener_lifecycle,
+        Some(ListenerLockLifecycle::StayUnconnectedReplaceOnClear)
     );
 }
 
@@ -533,20 +633,19 @@ fn listener_icmp_policy_resolves_to_raw_admission() {
 
 #[test]
 fn socket_creation_policy_centralizes_listener_and_upstream_paths() {
-    let capabilities = current_icmp_platform_capabilities();
     let udp = listener_socket_creation_policy(SupportedProtocol::UDP, Domain::IPV4);
     assert_eq!(udp.primary.path, SocketCreationPath::Datagram);
     assert_eq!(udp.primary.socket_type, Type::DGRAM);
     assert_eq!(udp.primary.protocol, Some(Protocol::UDP));
-    assert_eq!(udp.create_fallback, None);
+    assert_eq!(udp.fallback, None);
 
     let listener_v4 = listener_socket_creation_policy(SupportedProtocol::ICMP, Domain::IPV4);
-    let expected_v4_path = if capabilities.windows_ipv4_protocol_zero_raw {
+    let expected_v4_path = if SocketPlatform::current() == SocketPlatform::Windows {
         SocketCreationPath::WindowsProtocolZeroCapture
     } else {
         SocketCreationPath::RawIcmp
     };
-    let expected_v4_protocol = if capabilities.windows_ipv4_protocol_zero_raw {
+    let expected_v4_protocol = if SocketPlatform::current() == SocketPlatform::Windows {
         Protocol::from(0)
     } else {
         Protocol::ICMPV4
@@ -554,7 +653,7 @@ fn socket_creation_policy_centralizes_listener_and_upstream_paths() {
     assert_eq!(listener_v4.primary.path, expected_v4_path);
     assert_eq!(listener_v4.primary.socket_type, Type::RAW);
     assert_eq!(listener_v4.primary.protocol, Some(expected_v4_protocol));
-    assert_eq!(listener_v4.create_fallback, None);
+    assert_eq!(listener_v4.fallback, None);
 
     let listener_v6 = listener_socket_creation_policy(SupportedProtocol::ICMP, Domain::IPV6);
     assert_eq!(listener_v6.primary.path, SocketCreationPath::RawIcmp);
@@ -563,423 +662,16 @@ fn socket_creation_policy_centralizes_listener_and_upstream_paths() {
     let disjoint =
         upstream_socket_creation_policy(SupportedProtocol::ICMP, Domain::IPV4, 1001, 2002, false);
     assert_eq!(disjoint.primary.path, expected_v4_path);
-    assert_eq!(disjoint.create_fallback, None);
+    assert_eq!(disjoint.fallback, None);
 
     let wildcard =
         upstream_socket_creation_policy(SupportedProtocol::ICMP, Domain::IPV4, 0, 0, false);
-    if capabilities.datagram_echo_sockets {
-        assert_eq!(wildcard.primary.path, SocketCreationPath::Datagram);
-        assert_eq!(wildcard.primary.socket_type, Type::DGRAM);
-        assert_eq!(
-            wildcard.create_fallback.map(|spec| spec.path),
-            Some(expected_v4_path)
-        );
-    } else {
-        assert_eq!(wildcard.primary.path, expected_v4_path);
-        assert_eq!(wildcard.create_fallback, None);
-    }
-}
-
-#[test]
-fn icmp_platform_capability_matrix_is_complete_and_conservative() {
-    for platform in [SocketPlatform::Linux, SocketPlatform::Android] {
-        let capabilities = icmp_platform_capabilities(platform);
-        assert!(capabilities.datagram_echo_sockets);
-        assert!(capabilities.dgram_to_bound_raw_loopback);
-        assert!(capabilities.raw_to_bound_raw_loopback);
-        assert!(!capabilities.windows_ipv4_protocol_zero_raw);
-    }
-
-    let macos = icmp_platform_capabilities(SocketPlatform::Macos);
-    assert!(macos.datagram_echo_sockets);
-    assert!(!macos.dgram_to_bound_raw_loopback);
-    assert!(!macos.raw_to_bound_raw_loopback);
-
-    let ios = icmp_platform_capabilities(SocketPlatform::Ios);
-    assert!(!ios.datagram_echo_sockets);
-    assert!(!ios.raw_to_bound_raw_loopback);
-
-    let windows = icmp_platform_capabilities(SocketPlatform::Windows);
-    assert!(!windows.datagram_echo_sockets);
-    assert!(windows.windows_ipv4_protocol_zero_raw);
-    assert!(windows.raw_to_bound_raw_loopback);
-
-    let other = icmp_platform_capabilities(SocketPlatform::Other);
-    assert!(!other.datagram_echo_sockets);
-    assert!(!other.windows_ipv4_protocol_zero_raw);
-}
-
-#[test]
-fn post_bind_setup_is_owned_by_the_protocol_zero_creation_path() {
-    for path in [SocketCreationPath::Datagram, SocketCreationPath::RawIcmp] {
-        let policy = socket_post_bind_policy(path);
-        assert!(!policy.enable_windows_rcvall);
-        assert!(!policy.set_ipv4_header_included);
-    }
-    let capture = socket_post_bind_policy(SocketCreationPath::WindowsProtocolZeroCapture);
-    assert!(capture.enable_windows_rcvall);
-    assert!(capture.set_ipv4_header_included);
-
-    let worker = listener_worker_socket_policy(2, true);
-    let setup =
-        listener_socket_setup_policy(worker, SocketCreationPath::WindowsProtocolZeroCapture);
-    assert_eq!(setup.worker, worker);
-    assert!(setup.bind_requested_address);
-    assert_eq!(setup.post_bind, capture);
-}
-
-#[test]
-fn upstream_pre_connect_bind_policy_unifies_udp_ports_and_ping_ids() {
+    assert_eq!(wildcard.primary.path, SocketCreationPath::Datagram);
+    assert_eq!(wildcard.primary.socket_type, Type::DGRAM);
     assert_eq!(
-        upstream_pre_connect_bind_id(SupportedProtocol::UDP, Type::DGRAM, 9999, 2002),
-        Some(2002)
-    );
-    assert_eq!(
-        upstream_pre_connect_bind_id(SupportedProtocol::UDP, Type::DGRAM, 9999, 0),
-        None
-    );
-    assert_eq!(
-        upstream_pre_connect_bind_id(SupportedProtocol::ICMP, Type::DGRAM, 3003, 2002),
-        Some(3003)
-    );
-    assert_eq!(
-        upstream_pre_connect_bind_id(SupportedProtocol::ICMP, Type::DGRAM, 0, 2002),
-        None
-    );
-    assert_eq!(
-        upstream_pre_connect_bind_id(SupportedProtocol::ICMP, Type::RAW, 3003, 2002),
-        None
+        wildcard.fallback.map(|fallback| fallback.to.path),
+        Some(expected_v4_path)
     );
 }
 
-#[test]
-fn disjoint_upstream_ids_require_disjoint_capable_policy() {
-    let raw = resolve_icmp_socket_policy_with_intent(
-        SocketRole::Upstream,
-        Type::RAW,
-        IcmpPolicyIntent::default(),
-    );
-    let dgram = resolve_icmp_socket_policy_with_intent(
-        SocketRole::Upstream,
-        Type::DGRAM,
-        IcmpPolicyIntent::default(),
-    );
-
-    assert!(raw.can_honor_disjoint_ids());
-    assert!(raw.requires_raw_packet_admission());
-
-    assert!(!dgram.can_honor_disjoint_ids());
-    assert!(!dgram.requires_raw_packet_admission());
-}
-
-#[test]
-fn dgram_upstream_id_capability_matches_platform_semantics() {
-    let dgram = resolve_icmp_socket_policy_with_intent(
-        SocketRole::Upstream,
-        Type::DGRAM,
-        IcmpPolicyIntent::default(),
-    );
-    if cfg!(any(target_os = "linux", target_os = "android")) {
-        assert_eq!(
-            dgram.id_capability,
-            IcmpSocketIdCapability::KernelAssignedCollapsedId
-        );
-        assert_eq!(
-            dgram.kernel_id_policy,
-            IcmpKernelIdPolicy::DeferredKernelAssigned
-        );
-        assert_eq!(
-            dgram.wildcard_id_policy,
-            IcmpWildcardIdPolicy::UseKernelAssignedCollapsedId
-        );
-    } else {
-        assert_eq!(
-            dgram.id_capability,
-            IcmpSocketIdCapability::FixedCollapsedId
-        );
-        assert_eq!(
-            dgram.kernel_id_policy,
-            IcmpKernelIdPolicy::TrustedGetsockname
-        );
-        assert_eq!(
-            dgram.wildcard_id_policy,
-            IcmpWildcardIdPolicy::GenerateFixedCollapsedId
-        );
-    }
-}
-
-#[test]
-fn raw_debug_wildcard_policy_can_keep_raw_admission_without_disjoint_ids() {
-    let policy = resolve_socket_policy_with_icmp_intent(
-        SocketRole::Upstream,
-        SupportedProtocol::ICMP,
-        Type::RAW,
-        TimeoutAction::Drop,
-        false,
-        Domain::IPV4,
-        IcmpPolicyIntent {
-            disable_disjoint_ids: true,
-            allow_debug_kernel_echo_self_handshake: false,
-        },
-    );
-    let icmp = policy.icmp.expect("ICMP policy");
-
-    assert_eq!(icmp.socket_type, Type::RAW);
-    assert_eq!(icmp.id_capability, IcmpSocketIdCapability::FixedCollapsedId);
-    assert_eq!(
-        icmp.kernel_id_policy,
-        IcmpKernelIdPolicy::IgnoreGetsocknameProtocol
-    );
-    assert_eq!(
-        icmp.wildcard_id_policy,
-        IcmpWildcardIdPolicy::GenerateFixedCollapsedId
-    );
-    assert!(icmp.requires_raw_packet_admission());
-    assert!(!icmp.can_honor_disjoint_ids());
-}
-
-#[test]
-fn raw_icmp_kernel_local_ids_are_untrusted() {
-    let policy = resolve_icmp_socket_policy_with_intent(
-        SocketRole::Upstream,
-        Type::RAW,
-        IcmpPolicyIntent::default(),
-    );
-    assert_eq!(
-        policy.kernel_id_policy,
-        IcmpKernelIdPolicy::IgnoreGetsocknameProtocol
-    );
-    assert_eq!(
-        policy.wildcard_id_policy,
-        IcmpWildcardIdPolicy::GenerateDisjointIds
-    );
-}
-
-#[test]
-fn receive_evidence_policy_is_resolved_with_socket_layout() {
-    for family in [Domain::IPV4, Domain::IPV6] {
-        let udp = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Upstream,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Exit,
-            false,
-            family,
-            IcmpPolicyIntent::default(),
-        );
-        assert_eq!(
-            udp.evidence_policy(true),
-            super::ReceiveEvidencePolicy {
-                peer_source: super::PeerSourceRequirement::ConnectedKernel,
-                protocol_id: super::ProtocolIdRequirement::None,
-            }
-        );
-        assert_eq!(
-            udp.evidence_policy(false),
-            super::ReceiveEvidencePolicy {
-                peer_source: super::PeerSourceRequirement::SourceMetadata,
-                protocol_id: super::ProtocolIdRequirement::None,
-            }
-        );
-        let listener_udp = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Listener,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Drop,
-            false,
-            family,
-            IcmpPolicyIntent::default(),
-        );
-        assert_eq!(
-            listener_udp.evidence_policy(true),
-            super::ReceiveEvidencePolicy {
-                peer_source: super::PeerSourceRequirement::SourceMetadata,
-                protocol_id: super::ProtocolIdRequirement::None,
-            }
-        );
-
-        let raw = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Upstream,
-            SupportedProtocol::ICMP,
-            Type::RAW,
-            TimeoutAction::Exit,
-            false,
-            family,
-            IcmpPolicyIntent::default(),
-        );
-        if family == Domain::IPV4 {
-            assert_eq!(
-                raw.evidence_policy(true),
-                super::ReceiveEvidencePolicy {
-                    peer_source: super::PeerSourceRequirement::RawPacketHeader,
-                    protocol_id: super::ProtocolIdRequirement::ParsedTransportIdentifier,
-                }
-            );
-            assert_eq!(
-                raw.evidence_policy(false),
-                super::ReceiveEvidencePolicy {
-                    peer_source: super::PeerSourceRequirement::RawPacketHeader,
-                    protocol_id: super::ProtocolIdRequirement::ParsedTransportIdentifier,
-                }
-            );
-        } else {
-            assert_eq!(
-                raw.evidence_policy(true),
-                super::ReceiveEvidencePolicy {
-                    peer_source: super::PeerSourceRequirement::ConnectedKernel,
-                    protocol_id: super::ProtocolIdRequirement::ParsedTransportIdentifier,
-                }
-            );
-            assert_eq!(
-                raw.evidence_policy(false),
-                super::ReceiveEvidencePolicy {
-                    peer_source: super::PeerSourceRequirement::SourceMetadata,
-                    protocol_id: super::ProtocolIdRequirement::ParsedTransportIdentifier,
-                }
-            );
-        }
-    }
-}
-
-#[test]
-fn receive_syscall_policy_optimizes_safe_connected_roles_and_preserves_listener_metadata() {
-    for family in [Domain::IPV4, Domain::IPV6] {
-        let listener_udp = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Listener,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Drop,
-            false,
-            family,
-            IcmpPolicyIntent::default(),
-        );
-        assert_eq!(
-            listener_udp.receive_syscall(true),
-            super::ReceiveSyscall::RecvFrom
-        );
-        assert_eq!(
-            listener_udp.receive_syscall(false),
-            super::ReceiveSyscall::RecvFrom
-        );
-        let upstream_udp = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Upstream,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Drop,
-            false,
-            family,
-            IcmpPolicyIntent::default(),
-        );
-        assert_eq!(
-            upstream_udp.receive_syscall(true),
-            super::ReceiveSyscall::Recv
-        );
-        assert_eq!(
-            upstream_udp.receive_syscall(false),
-            super::ReceiveSyscall::RecvFrom
-        );
-
-        for socket_type in [Type::DGRAM, Type::RAW] {
-            let icmp = resolve_socket_policy_with_icmp_intent(
-                SocketRole::Upstream,
-                SupportedProtocol::ICMP,
-                socket_type,
-                TimeoutAction::Drop,
-                false,
-                family,
-                IcmpPolicyIntent::default(),
-            );
-            assert_eq!(icmp.receive_syscall(true), super::ReceiveSyscall::Recv);
-            assert_eq!(icmp.receive_syscall(false), super::ReceiveSyscall::RecvFrom);
-        }
-    }
-}
-
-#[test]
-fn listener_worker_socket_policy_limits_separate_state_to_kernel_flow_affinity() {
-    assert_eq!(
-        listener_worker_socket_policy(1, true),
-        super::ListenerWorkerSocketPolicy {
-            reuse_address: false,
-            reuse_port: false,
-            distribution: super::ListenerWorkerDistribution::SingleSocket,
-        }
-    );
-
-    let shared = listener_worker_socket_policy(3, false);
-    assert!(shared.supports_requested_distribution());
-    assert_eq!(
-        shared.distribution,
-        super::ListenerWorkerDistribution::SharedState
-    );
-    assert!(shared.reuse_address);
-    assert_eq!(shared.reuse_port, cfg!(unix));
-    let listener_udp = resolve_socket_policy_with_icmp_intent(
-        SocketRole::Listener,
-        SupportedProtocol::UDP,
-        Type::DGRAM,
-        TimeoutAction::Drop,
-        false,
-        Domain::IPV4,
-        IcmpPolicyIntent::default(),
-    );
-    assert!(!shared.connects_after_lock(listener_udp));
-    assert_eq!(
-        listener_worker_socket_policy(1, false).connects_after_lock(listener_udp),
-        listener_udp.reuse.connects_after_lock()
-    );
-
-    let separate = listener_worker_socket_policy(3, true);
-    assert_eq!(
-        separate.distribution,
-        if cfg!(any(target_os = "linux", target_os = "android")) {
-            super::ListenerWorkerDistribution::KernelFlowAffinity
-        } else {
-            super::ListenerWorkerDistribution::UnsupportedSeparateState
-        }
-    );
-    assert_eq!(
-        separate.supports_requested_distribution(),
-        cfg!(any(target_os = "linux", target_os = "android"))
-    );
-}
-
-#[test]
-fn upstream_reresolve_uses_only_proven_family_reconnect_capability() {
-    for family in [Domain::IPV4, Domain::IPV6] {
-        let capability =
-            upstream_reresolve_capability(SupportedProtocol::UDP, Type::DGRAM, false, family);
-        assert!(capability.can_disconnect());
-        let macos_ipv6 =
-            cfg!(any(target_os = "macos", target_os = "ios")) && family == Domain::IPV6;
-        assert_eq!(capability.can_reconnect_to_new_target(), !macos_ipv6);
-        assert_eq!(
-            capability.reresolve_mode(),
-            if macos_ipv6 {
-                super::SocketReresolveMode::ReplaceSocket
-            } else {
-                super::SocketReresolveMode::ReconnectInPlace
-            }
-        );
-    }
-}
-
-#[test]
-fn socket_evidence_generation_changes_only_on_replacement() {
-    let initial = SocketEvidenceKey::initial(
-        SocketRole::Upstream,
-        7,
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    );
-    assert_eq!(initial.generation, 1);
-    assert_eq!(initial.domain, Domain::IPV4);
-    assert_eq!(initial.socket_slot, 7);
-
-    let replacement = initial.replacement(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0));
-    assert_eq!(replacement.process_id, initial.process_id);
-    assert_eq!(replacement.role, initial.role);
-    assert_eq!(replacement.socket_slot, initial.socket_slot);
-    assert_eq!(replacement.generation, initial.generation + 1);
-    assert_eq!(replacement.domain, Domain::IPV6);
-    assert_ne!(replacement.domain, initial.domain);
-}
+mod policy_resolution_tests;

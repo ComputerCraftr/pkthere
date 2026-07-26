@@ -1,6 +1,7 @@
 use pkthere_test_support::cli::{
     RunningObservation, assert_cli_rejects, assert_cli_runs, render_app_bin_path,
-    run_cli_args_expect_running_with_stdout, run_cli_args_with_stdout,
+    run_cli_args_expect_running_with_stdout, run_cli_args_wait_for_stdout,
+    run_cli_args_with_stdout,
 };
 use pkthere_test_support::network::{
     NODE1_IPV4_STR, default_test_icmp_upstream_arg, default_test_upstream_arg, localhost_addr,
@@ -8,18 +9,10 @@ use pkthere_test_support::network::{
 };
 use pkthere_test_support::timing::{CLI_COMPLETION_WAIT, CLI_OBSERVATION_WAIT};
 use socket2::Domain;
-use std::time::Duration;
 
-fn expect_running_output(args: &[&str], wait: Duration) -> (String, String) {
-    match run_cli_args_expect_running_with_stdout(args, wait) {
-        RunningObservation::Running(output) => (output.stdout_lossy(), output.stderr_lossy()),
-        RunningObservation::Exited(completed) => panic!(
-            "expected config to remain running; exit={}; stdout: {}; stderr: {}",
-            completed.exit,
-            completed.output.stdout_lossy(),
-            completed.output.stderr_lossy()
-        ),
-    }
+fn expect_startup_output(args: &[&str], expected_line_fragment: &str) -> (String, String) {
+    let output = run_cli_args_wait_for_stdout(args, expected_line_fragment, CLI_COMPLETION_WAIT);
+    (output.stdout_lossy(), output.stderr_lossy())
 }
 
 fn udp_cli_pair(family: Domain, here_port: u16, there_port: u16) -> (String, String) {
@@ -301,7 +294,14 @@ fn rejects_invalid_single_value_cli_options_against_base_udp_config() {
             vec!["--icmp-sync-pps", "10"],
             vec!["--icmp-sync-pps requires --there ICMP"],
         ),
-        (vec!["--workers", "0"], vec!["--workers must be >= 1"]),
+        (
+            vec!["--workers", "0"],
+            vec!["--workers must be between 1 and 256"],
+        ),
+        (
+            vec!["--workers", "257"],
+            vec!["--workers must be between 1 and 256"],
+        ),
         (
             vec!["--max-payload", "65508"],
             vec![
@@ -459,7 +459,7 @@ fn rejects_unrecognized_debug_flags() {
 fn startup_logs_clarify_single_flow_with_one_worker() {
     let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 0));
     let there = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 9));
-    let (out, _err) = expect_running_output(
+    let (out, _err) = expect_startup_output(
         &[
             "--here",
             &here,
@@ -470,7 +470,7 @@ fn startup_logs_clarify_single_flow_with_one_worker() {
             "--worker-flow-mode",
             "single-flow",
         ],
-        CLI_OBSERVATION_WAIT,
+        "single-flow with --workers 1 is valid but has no distribution benefit",
     );
     let out_lower = out.to_lowercase();
     assert!(
@@ -499,8 +499,10 @@ fn startup_logs_clarify_single_flow_with_one_worker() {
 fn startup_logs_clarify_dynamic_icmp_upstream_mode() {
     let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 0));
     let there = default_test_icmp_upstream_arg(localhost_addr(Domain::IPV4, 0).ip());
-    let (out, _err) =
-        expect_running_output(&["--here", &here, "--there", &there], CLI_OBSERVATION_WAIT);
+    let (out, _err) = expect_startup_output(
+        &["--here", &here, "--there", &there],
+        "ICMP upstream mode: dynamic/wildcard local reply id",
+    );
     let out_lower = out.to_lowercase();
     assert!(
         out_lower.contains("icmp upstream mode: dynamic/wildcard local reply id"),
@@ -520,7 +522,7 @@ fn startup_logs_clarify_dynamic_icmp_upstream_mode() {
 fn startup_logs_clarify_global_icmp_sync_budget() {
     let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 0));
     let there = default_test_icmp_upstream_arg(localhost_addr(Domain::IPV4, 0).ip());
-    let (out, _err) = expect_running_output(
+    let (out, err) = expect_startup_output(
         &[
             "--here",
             &here,
@@ -533,14 +535,15 @@ fn startup_logs_clarify_global_icmp_sync_budget() {
             "--worker-flow-mode",
             "shared-flow",
         ],
-        CLI_OBSERVATION_WAIT,
+        "ICMP sync pace: global total best-effort target 7 packet(s)/s shared across all workers and flows",
     );
     let out_lower = out.to_lowercase();
     assert!(
         out_lower.contains(
             "icmp sync pace: global total best-effort target 7 packet(s)/s shared across all workers and flows"
         ),
-        "stdout missing global icmp sync pace clarification: {out}"
+        "stdout missing global icmp sync pace clarification; binary={}; stdout={out}; stderr={err}",
+        render_app_bin_path()
     );
 }
 
@@ -570,8 +573,8 @@ fn rejects_max_payload_exceeding_icmp_tunnel_limit() {
     let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 1));
     let there = render_icmp_arg(localhost_addr(Domain::IPV4, 0).ip(), 1234);
     assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--max-payload", "65507"],
-        &["exceeds the maximum supported by the selected protocols and address families (65506)"],
+        &["--here", &here, "--there", &there, "--max-payload", "65497"],
+        &["exceeds the maximum supported by the selected protocols and address families (65496)"],
     );
 }
 
@@ -591,8 +594,8 @@ fn rejects_max_payload_for_mixed_ipv4_ipv6() {
     let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 1));
     let there = render_icmp_arg(localhost_addr(Domain::IPV6, 0).ip(), 1234);
     assert_cli_rejects(
-        &["--here", &here, "--there", &there, "--max-payload", "65526"],
-        &["exceeds the maximum supported by the selected protocols and address families (65506)"],
+        &["--here", &here, "--there", &there, "--max-payload", "65497"],
+        &["exceeds the maximum supported by the selected protocols and address families (65496)"],
     );
 }
 
@@ -612,6 +615,58 @@ fn rejects_duplicate_icmp_sync_pps() {
             "20",
         ],
         &["--icmp-sync-pps specified multiple times"],
+    );
+}
+
+#[test]
+fn rejects_icmp_session_pool_sizes_outside_protocol_bounds() {
+    let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 0));
+    let there = render_icmp_arg(localhost_addr(Domain::IPV4, 0).ip(), 2222);
+    for invalid in ["0", "33"] {
+        assert_cli_rejects(
+            &[
+                "--here",
+                &here,
+                "--there",
+                &there,
+                "--icmp-session-pool-size",
+                invalid,
+            ],
+            &["--icmp-session-pool-size must be between 1 and 32"],
+        );
+    }
+}
+
+#[test]
+fn rejects_icmp_handshake_timeout_that_can_exhaust_candidate_sequences() {
+    let here = default_test_upstream_arg("UDP", localhost_addr(Domain::IPV4, 0));
+    let there = render_icmp_arg(localhost_addr(Domain::IPV4, 0).ip(), 2222);
+    assert_cli_rejects(
+        &[
+            "--here",
+            &here,
+            "--there",
+            &there,
+            "--icmp-handshake-timeout-secs",
+            "3601",
+        ],
+        &["--icmp-handshake-timeout-secs must be <= 3600"],
+    );
+}
+
+#[test]
+fn rejects_icmp_session_pool_option_for_udp_only_topology() {
+    let (here, there) = udp_cli_pair(Domain::IPV4, 0, 9);
+    assert_cli_rejects(
+        &[
+            "--here",
+            &here,
+            "--there",
+            &there,
+            "--icmp-session-pool-size",
+            "4",
+        ],
+        &["--icmp-session-pool-size requires an ICMP listener or upstream"],
     );
 }
 

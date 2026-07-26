@@ -15,7 +15,15 @@ pub fn render_test_path(path: &Path) -> String {
 }
 
 pub fn render_repo_relative_path(repo_root: &Path, path: &Path) -> String {
-    let rel = path.strip_prefix(repo_root).unwrap_or(path);
+    let canonical_root = repo_root.canonicalize().ok();
+    let canonical_path = path.canonicalize().ok();
+    let rel = path.strip_prefix(repo_root).ok().or_else(|| {
+        canonical_root
+            .as_deref()
+            .zip(canonical_path.as_deref())
+            .and_then(|(root, candidate)| candidate.strip_prefix(root).ok())
+    });
+    let rel = rel.unwrap_or(path);
     render_test_path(rel)
 }
 
@@ -28,47 +36,4 @@ pub fn join_test_path(parts: &[&str]) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        join_test_path, platform_executable_name, render_repo_relative_path, render_test_path,
-    };
-    use std::path::Path;
-
-    #[test]
-    fn render_test_path_normalizes_separators() {
-        let path = join_test_path(&["tmp", "folder", "file.txt"]);
-        let rendered = render_test_path(&path);
-        assert!(!rendered.contains('\\'));
-        assert!(rendered.ends_with("tmp/folder/file.txt") || rendered == "tmp/folder/file.txt");
-    }
-
-    #[test]
-    fn render_repo_relative_path_uses_repo_relative_view() {
-        let repo_root = join_test_path(&["repo"]);
-        let child = join_test_path(&["repo", "tests", "common", "policy.rs"]);
-        assert_eq!(
-            render_repo_relative_path(&repo_root, &child),
-            "tests/common/policy.rs"
-        );
-    }
-
-    #[test]
-    fn platform_executable_name_matches_current_platform_policy() {
-        let exe = platform_executable_name("pkthere");
-        #[cfg(windows)]
-        assert_eq!(exe, "pkthere.exe");
-
-        #[cfg(not(windows))]
-        assert_eq!(exe, "pkthere");
-    }
-
-    #[test]
-    fn render_repo_relative_path_falls_back_to_full_path_when_outside_repo() {
-        let repo_root = Path::new("/repo");
-        let outside = Path::new("/tmp/file.txt");
-        assert_eq!(
-            render_repo_relative_path(repo_root, outside),
-            "/tmp/file.txt"
-        );
-    }
-}
+mod tests;

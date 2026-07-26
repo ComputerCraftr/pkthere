@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
@@ -24,71 +24,114 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check Rust workspace
-        run: cargo check --locked --workspace --all-targets
-
-      - name: Check Rust lints
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-
-      - name: Install Python check runner
-        run: python -m pip install --disable-pip-version-check pipx==1.16.2
-
-      - name: Check Python formatting
-        run: pipx run ruff==0.15.22 format --check .
-
-      - name: Check Python lint
-        run: pipx run ruff==0.15.22 check .
-
-      - name: Check Python types
-        run: pipx run mypy==2.3.0 --strict
-
-      - name: Install TOML formatter and validator
-        run: cargo install taplo-cli --version 0.10.0 --locked
-
-      - name: Check TOML formatting
-        run: taplo fmt --check
-
-      - name: Validate TOML
-        run: taplo check
-
-      - name: Check YAML formatting
-        run: npx --yes prettier@3.9.6 --check "**/*.{yml,yaml}"
-
-      - name: Check CI shell scripts
-        run: shellcheck .github/scripts/*.sh
-
-      - name: Check CI shell formatting
-        uses: docker://mvdan/shfmt:v3.12.0-alpine
-        with:
-          args: -d -ci .github/scripts
-
-      - name: Check workflow YAML style
+      - name: Install pinned quality tools
         run: >-
-          pipx run yamllint==1.38.0
-          -d '{extends: default, rules: {line-length: disable, truthy: disable, document-start: disable}}'
-          .github/workflows
+          python -m ci.pkthere_ci bootstrap-quality-tools
+          --log quality-bootstrap.log
 
-      - name: Validate GitHub Actions semantics
-        uses: docker://rhysd/actionlint:1.7.12
+      - name: Run canonical quality command plan
+        run: >-
+          python -m ci.pkthere_ci quality
+          --log quality.log
+
+  authority-audit:
+    name: Authority Graph and Loom Negative Controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
         with:
-          args: -color
+          toolchain: stable
 
-      - name: Run Alpine harness unit tests
-        run: python -m unittest discover -s docker/alpine/tests -v
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
 
-      - name: Compile benchmarks without running them
-        run: cargo bench --locked --workspace --no-run
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: authority-audit
+
+      - uses: ./.github/actions/enable_icmp_ping
+
+      - name: Run allowlisted negative controls and positive authority suite
+        run: >-
+          python -m ci.pkthere_ci authority-audit
+          --log authority-audit.log
+
+  msrv:
+    name: Rust 1.97.1 MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust 1.97.1
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.97.1
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv-1.97.1
+
+      - uses: ./.github/actions/enable_icmp_ping
+
+      - name: Run canonical MSRV command plan
+        run: >-
+          python -m ci.pkthere_ci msrv
+          --log msrv.log
+
+  macos-profile:
+    name: macOS Time Profiler Artifact
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-profile-portable
+
+      - name: Build and verify portable profiling artifact
+        run: >-
+          python -m ci.pkthere_ci macos-profile
+          --cpu-policy portable
+          --log macos-profile.log
+
+      - name: Upload macOS profiling evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-profile-portable
+          path: |
+            macos-profile.log
+            macos-profile-artifacts
+            target/macos_profile
+          if-no-files-found: error
 
   miri-production-units:
     name: Miri production unit suite
@@ -97,102 +140,79 @@ jobs:
     env:
       MIRIFLAGS: -Zmiri-disable-isolation
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Resolve pinned CI tool versions
+        id: ci-tools
+        run: >-
+          python -m ci.pkthere_ci ci-tool-outputs
+          --log ci-tool-outputs.log
 
       - name: Set up pinned nightly Miri
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-07-01
+          toolchain: ${{ steps.ci-tools.outputs.miri_toolchain }}
           components: miri
 
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: miri-production-units
 
-      - name: Prepare Miri
-        run: cargo miri setup
-
-      - name: Run every Miri-compatible production unit test
+      - name: Run targeted Miri boundary tests
         run: >-
-          cargo miri test --locked
-          -p pkthere
-          -p pkthere-wire
-          -p pkthere-socket-policy
-          --lib --bins -- --nocapture
+          python -m ci.pkthere_ci miri-boundaries
+          --log miri-boundaries.log
 
   test:
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            platform: linux
-            label: Linux
-            raw_icmp_override: 1
             app_source: target/debug/pkthere
             test_app: target/debug/pkthere-priv
           - os: macos-latest
-            platform: macos
-            label: macOS
-            raw_icmp_override: 0
             app_source: target/debug/pkthere
             test_app: target/debug/pkthere-priv
           - os: windows-latest
-            platform: windows
-            label: Windows
-            raw_icmp_override: 1
             app_source: target/debug/pkthere.exe
-            test_app: target/debug/pkthere.exe
+            test_app: target/debug/pkthere-priv.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    env:
-      PKTHERE_ALLOW_RAW_ICMP: ${{ matrix.raw_icmp_override }}
-      TEST_APP_BIN: ${{ github.workspace }}/${{ matrix.test_app }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Enable ICMP ping sockets
-        if: runner.os == 'Linux'
-        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - uses: ./.github/actions/enable_icmp_ping
 
-      - name: Build
-        run: cargo test --locked --workspace --lib --bins --tests --no-run --verbose
-
-      - name: Prepare privileged native binary
-        if: runner.os != 'Windows'
-        shell: bash
-        run: .github/scripts/grant_raw_capability.sh "${{ matrix.app_source }}" "$TEST_APP_BIN"
-
-      - name: Run complete native test manifest
+      - name: Run canonical native platform lifecycle
         run: >-
-          python .github/scripts/ci_test_runner.py native
-          --log native-tests-${{ matrix.platform }}.log
-
-      - name: Run privileged RAW socket reality manifest
-        run: >-
-          python .github/scripts/ci_test_runner.py raw-reality
-          --log raw-reality-${{ matrix.platform }}.log
+          python -m ci.pkthere_ci platform-ci
+          --app-bin "${{ matrix.app_source }}"
+          --privileged-app-bin "${{ matrix.test_app }}"
+          --log native-platform-${{ matrix.os }}.log
 
       - name: Upload native socket reality evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: native-${{ matrix.platform }}
+          name: native-${{ matrix.os }}
           path: |
-            native-tests-*.log
-            raw-reality-*.log
+            native-platform-*.log
             ${{ matrix.app_source }}
-            ${{ matrix.test_app }}
           if-no-files-found: warn
 
   stress-release:
@@ -202,84 +222,59 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            platform: linux
             label: Linux
-            raw_icmp_override: 1
-            app_source: target/release/pkthere
-            test_app: target/release/pkthere-priv
           - os: macos-latest
-            platform: macos
             label: macOS
-            raw_icmp_override: 0
-            app_source: target/release/pkthere
-            test_app: target/release/pkthere-priv
           - os: windows-latest
-            platform: windows
             label: Windows
-            raw_icmp_override: 0
-            app_source: target/release/pkthere.exe
-            test_app: target/release/pkthere.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    env:
-      PKTHERE_ALLOW_RAW_ICMP: ${{ matrix.raw_icmp_override }}
-      TEST_APP_BIN: ${{ github.workspace }}/${{ matrix.test_app }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
 
-      - name: Enable ICMP ping sockets
-        if: runner.os == 'Linux'
-        run: |
-          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+      - uses: ./.github/actions/enable_icmp_ping
 
-      - name: Build only the release stress target
-        run: cargo test --locked --release --test stress --no-run
-
-      - name: Prepare privileged release binary
-        if: runner.os != 'Windows'
-        shell: bash
-        run: .github/scripts/grant_raw_capability.sh "${{ matrix.app_source }}" "$TEST_APP_BIN"
-
-      - name: Execute exact release stress owner
-        run: cargo test --locked --release --test stress stress_test_ipv4 -- --exact --ignored --nocapture
+      - name: Run canonical release stress command plan
+        run: >-
+          python -m ci.pkthere_ci release-stress
+          --log release-stress.log
 
   aarch64-musl:
     name: Portable aarch64 musl artifact
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: aarch64-musl-cross
 
-      - name: Install pinned cross
+      - name: Run canonical AArch64 musl artifact plan
         run: >-
-          cargo install cross
-          --git https://github.com/cross-rs/cross
-          --rev 1d07d3f9cc465c435256f1aabc1d18024517891a
-          --locked
-
-      - name: Build and inspect aarch64 musl artifact
-        run: >-
-          python3 -m docker.alpine.portable_build aarch64
-          --backend cross
-          --evidence-dir cross-artifacts
-          --output cross-artifacts/alpine
+          python -m ci.pkthere_ci aarch64-musl
+          --log cross-artifacts/aarch64-musl.log
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -294,10 +289,8 @@ jobs:
     name: Alpine Privileged Socket Reality
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      PKTHERE_ALLOW_RAW_ICMP: 1
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@v1
@@ -305,20 +298,20 @@ jobs:
           toolchain: stable
           targets: x86_64-unknown-linux-musl
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: alpine-musl
 
-      - name: Install musl linker
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - uses: ./.github/actions/enable_icmp_ping
 
-      - name: Enable ICMP ping sockets
-        run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
-
-      - name: Build exact Alpine executables
+      - name: Run canonical x86_64 musl artifact plan
         run: >-
-          python3 -m docker.alpine.portable_build x86_64
-          --evidence-dir docker-artifacts
+          python -m ci.pkthere_ci alpine-build
+          --log docker-artifacts/alpine-build.log
 
       - uses: docker/setup-buildx-action@v4
 
@@ -334,7 +327,9 @@ jobs:
           cache-to: type=gha,mode=max,scope=alpine-reality
 
       - name: Run privileged Alpine profiles
-        run: python3 -m docker.alpine.ci all --artifact-dir docker-artifacts
+        run: >-
+          python -m ci.pkthere_ci alpine-runtime
+          --log docker-artifacts/alpine-runtime.log
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -342,3 +337,72 @@ jobs:
           name: alpine
           path: docker-artifacts
           if-no-files-found: error
+
+  freebsd:
+    name: FreeBSD ${{ matrix.release }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: .freebsd-cache/${{ matrix.release }}/cargo-home
+      CARGO_TARGET_DIR: .freebsd-cache/${{ matrix.release }}/target
+      PKTHERE_AUTHORITY_TARGET_DIR: .freebsd-cache/${{ matrix.release }}/authority-target
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14.4", "15.1"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Restore FreeBSD Cargo cache
+        id: freebsd-cargo-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .freebsd-cache/${{ matrix.release }}
+          key: >-
+            freebsd-${{ matrix.release }}-rust-v1-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            freebsd-${{ matrix.release }}-rust-v1-${{ hashFiles('Cargo.lock') }}-
+            freebsd-${{ matrix.release }}-rust-v1-
+
+      - name: Run canonical FreeBSD platform lifecycle
+        uses: vmactions/freebsd-vm@v1.5.2
+        with:
+          release: ${{ matrix.release }}
+          sync: rsync
+          copyback: true
+          cache-after-prepare: true
+          envs: CARGO_HOME CARGO_TARGET_DIR PKTHERE_AUTHORITY_TARGET_DIR
+          prepare: /bin/sh .github/scripts/prepare_freebsd_ci.sh v1
+          run: >-
+            python3.13 -m ci.pkthere_ci platform-ci-vm
+            --log freebsd-${{ matrix.release }}.log
+            --result freebsd-${{ matrix.release }}.result.json
+
+      - name: Save FreeBSD Cargo cache
+        if: always() && steps.freebsd-cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: .freebsd-cache/${{ matrix.release }}
+          key: >-
+            freebsd-${{ matrix.release }}-rust-v1-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+
+      - name: Upload FreeBSD socket reality evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: freebsd-${{ matrix.release }}
+          path: |
+            freebsd-${{ matrix.release }}.log
+            freebsd-${{ matrix.release }}.result.json
+          if-no-files-found: error
+
+      - name: Verify canonical FreeBSD platform result
+        if: always()
+        run: >-
+          python3 -m ci.pkthere_ci platform-ci-result
+          --log freebsd-${{ matrix.release }}-result-check.log
+          --result freebsd-${{ matrix.release }}.result.json

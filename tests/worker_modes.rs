@@ -1,4 +1,7 @@
-#[cfg(any(target_os = "linux", target_os = "android"))]
+use pkthere_socket_policy::{
+    ProtocolPolicyIntent, TimeoutAction, listener_worker_socket_policy,
+    resolve_listener_socket_policy_with_protocol_intent,
+};
 use pkthere_test_support::fixtures::MULTI_WORKER_CANDIDATE_PREFIX;
 use pkthere_test_support::fixtures::{
     MULTI_WORKER_FOLLOWUP_PAYLOAD, MULTI_WORKER_SHARED_PAYLOAD, MULTI_WORKER_TIMEOUT_SECS,
@@ -10,26 +13,32 @@ use pkthere_test_support::network::{
     UdpEchoServer, bind_udp_client, default_test_icmp_upstream_arg, localhost_addr,
     spawn_udp_multi_peer_echo_server, udp_listen_arg,
 };
-use pkthere_test_support::runtime_asserts::{
-    expect_session_stats_matching, recv_legitimate_echo_with_retry,
-};
+use pkthere_test_support::runtime_asserts::{assert_recv_payload, expect_session_stats_matching};
 use pkthere_test_support::timing::{CHILD_CLEANUP_WAIT, MAX_WAIT_SECS};
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use pkthere_test_support::timing::{CLIENT_WAIT_MS, TEST_POLL_INTERVAL};
 use pkthere_wire::SupportedProtocol;
 use socket2::Domain;
 use std::collections::HashSet;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io::ErrorKind;
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::net::{SocketAddr, UdpSocket};
-#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::thread;
 use std::time::Instant;
 
 const WORKER_PAIRS: usize = 3;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+const MULTI_WORKER_SYNC_PPS: u32 = 20;
 const FLOW_CANDIDATES: usize = 64;
+
+#[derive(Clone, Copy)]
+enum WorkerConnectionScenario {
+    ProductionPolicy,
+    ForcedUnconnectedDebug,
+}
+
+impl WorkerConnectionScenario {
+    const fn debug_client_unconnected(self) -> bool {
+        matches!(self, Self::ForcedUnconnectedDebug)
+    }
+}
 
 #[test]
 fn shared_flow_publishes_one_udp_flow_to_all_worker_pairs_ipv4_and_ipv6() {
@@ -39,10 +48,40 @@ fn shared_flow_publishes_one_udp_flow_to_all_worker_pairs_ipv4_and_ipv6() {
 }
 
 #[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn single_flow_distributes_distinct_udp_flows_across_all_worker_pairs_ipv4_and_ipv6() {
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "separate-flow worker distribution requires policy-authorized kernel flow affinity"
+)]
+fn single_flow_production_policy_distributes_distinct_udp_flows_across_worker_pairs() {
+    assert!(
+        listener_worker_socket_policy(WORKER_PAIRS, true).supports_requested_distribution(),
+        "selected platform must expose policy-authorized kernel flow affinity"
+    );
     for family in [Domain::IPV4, Domain::IPV6] {
-        run_single_flow_case(family, SupportedProtocol::UDP);
+        run_single_flow_case(
+            family,
+            SupportedProtocol::UDP,
+            WorkerConnectionScenario::ProductionPolicy,
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    ignore = "separate-flow worker distribution requires policy-authorized kernel flow affinity"
+)]
+fn single_flow_forced_unconnected_debug_scenario_distributes_distinct_udp_flows() {
+    assert!(
+        listener_worker_socket_policy(WORKER_PAIRS, true).supports_requested_distribution(),
+        "selected platform must expose policy-authorized kernel flow affinity"
+    );
+    for family in [Domain::IPV4, Domain::IPV6] {
+        run_single_flow_case(
+            family,
+            SupportedProtocol::UDP,
+            WorkerConnectionScenario::ForcedUnconnectedDebug,
+        );
     }
 }
 
@@ -52,7 +91,58 @@ fn single_flow_distributes_distinct_udp_flows_across_all_worker_pairs_ipv4_and_i
     ignore = "the target policy does not expose ICMP DGRAM echo sockets"
 )]
 fn shared_flow_shares_icmp_handshake_state_across_worker_pairs() {
+    assert!(
+        pkthere_test_support::runtime_capability::icmp_dgram_echo(),
+        "selected platform must expose the policy-authorized ICMP DGRAM path"
+    );
     run_shared_flow_case(Domain::IPV4, SupportedProtocol::ICMP);
+}
+
+#[test]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android", target_os = "macos")),
+    ignore = "the target policy does not expose ICMP DGRAM echo sockets"
+)]
+fn shared_flow_icmp_sync_uses_one_cross_worker_payload_slot() {
+    assert!(
+        pkthere_test_support::runtime_capability::icmp_dgram_echo(),
+        "selected platform must expose the policy-authorized ICMP DGRAM path"
+    );
+    let client = bind_udp_client(Domain::IPV4).expect("bind synchronized shared-flow client");
+    let (mut session, _upstream_echo) = launch_worker_forwarder_with_sync(
+        Domain::IPV4,
+        SupportedProtocol::ICMP,
+        "shared-flow",
+        Some(MULTI_WORKER_SYNC_PPS),
+    );
+    client
+        .connect(session.listen_addr)
+        .expect("connect synchronized shared-flow client");
+    client
+        .send(MULTI_WORKER_SHARED_PAYLOAD)
+        .expect("send synchronized shared-flow payload");
+
+    let mut buffer = [0_u8; 2048];
+    assert_recv_payload(
+        &session,
+        &client,
+        MULTI_WORKER_SHARED_PAYLOAD,
+        &mut buffer,
+        "shared-flow ICMP synchronization",
+    );
+
+    let stats = expect_session_stats_matching(
+        &mut session,
+        MAX_WAIT_SECS,
+        "synchronized shared-flow payload was not accounted exactly once",
+        |stats| {
+            stats["locked_worker_pairs"].as_u64() == Some(WORKER_PAIRS as u64)
+                && stats["c2u_pkts"].as_u64() == Some(1)
+                && stats["u2c_pkts"].as_u64() == Some(1)
+        },
+    );
+    assert_eq!(strict_worker_flows(&stats).len(), WORKER_PAIRS);
+    finish_worker_forwarder(session, "synchronized shared-flow forwarder");
 }
 
 fn run_shared_flow_case(family: Domain, proto: SupportedProtocol) {
@@ -66,14 +156,13 @@ fn run_shared_flow_case(family: Domain, proto: SupportedProtocol) {
     let mut buf = [0u8; 2048];
     for payload in [MULTI_WORKER_SHARED_PAYLOAD, MULTI_WORKER_FOLLOWUP_PAYLOAD] {
         client.send(payload).expect("send shared-flow payload");
-        recv_legitimate_echo_with_retry(
+        assert_recv_payload(
+            &session,
             &client,
             payload,
             &mut buf,
             &format!("shared-flow {family:?} {}", proto.to_str()),
-            "shared-flow echo",
-        )
-        .unwrap_or_else(|error| panic!("{error}\n{}", session.diagnostic_snapshot(80)));
+        );
     }
 
     let stats = expect_session_stats_matching(
@@ -89,11 +178,61 @@ fn run_shared_flow_case(family: Domain, proto: SupportedProtocol) {
     let flows = strict_worker_flows(&stats);
     assert_worker_slots(flows);
     assert_eq!(flows.len(), WORKER_PAIRS);
+    if proto == SupportedProtocol::ICMP {
+        let upstream_local_identities = flows
+            .iter()
+            .map(|flow| {
+                flow["upstream_local_filter"]
+                    .as_str()
+                    .expect("shared ICMP upstream local identity")
+            })
+            .collect::<HashSet<_>>();
+        let upstream_remote_identities = flows
+            .iter()
+            .map(|flow| {
+                flow["upstream_remote_filter"]
+                    .as_str()
+                    .expect("shared ICMP upstream remote identity")
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            upstream_local_identities.len(),
+            1,
+            "shared-flow ICMP workers must publish one upstream local identity: {stats}"
+        );
+        assert_eq!(
+            upstream_remote_identities.len(),
+            1,
+            "shared-flow ICMP workers must publish one upstream remote identity: {stats}"
+        );
+    }
     assert!(
         flows
             .iter()
             .all(|flow| flow["locked"].as_bool() == Some(true)),
         "shared-flow did not expose the lock through every worker pair: {stats}"
+    );
+    let listener_policy = resolve_listener_socket_policy_with_protocol_intent(
+        ProtocolPolicyIntent::Udp,
+        socket2::Type::DGRAM,
+        TimeoutAction::Exit,
+        false,
+        family,
+        listener_worker_socket_policy(WORKER_PAIRS, false),
+    );
+    let expected_connected_owner_count = usize::from(
+        listener_policy
+            .listener_lifecycle
+            .expect("shared listener lifecycle")
+            .connects_after_lock(),
+    );
+    assert_eq!(
+        flows
+            .iter()
+            .filter(|flow| flow["listener_connected"].as_bool() == Some(true))
+            .count(),
+        expected_connected_owner_count,
+        "shared-state listener owner count differs from independently resolved lifecycle: {stats}"
     );
     let expected_key = client_addr.to_string();
     let keys = flow_keys(flows);
@@ -110,9 +249,13 @@ fn run_shared_flow_case(family: Domain, proto: SupportedProtocol) {
     finish_worker_forwarder(session, "shared-flow forwarder");
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn run_single_flow_case(family: Domain, proto: SupportedProtocol) {
-    let (mut session, _upstream_echo) = launch_worker_forwarder(family, proto, "single-flow");
+fn run_single_flow_case(
+    family: Domain,
+    proto: SupportedProtocol,
+    connection_scenario: WorkerConnectionScenario,
+) {
+    let (mut session, _upstream_echo) =
+        launch_worker_forwarder_for_scenario(family, proto, "single-flow", connection_scenario);
     let mut candidates = make_flow_candidates(family, session.listen_addr);
     for candidate in &candidates {
         candidate
@@ -144,14 +287,13 @@ fn run_single_flow_case(family: Domain, proto: SupportedProtocol) {
             .send(MULTI_WORKER_FOLLOWUP_PAYLOAD)
             .expect("send single-flow follow-up");
         let mut buf = [0u8; 2048];
-        recv_legitimate_echo_with_retry(
+        assert_recv_payload(
+            &session,
             &candidate.socket,
             MULTI_WORKER_FOLLOWUP_PAYLOAD,
             &mut buf,
             &format!("single-flow {family:?} {}", proto.to_str()),
-            "single-flow follow-up echo",
-        )
-        .unwrap_or_else(|error| panic!("{error}\n{}", session.diagnostic_snapshot(80)));
+        );
     }
 
     let expected_packets = (WORKER_PAIRS * 2) as u64;
@@ -204,6 +346,51 @@ fn launch_worker_forwarder(
     proto: SupportedProtocol,
     worker_flow_mode: &str,
 ) -> (ForwarderSession, Option<UdpEchoServer>) {
+    launch_worker_forwarder_for_scenario(
+        family,
+        proto,
+        worker_flow_mode,
+        WorkerConnectionScenario::ProductionPolicy,
+    )
+}
+
+fn launch_worker_forwarder_for_scenario(
+    family: Domain,
+    proto: SupportedProtocol,
+    worker_flow_mode: &str,
+    connection_scenario: WorkerConnectionScenario,
+) -> (ForwarderSession, Option<UdpEchoServer>) {
+    launch_worker_forwarder_with_sync_and_scenario(
+        family,
+        proto,
+        worker_flow_mode,
+        None,
+        connection_scenario,
+    )
+}
+
+fn launch_worker_forwarder_with_sync(
+    family: Domain,
+    proto: SupportedProtocol,
+    worker_flow_mode: &str,
+    icmp_sync_pps: Option<u32>,
+) -> (ForwarderSession, Option<UdpEchoServer>) {
+    launch_worker_forwarder_with_sync_and_scenario(
+        family,
+        proto,
+        worker_flow_mode,
+        icmp_sync_pps,
+        WorkerConnectionScenario::ProductionPolicy,
+    )
+}
+
+fn launch_worker_forwarder_with_sync_and_scenario(
+    family: Domain,
+    proto: SupportedProtocol,
+    worker_flow_mode: &str,
+    icmp_sync_pps: Option<u32>,
+    connection_scenario: WorkerConnectionScenario,
+) -> (ForwarderSession, Option<UdpEchoServer>) {
     let (there, upstream_echo) = if proto == SupportedProtocol::ICMP {
         (
             default_test_icmp_upstream_arg(localhost_addr(family, 0).ip()),
@@ -221,7 +408,7 @@ fn launch_worker_forwarder(
     ];
     let session = launch_forwarder_with_extra_args(
         ForwarderConfig {
-            debug_client_unconnected: worker_flow_mode == "single-flow",
+            debug_client_unconnected: connection_scenario.debug_client_unconnected(),
             debug_upstream_unconnected: false,
             debug_icmp_kernel_echo_self_handshake: proto == SupportedProtocol::ICMP,
             debug_force_raw_icmp_wildcard_upstream: false,
@@ -236,7 +423,7 @@ fn launch_worker_forwarder(
             max_payload: None,
             fast_stats: true,
             stats_interval_mins: None,
-            icmp_sync_pps: None,
+            icmp_sync_pps,
             debug_logs: &["drops", "handshake", "handles"],
             diagnostic_label: Some("multi-worker forwarder"),
             icmp_handshake_timeout_secs: None,
@@ -246,14 +433,12 @@ fn launch_worker_forwarder(
     (session, upstream_echo)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 struct FlowCandidate {
     socket: UdpSocket,
     local_addr: SocketAddr,
     payload: Vec<u8>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn make_flow_candidates(family: Domain, destination: SocketAddr) -> Vec<FlowCandidate> {
     (0..FLOW_CANDIDATES)
         .map(|index| {
@@ -276,7 +461,6 @@ fn make_flow_candidates(family: Domain, destination: SocketAddr) -> Vec<FlowCand
         .collect()
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
 fn collect_candidate_replies(
     candidates: &mut [FlowCandidate],
     expected: usize,

@@ -6,18 +6,18 @@ import socket
 import threading
 import time
 
-from .command_runner import CommandResult, CommandRunner
-from .config import LOG_DIR, TOPOLOGY_VERIFIER, required, required_int
-from .processes import exec_forwarder, run, wait_for
-from .timing import (
+from ci.pkthere_ci.command_runner import CommandResult, CommandRunner
+from ci.pkthere_ci.timing import (
     DOCKER_CONTROL_TIMEOUT_SECONDS,
-    FLOW_REPLY_TIMEOUT_SECONDS,
     FLOW_RETRY_SECONDS,
     FORWARDER_NODE_TIMEOUT_SECONDS,
     HANDSHAKE_TIMEOUT_SECONDS,
     TOPOLOGY_EVENT_TIMEOUT_SECONDS,
     VERIFIER_TIMEOUT_SECONDS,
 )
+
+from .config import LOG_DIR, TOPOLOGY_VERIFIER, required, required_int
+from .processes import exec_forwarder, run, wait_for
 
 FLOW_DEADLINE_SECONDS = TOPOLOGY_EVENT_TIMEOUT_SECONDS
 RUNNER = CommandRunner()
@@ -95,22 +95,31 @@ def driver() -> None:
 
 def require_udp_echo(client: socket.socket, payload: bytes, context: str) -> None:
     deadline = time.monotonic() + FLOW_DEADLINE_SECONDS
-    last_reply: bytes | None = None
-    client.settimeout(FLOW_REPLY_TIMEOUT_SECONDS)
+    unexpected_replies: list[bytes] = []
+    client.setblocking(False)
+    while True:
+        try:
+            client.recvfrom(65_535)
+        except BlockingIOError:
+            break
+
+    client.sendto(
+        payload,
+        (required("NODE_A_IP"), required_int("CLIENT_UDP_PORT")),
+    )
     while time.monotonic() < deadline:
-        client.sendto(
-            payload,
-            (required("NODE_A_IP"), required_int("CLIENT_UDP_PORT")),
-        )
+        client.settimeout(max(0.0, deadline - time.monotonic()))
         try:
             reply, _ = client.recvfrom(65_535)
-            last_reply = reply
-            if reply == payload:
-                return
         except TimeoutError:
-            pass
-        time.sleep(FLOW_RETRY_SECONDS)
-    raise AssertionError(f"{context} returned {last_reply!r}, expected {payload!r}")
+            break
+        if reply == payload:
+            return
+        unexpected_replies.append(reply)
+    raise AssertionError(
+        f"{context} did not return {payload!r}; "
+        f"unexpected replies={unexpected_replies[-8:]!r}"
+    )
 
 
 def blackhole() -> None:

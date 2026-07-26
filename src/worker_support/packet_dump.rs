@@ -1,41 +1,128 @@
+mod diagnostic_store;
+mod formatting;
+
 use super::packet_admission::{
-    AdmittedWirePacket, PeerSourceRequirement, ReceiveContext, RejectionReason, SocketLeg,
-    WirePacketAdmission, admit_wire_packet_with_parsed,
+    PeerSourceRequirement, ReceiveContext, RejectionReason, TransportAdmission,
+    WirePacketAdmission, admit_network_layer, admit_packet_with_parsed, admit_transport_packet,
+    transport_requires_authenticated_work,
 };
-use crate::cli::{RuntimeConfig, SupportedProtocol};
-use crate::endpoint::LogicalEndpoint;
-use crate::flow_key::{ClientFlowKey, FlowTuple};
-use crate::net::packet_headers::{ParsedIcmpEcho, ParsedPacketHeaders, ParsedTransport};
-use crate::net::payload::PayloadEvent;
+use crate::cli::RuntimeConfig;
+use crate::diagnostics::PacketTraceId;
+use crate::net::packet_headers::{
+    IpMalformedReason, IpUnsupportedReason, NetworkParseOutcome, ParsedIcmpEcho,
+    ParsedNetworkLayer, ParsedPacketHeaders, ParsedTransport,
+};
 use crate::net::sock_mgr::SocketEvidenceKey;
-use crate::packet_trace::PacketTraceId;
-use serde_json::{Value, json};
-use socket2::{SockAddr, Type};
-use std::fmt::Write;
+use diagnostic_store::{
+    DiagnosticClass, begin_trace_output, finish_trace_output, take_any_completed_trace,
+    take_completed_trace,
+};
+use formatting::{
+    client_flow_key_string, flow_endpoint_string, flow_tuple_string, ip_version,
+    network_layer_name, payload_event_kind, protocol_name, role_name, socket_type_name,
+    transport_name,
+};
+use serde_json::Value;
+use std::net::SocketAddr;
+use std::time::Instant;
 
 const PACKET_DUMP_HEX_LIMIT: usize = 2048;
 
+#[derive(Clone, Copy)]
+struct PacketDumpContext {
+    role: super::packet_admission::SocketLeg,
+    proto: crate::cli::SupportedProtocol,
+    sock_type: socket2::Type,
+    parser: crate::net::packet_headers::ReceiveParserKernel,
+    receive_syscall: pkthere_socket_policy::ReceiveSyscall,
+    connected: bool,
+    peer_source: PeerSourceRequirement,
+    socket_is_ipv4: bool,
+    can_honor_disjoint_icmp_ids: bool,
+    allow_debug_kernel_echo_self_handshake: bool,
+    local_filter: crate::endpoint::LogicalEndpoint,
+    evidence_key: SocketEvidenceKey,
+    expected_inbound: Option<crate::flow_key::FlowTuple>,
+    expected_local: Option<crate::endpoint::LogicalEndpoint>,
+    expected_remote: Option<crate::endpoint::LogicalEndpoint>,
+    locked_flow: Option<crate::flow_key::ClientFlowKey>,
+}
+
+impl PacketDumpContext {
+    fn capture(spec: ReceiveContext<'_>) -> Self {
+        Self {
+            role: spec.socket.role,
+            proto: spec.socket.proto,
+            sock_type: spec.socket.sock_type,
+            parser: spec.socket.parser,
+            receive_syscall: spec.socket.policy.receive_syscall(spec.socket.connected),
+            connected: spec.socket.connected,
+            peer_source: spec.socket.evidence_policy().peer_source,
+            socket_is_ipv4: spec.socket.socket_is_ipv4(),
+            can_honor_disjoint_icmp_ids: spec.socket.can_honor_disjoint_icmp_ids(),
+            allow_debug_kernel_echo_self_handshake: spec
+                .socket
+                .allow_debug_kernel_echo_self_handshake(),
+            local_filter: spec.socket.local_filter,
+            evidence_key: spec.socket.evidence_key,
+            expected_inbound: spec.admission.expected_inbound,
+            expected_local: spec.admission.expected_local,
+            expected_remote: spec.expected_remote(),
+            locked_flow: spec.admission.locked_flow,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PacketDumpCandidate {
+    flow_key: crate::flow_key::ClientFlowKey,
+    listener_flow_inbound: Option<crate::flow_key::FlowTuple>,
+    listener_flow_outbound: Option<crate::flow_key::FlowTuple>,
+}
+
+impl PacketDumpCandidate {
+    fn capture(candidate: crate::flow_state::PendingIcmpClientLock) -> Self {
+        Self {
+            flow_key: candidate.flow_key,
+            listener_flow_inbound: candidate.listener_flow.inbound,
+            listener_flow_outbound: candidate.listener_flow.outbound,
+        }
+    }
+}
+
 enum PacketParseRecord<'a> {
     Parsed(&'a ParsedPacketHeaders),
-    Malformed {
-        transport: ParsedTransport,
-        icmp_reason: Option<crate::net::packet_headers::IcmpMalformedReason>,
-    },
-    ReceiveNoise {
-        transport: ParsedTransport,
-    },
+    MalformedNetwork(IpMalformedReason),
+    UnsupportedNetwork(IpUnsupportedReason),
+    UnexpectedNetworkVersion,
+    MalformedTransport(Option<crate::net::packet_headers::IcmpMalformedReason>),
+    ReceiveNoise { transport: ParsedTransport },
 }
 
 impl<'a> From<&'a ParsedPacketHeaders> for PacketParseRecord<'a> {
     fn from(parsed: &'a ParsedPacketHeaders) -> Self {
+        match parsed.network {
+            ParsedNetworkLayer::Malformed(reason) => return Self::MalformedNetwork(reason),
+            ParsedNetworkLayer::Unsupported { reason, .. } => {
+                return Self::UnsupportedNetwork(reason);
+            }
+            ParsedNetworkLayer::UnexpectedVersion { .. } => {
+                return Self::UnexpectedNetworkVersion;
+            }
+            ParsedNetworkLayer::NotPresent | ParsedNetworkLayer::Valid(_) => {}
+        }
         match parsed.transport {
-            ParsedTransport::Malformed => Self::Malformed {
-                transport: parsed.transport,
-                icmp_reason: parsed.icmp_malformed_reason,
-            },
-            ParsedTransport::Unsupported => Self::ReceiveNoise {
+            ParsedTransport::NotParsed => Self::ReceiveNoise {
                 transport: parsed.transport,
             },
+            ParsedTransport::MalformedIcmp => {
+                Self::MalformedTransport(parsed.icmp_malformed_reason)
+            }
+            ParsedTransport::UnrelatedProtocol | ParsedTransport::UnrelatedIcmp => {
+                Self::ReceiveNoise {
+                    transport: parsed.transport,
+                }
+            }
             _ => Self::Parsed(parsed),
         }
     }
@@ -46,51 +133,329 @@ struct PacketDumpRecord<'a> {
     worker_id: usize,
     c2u: bool,
     packet_id: u64,
-    spec: ReceiveContext,
+    context: PacketDumpContext,
     bytes: &'a [u8],
-    socket_source: Option<&'a SockAddr>,
-    parsed: &'a ParsedPacketHeaders,
+    socket_source: Option<SocketAddr>,
+    parsed: ParsedPacketHeaders,
+    include_detail: bool,
+}
+
+#[derive(Clone, Copy)]
+struct AcceptedPacketDump {
+    normalized_source: Option<crate::endpoint::LogicalEndpoint>,
+    event_kind: &'static str,
+    payload_len: usize,
+    icmp: Option<PacketDumpIcmp>,
+    lock_candidate: Option<PacketDumpCandidate>,
+    pending_negotiation: Option<PacketDumpCandidate>,
+}
+
+#[derive(Clone, Copy)]
+struct PacketDumpIcmp {
+    remote_source_id: u16,
+    inbound_header_ident: u16,
+    sequence: u16,
+    session_id: u64,
+    advertised_reply_id: Option<u16>,
+    negotiates_reply_id: bool,
+    acknowledges_reply_id: bool,
+}
+
+impl PacketDumpIcmp {
+    fn capture(meta: crate::net::payload::IcmpPayloadMeta) -> Self {
+        Self {
+            remote_source_id: meta.flow_identity().remote_source_id(),
+            inbound_header_ident: meta.inbound_header_ident(),
+            sequence: meta.seq(),
+            session_id: meta.session_id().get(),
+            advertised_reply_id: meta.advertised_reply_id(),
+            negotiates_reply_id: meta.negotiates_reply_id(),
+            acknowledges_reply_id: meta.acknowledges_reply_id(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PacketAdmissionKind {
+    Accepted,
+    ReceiveNoise,
+    Filtered,
+}
+
+#[derive(Clone, Copy)]
+struct PacketAdmissionSummary {
+    kind: PacketAdmissionKind,
+    accepted: Option<AcceptedPacketDump>,
+    receive_noise: Option<super::packet_admission::ReceiveNoiseReason>,
+    filtered: Option<super::packet_admission::RejectedPacket>,
+}
+
+impl PacketAdmissionSummary {
+    fn capture(admission: &WirePacketAdmission<'_>) -> Self {
+        match admission {
+            Ok(admitted) => Self {
+                kind: PacketAdmissionKind::Accepted,
+                accepted: Some(AcceptedPacketDump {
+                    normalized_source: admitted.normalized_source,
+                    event_kind: payload_event_kind(&admitted.event),
+                    payload_len: admitted.event.payload_len(),
+                    icmp: admitted
+                        .event
+                        .icmp_meta()
+                        .copied()
+                        .map(PacketDumpIcmp::capture),
+                    lock_candidate: admitted.lock_candidate().map(PacketDumpCandidate::capture),
+                    pending_negotiation: admitted
+                        .pending_negotiation()
+                        .map(PacketDumpCandidate::capture),
+                }),
+                receive_noise: None,
+                filtered: None,
+            },
+            Err(crate::worker_support::packet_admission::WirePacketRejection::ReceiveNoise(
+                reason,
+            )) => Self {
+                kind: PacketAdmissionKind::ReceiveNoise,
+                accepted: None,
+                receive_noise: Some(*reason),
+                filtered: None,
+            },
+            Err(crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                rejected,
+            )) => Self {
+                kind: PacketAdmissionKind::Filtered,
+                accepted: None,
+                receive_noise: None,
+                filtered: Some(*rejected),
+            },
+        }
+    }
+}
+
+pub(crate) struct DeferredPacketDump<'a> {
+    record: PacketDumpRecord<'a>,
+    admission: PacketAdmissionSummary,
+}
+
+impl DeferredPacketDump<'_> {
+    pub(crate) const fn trace(&self) -> PacketTraceId {
+        PacketTraceId {
+            worker_id: self.record.worker_id,
+            c2u: self.record.c2u,
+            packet_id: self.record.packet_id,
+        }
+    }
+
+    pub(crate) fn emit(self, cfg: &RuntimeConfig) {
+        {
+            let _json_scope = crate::authority::AuditedOperationScope::enter(
+                crate::authority::OperationId::JsonSerialization,
+            )
+            .unwrap_or_else(|error| {
+                crate::runtime_support::fatal_invariant_or_shutdown(format_args!(
+                    "packet diagnostic JSON scope conflicted with packet authority: {error}"
+                ))
+            });
+            log_packet_dump_received(cfg, self.record);
+            log_packet_dump_admission(cfg, self.record, self.admission);
+        }
+        emit_completed_trace(
+            self.record.worker_id,
+            self.record.c2u,
+            self.record.packet_id,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PacketDumpAdmissionContext<'a, 'snapshot> {
+    pub(crate) cfg: &'a RuntimeConfig,
+    pub(crate) trace: PacketTraceId,
+    pub(crate) spec: ReceiveContext<'snapshot>,
+    pub(crate) received_at: Instant,
 }
 
 pub(crate) fn admit_received_packet_with_dump<'a>(
-    cfg: &RuntimeConfig,
-    trace: PacketTraceId,
-    spec: ReceiveContext,
+    context: PacketDumpAdmissionContext<'_, '_>,
     bytes: &'a [u8],
-    socket_source: Option<&SockAddr>,
-) -> WirePacketAdmission<'a> {
+    socket_source: Option<SocketAddr>,
+    authenticated_frame_budget: &mut super::work_budget::AuthenticatedFrameBudget,
+    packet_dump_detail_budget: &mut super::work_budget::PacketDumpDetailBudget,
+) -> ReceivedPacketAdmission<'a> {
+    let PacketDumpAdmissionContext {
+        cfg,
+        trace,
+        spec,
+        received_at,
+    } = context;
+    let c2u = trace.c2u;
+    let network = spec.socket.parser.parse_network(bytes);
+    let network_layer = match network {
+        NetworkParseOutcome::NotPresent => ParsedNetworkLayer::NotPresent,
+        NetworkParseOutcome::Valid(validated) => ParsedNetworkLayer::Valid(validated.header),
+        NetworkParseOutcome::Rejected(layer) => layer,
+    };
+    let network_admission = admit_network_layer(spec, network_layer);
+    let parsed = match network_admission {
+        Some(_) => ParsedPacketHeaders::network_only(network_layer),
+        None => spec.socket.parser.parse_transport(bytes, network),
+    };
+    let (mut admission, authenticated_work_charged): (WirePacketAdmission<'_>, bool) =
+        match network_admission {
+            Some(TransportAdmission::Filtered(rejected)) => (
+                Err(
+                    crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                        rejected,
+                    ),
+                ),
+                false,
+            ),
+            Some(TransportAdmission::ReceiveNoise(reason)) => (
+                Err(
+                    crate::worker_support::packet_admission::WirePacketRejection::ReceiveNoise(
+                        reason,
+                    ),
+                ),
+                false,
+            ),
+            Some(TransportAdmission::Accepted(_)) => {
+                crate::runtime_support::publish_process_fatal(format_args!(
+                    "network-layer admission returned an accepted transport outcome"
+                ));
+                return ReceivedPacketAdmission {
+                    admission: None,
+                    authenticated_work_charged: false,
+                    deferred_dump: None,
+                };
+            }
+            None => match admit_packet_with_parsed(spec, bytes, socket_source, &parsed) {
+                TransportAdmission::Accepted(transport) => {
+                    let charge = transport_requires_authenticated_work(spec, &transport);
+                    if charge && !authenticated_frame_budget.take(received_at) {
+                        return ReceivedPacketAdmission {
+                            admission: None,
+                            authenticated_work_charged: false,
+                            deferred_dump: None,
+                        };
+                    }
+                    let mut admission = admit_transport_packet(c2u, cfg, spec, transport);
+                    if let Ok(admitted) = &mut admission {
+                        admitted.trace = Some(trace);
+                    }
+                    let diagnostic_class = match &admission {
+                    Ok(_) => DiagnosticClass::Accepted,
+                    Err(crate::worker_support::packet_admission::WirePacketRejection::ReceiveNoise(_)) => DiagnosticClass::ReceiveNoise,
+                    Err(crate::worker_support::packet_admission::WirePacketRejection::Filtered(_)) => DiagnosticClass::Filtered,
+                };
+                    let deferred_dump = deferred_packet_dump(
+                        context,
+                        bytes,
+                        socket_source,
+                        parsed,
+                        &admission,
+                        diagnostic_class,
+                        packet_dump_detail_budget,
+                    );
+                    return ReceivedPacketAdmission {
+                        admission: Some(admission),
+                        authenticated_work_charged: charge,
+                        deferred_dump,
+                    };
+                }
+                TransportAdmission::Filtered(rejected) => (
+                    Err(
+                        crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                            rejected,
+                        ),
+                    ),
+                    false,
+                ),
+                TransportAdmission::ReceiveNoise(reason) => (
+                    Err(
+                        crate::worker_support::packet_admission::WirePacketRejection::ReceiveNoise(
+                            reason,
+                        ),
+                    ),
+                    false,
+                ),
+            },
+        };
+    if let Ok(admitted) = &mut admission {
+        admitted.trace = Some(trace);
+    }
+    let diagnostic_class = match &admission {
+        Ok(_) => DiagnosticClass::Accepted,
+        Err(crate::worker_support::packet_admission::WirePacketRejection::ReceiveNoise(_)) => {
+            DiagnosticClass::ReceiveNoise
+        }
+        Err(crate::worker_support::packet_admission::WirePacketRejection::Filtered(_)) => {
+            DiagnosticClass::Filtered
+        }
+    };
+    let deferred_dump = deferred_packet_dump(
+        context,
+        bytes,
+        socket_source,
+        parsed,
+        &admission,
+        diagnostic_class,
+        packet_dump_detail_budget,
+    );
+    ReceivedPacketAdmission {
+        admission: Some(admission),
+        authenticated_work_charged,
+        deferred_dump,
+    }
+}
+
+#[inline]
+fn deferred_packet_dump<'a>(
+    context: PacketDumpAdmissionContext<'_, '_>,
+    bytes: &'a [u8],
+    socket_source: Option<SocketAddr>,
+    parsed: ParsedPacketHeaders,
+    admission: &WirePacketAdmission<'_>,
+    diagnostic_class: DiagnosticClass,
+    packet_dump_detail_budget: &mut super::work_budget::PacketDumpDetailBudget,
+) -> Option<DeferredPacketDump<'a>> {
+    if !context.cfg.debug_logs.packet_dump
+        || !begin_trace_output(context.trace, diagnostic_class, context.received_at)
+    {
+        return None;
+    }
     let PacketTraceId {
         worker_id,
         c2u,
         packet_id,
-    } = trace;
-    let parsed = spec.socket.parser.parse(bytes);
-    let record = PacketDumpRecord {
-        worker_id,
-        c2u,
-        packet_id,
-        spec,
-        bytes,
-        socket_source,
-        parsed: &parsed,
+    } = context.trace;
+    let detail_class = match diagnostic_class {
+        DiagnosticClass::Accepted => super::work_budget::PacketDumpDetailClass::Accepted,
+        DiagnosticClass::Filtered => super::work_budget::PacketDumpDetailClass::Filtered,
+        DiagnosticClass::ReceiveNoise => super::work_budget::PacketDumpDetailClass::ReceiveNoise,
     };
-    log_packet_dump_received(cfg, record);
-    let mut admission =
-        admit_wire_packet_with_parsed(c2u, cfg, spec, bytes, socket_source, &parsed);
-    if let WirePacketAdmission::Accepted(admitted) = &mut admission {
-        admitted.trace = Some(trace);
-    }
-    log_packet_dump_admission(cfg, record, &admission);
-    match &admission {
-        WirePacketAdmission::Accepted(_) => {}
-        WirePacketAdmission::ReceiveNoise(_) => {
-            log_packet_disposition(cfg, trace, PacketDisposition::ReceiveNoise);
-        }
-        WirePacketAdmission::Filtered(_) => {
-            log_packet_disposition(cfg, trace, PacketDisposition::Filtered);
-        }
-    }
-    admission
+    Some(DeferredPacketDump {
+        record: PacketDumpRecord {
+            worker_id,
+            c2u,
+            packet_id,
+            context: PacketDumpContext::capture(context.spec),
+            bytes,
+            socket_source,
+            parsed,
+            include_detail: packet_dump_detail_budget.take(detail_class, context.received_at),
+        },
+        admission: PacketAdmissionSummary::capture(admission),
+    })
+}
+
+pub(crate) struct ReceivedPacketAdmission<'a> {
+    pub(crate) admission: Option<WirePacketAdmission<'a>>,
+    pub(crate) authenticated_work_charged: bool,
+    pub(crate) deferred_dump: Option<DeferredPacketDump<'a>>,
+}
+
+pub(crate) fn configure_packet_diagnostics(worker_threads: usize) -> std::io::Result<()> {
+    diagnostic_store::configure(worker_threads)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,9 +463,11 @@ pub(crate) enum PacketDisposition {
     Forwarded,
     SendFailed,
     DropDuplicate,
+    DropRateLimited,
     DropHandshakePending,
     DropSyncReplaced,
     DropFlowConflict,
+    DropStaleAuthority,
     DropSyncInvalid,
     DropNoActiveFlow,
     ConsumeCadence,
@@ -114,13 +481,16 @@ pub(crate) enum PacketDisposition {
 }
 
 impl PacketDisposition {
-    pub(crate) const ALL: [Self; 16] = [
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 18] = [
         Self::Forwarded,
         Self::SendFailed,
         Self::DropDuplicate,
+        Self::DropRateLimited,
         Self::DropHandshakePending,
         Self::DropSyncReplaced,
         Self::DropFlowConflict,
+        Self::DropStaleAuthority,
         Self::DropSyncInvalid,
         Self::DropNoActiveFlow,
         Self::ConsumeCadence,
@@ -135,14 +505,15 @@ impl PacketDisposition {
 
     #[inline]
     pub(crate) fn as_str(self) -> &'static str {
-        debug_assert!(Self::ALL.contains(&self));
         match self {
             Self::Forwarded => "forwarded",
             Self::SendFailed => "send-failed",
             Self::DropDuplicate => "drop-duplicate",
+            Self::DropRateLimited => "drop-rate-limited",
             Self::DropHandshakePending => "drop-handshake-pending",
             Self::DropSyncReplaced => "drop-sync-replaced",
             Self::DropFlowConflict => "drop-flow-conflict",
+            Self::DropStaleAuthority => "drop-stale-authority",
             Self::DropSyncInvalid => "drop-sync-invalid",
             Self::DropNoActiveFlow => "drop-no-active-flow",
             Self::ConsumeCadence => "consume-cadence",
@@ -183,13 +554,29 @@ fn log_packet_disposition_with_retry(
     if !cfg.debug_logs.packet_dump {
         return;
     }
-    let disposition = disposition.as_str();
+    finish_trace_output(trace, disposition, retried_unconnected);
+}
+
+fn emit_completed_trace(worker_id: usize, c2u: bool, packet_id: u64) {
+    let trace = PacketTraceId {
+        worker_id,
+        c2u,
+        packet_id,
+    };
+    let Some(completed) = take_completed_trace(trace) else {
+        return;
+    };
+    emit_completed_disposition(completed);
+}
+
+fn emit_completed_disposition(completed: diagnostic_store::CompletedPacketDisposition) {
+    let disposition = completed.disposition.as_str();
     let PacketTraceId {
         worker_id,
         c2u,
         packet_id,
-    } = trace;
-    let mut value = json!({
+    } = completed.trace;
+    let mut value = audited_json!({
         "event": "packet_dump",
         "stage": "disposition",
         "worker": worker_id,
@@ -197,27 +584,59 @@ fn log_packet_disposition_with_retry(
         "packet_id": packet_id,
         "disposition": disposition,
     });
-    if let Some(retried_unconnected) = retried_unconnected {
+    if let Some(retried_unconnected) = completed.retried_unconnected {
         value["send_retry_unconnected"] = retried_unconnected.into();
     }
     log_packet_dump_line(worker_id, c2u, value);
 }
 
+pub(crate) fn flush_completed_packet_diagnostics(cfg: &RuntimeConfig, worker_id: usize) {
+    if !cfg.debug_logs.packet_dump {
+        return;
+    }
+    while let Some(completed) = take_any_completed_trace(worker_id) {
+        let _json_scope = crate::authority::AuditedOperationScope::enter(
+            crate::authority::OperationId::JsonSerialization,
+        )
+        .unwrap_or_else(|error| {
+            crate::runtime_support::fatal_invariant_or_shutdown(format_args!(
+                "completed packet diagnostic JSON scope conflicted with packet authority: {error}"
+            ))
+        });
+        emit_completed_disposition(completed);
+    }
+}
+
 #[cfg(test)]
-#[path = "packet_dump/disposition_tests.rs"]
 mod disposition_tests;
 
 fn log_packet_dump_received(cfg: &RuntimeConfig, record: PacketDumpRecord<'_>) {
     if !cfg.debug_logs.packet_dump {
         return;
     }
+    if !record.include_detail {
+        log_packet_dump_line(
+            record.worker_id,
+            record.c2u,
+            audited_json!({
+                "event": "packet_dump",
+                "stage": "received",
+                "worker": record.worker_id,
+                "direction": if record.c2u { "c2u" } else { "u2c" },
+                "packet_id": record.packet_id,
+                "captured_length": record.bytes.len(),
+                "detail_suppressed": true,
+            }),
+        );
+        return;
+    }
     let mut obj = base_packet_dump_json("received", record);
     let (hex, truncated) = bounded_hex(record.bytes);
-    obj["receive"] = json!({
+    obj["receive"] = audited_json!({
         "len": record.bytes.len(),
-        "socket_source": record.socket_source.and_then(socket_source_string),
+        "socket_source": record.socket_source.map(|source| source.to_string()),
     });
-    obj["packet"] = json!({
+    obj["packet"] = audited_json!({
         "original_len": record.bytes.len(),
         "hex": hex,
         "truncated": truncated,
@@ -229,16 +648,59 @@ fn log_packet_dump_received(cfg: &RuntimeConfig, record: PacketDumpRecord<'_>) {
 fn log_packet_dump_admission(
     cfg: &RuntimeConfig,
     record: PacketDumpRecord<'_>,
-    admission: &WirePacketAdmission<'_>,
+    admission: PacketAdmissionSummary,
 ) {
     if !cfg.debug_logs.packet_dump {
         return;
     }
+    if !record.include_detail {
+        log_packet_dump_line(
+            record.worker_id,
+            record.c2u,
+            compact_packet_admission_json(record, admission),
+        );
+        return;
+    }
     let mut obj = base_packet_dump_json("admission", record);
-    obj["parser_kernel"] = record.spec.socket.parser.name().into();
-    obj["parse"] = packet_parse_record_json(record.parsed);
+    obj["parser_kernel"] = record.context.parser.name().into();
+    obj["parse"] = packet_parse_record_json(&record.parsed);
     obj["admission"] = admission_json(admission);
     log_packet_dump_line(record.worker_id, record.c2u, obj);
+}
+
+fn compact_packet_admission_json(
+    record: PacketDumpRecord<'_>,
+    admission: PacketAdmissionSummary,
+) -> Value {
+    let (result, reason) = match admission.kind {
+        PacketAdmissionKind::Accepted => ("accepted", None),
+        PacketAdmissionKind::ReceiveNoise => ("receive-noise", None),
+        PacketAdmissionKind::Filtered => (
+            "filtered",
+            admission
+                .filtered
+                .map(|rejected| rejection_reason_name(rejected.reason)),
+        ),
+    };
+    audited_json!({
+        "event": "packet_dump",
+        "stage": "admission",
+        "worker": record.worker_id,
+        "direction": if record.c2u { "c2u" } else { "u2c" },
+        "packet_id": record.packet_id,
+        "admission": {
+            "result": result,
+            "reason": reason,
+        },
+        // Identity fields are correlation evidence, not an expensive packet
+        // snapshot. Preserve them when hex/detail output is suppressed so
+        // interface-global capture noise cannot hide an accepted RAW packet.
+        "parse": packet_parse_record_json(&record.parsed),
+        "socket": {
+            "evidence_key": socket_evidence_key_json(record.context.evidence_key),
+        },
+        "detail_suppressed": true,
+    })
 }
 
 fn log_packet_dump_line(worker_id: usize, c2u: bool, obj: Value) {
@@ -256,63 +718,71 @@ fn base_packet_dump_json(stage: &'static str, record: PacketDumpRecord<'_>) -> V
         worker_id,
         c2u,
         packet_id,
-        spec,
+        context,
         bytes: _,
         socket_source: _,
         parsed: _,
+        include_detail: _,
     } = record;
-    json!({
+    audited_json!({
         "event": "packet_dump",
         "stage": stage,
         "worker": worker_id,
         "direction": if c2u { "c2u" } else { "u2c" },
         "packet_id": packet_id,
-        "role": role_name(spec.socket.role),
+        "role": role_name(context.role),
         "socket": {
-            "protocol": protocol_name(spec.socket.proto),
-            "socket_type": socket_type_name(spec.socket.sock_type),
-            "ip_version": format!("{:?}", spec.socket.parser.version()),
-            "receive_header": format!("{:?}", spec.socket.parser.mode()),
-            "receive_syscall": match spec.socket.policy.receive_syscall(spec.socket.connected) {
+            "protocol": protocol_name(context.proto),
+            "socket_type": socket_type_name(context.sock_type),
+            "ip_version": format!("{:?}", context.parser.version()),
+            "receive_header": format!("{:?}", context.parser.mode()),
+            "receive_syscall": match context.receive_syscall {
                 pkthere_socket_policy::ReceiveSyscall::Recv => "recv",
                 pkthere_socket_policy::ReceiveSyscall::RecvFrom => "recv_from",
             },
-            "connected": spec.socket.connected,
-            "source_evidence": match spec.socket.evidence_policy().peer_source {
+            "connected": context.connected,
+            "source_evidence": match context.peer_source {
                 PeerSourceRequirement::ConnectedKernel => "ConnectedKernelFiltering",
                 PeerSourceRequirement::SourceMetadata => "SourceMetadata",
                 PeerSourceRequirement::RawPacketHeader => "RawPacketSource",
             },
-            "socket_is_ipv4": spec.socket.socket_is_ipv4(),
-            "can_honor_disjoint_icmp_ids": spec.socket.can_honor_disjoint_icmp_ids(),
-            "allow_debug_kernel_echo_self_handshake": spec.socket.allow_debug_kernel_echo_self_handshake(),
-            "local_filter": spec.socket.local_filter.to_string(),
-            "local_kernel_addr": spec.socket.local_kernel_addr.to_string(),
-            "evidence_key": socket_evidence_key_json(spec.socket.evidence_key),
-            "remote_filter": spec.expected_remote().map(|remote| remote.to_string()),
-            "expected_inbound": spec.admission.expected_inbound.map(flow_tuple_string),
-            "expected_local": spec.admission.expected_local.map(flow_endpoint_string),
-            "expected_remote": spec.expected_remote().map(|remote| remote.to_string()),
-            "locked_flow": spec.admission.locked_flow.map(client_flow_key_string),
+            "socket_is_ipv4": context.socket_is_ipv4,
+            "can_honor_disjoint_icmp_ids": context.can_honor_disjoint_icmp_ids,
+            "allow_debug_kernel_echo_self_handshake": context.allow_debug_kernel_echo_self_handshake,
+            "local_filter": context.local_filter.to_string(),
+            "evidence_key": socket_evidence_key_json(context.evidence_key),
+            "expected_inbound": context.expected_inbound.map(flow_tuple_string),
+            "expected_local": context.expected_local.map(flow_endpoint_string),
+            "expected_remote": context.expected_remote.map(|remote| remote.to_string()),
+            "locked_flow": context.locked_flow.map(client_flow_key_string),
         },
     })
 }
 
 fn packet_parse_record_json(parsed: &ParsedPacketHeaders) -> Value {
     match PacketParseRecord::from(parsed) {
-        PacketParseRecord::Malformed {
-            transport,
-            icmp_reason,
-        } => json!({
-            "kind": "malformed",
-            "transport": transport_name(transport),
+        PacketParseRecord::MalformedNetwork(reason) => audited_json!({
+            "kind": "malformed-network",
+            "network_reason": format!("{reason:?}"),
+        }),
+        PacketParseRecord::UnsupportedNetwork(reason) => audited_json!({
+            "kind": "unsupported-network",
+            "network_reason": format!("{reason:?}"),
+        }),
+        PacketParseRecord::UnexpectedNetworkVersion => audited_json!({
+            "kind": "receive-noise",
+            "network_reason": "UnexpectedVersion",
+        }),
+        PacketParseRecord::MalformedTransport(icmp_reason) => audited_json!({
+            "kind": "malformed-transport",
+            "transport": transport_name(parsed.transport),
             "icmp_reason": icmp_reason.map(|reason| format!("{reason:?}")),
         }),
-        PacketParseRecord::ReceiveNoise { transport } => json!({
+        PacketParseRecord::ReceiveNoise { transport } => audited_json!({
             "kind": "receive-noise",
             "transport": transport_name(transport),
         }),
-        PacketParseRecord::Parsed(parsed) => json!({
+        PacketParseRecord::Parsed(parsed) => audited_json!({
             "kind": "parsed",
             "headers": parsed_headers_json(parsed),
         }),
@@ -320,7 +790,7 @@ fn packet_parse_record_json(parsed: &ParsedPacketHeaders) -> Value {
 }
 
 fn socket_evidence_key_json(key: SocketEvidenceKey) -> Value {
-    json!({
+    audited_json!({
         "process_id": key.process_id,
         "role": match key.role {
             pkthere_socket_policy::SocketRole::Listener => "listener",
@@ -338,60 +808,80 @@ fn socket_evidence_key_json(key: SocketEvidenceKey) -> Value {
     })
 }
 
-fn admission_json(admission: &WirePacketAdmission<'_>) -> Value {
-    match admission {
-        WirePacketAdmission::Accepted(admitted) => accepted_json(admitted),
-        WirePacketAdmission::ReceiveNoise(reason) => json!({
+fn admission_json(admission: PacketAdmissionSummary) -> Value {
+    match admission.kind {
+        PacketAdmissionKind::Accepted => admission.accepted.map_or_else(
+            || audited_json!({"result": "invalid-diagnostic-state"}),
+            accepted_json,
+        ),
+        PacketAdmissionKind::ReceiveNoise => audited_json!({
             "result": "receive-noise",
-            "reason": match reason {
-                super::packet_admission::ReceiveNoiseReason::UnexpectedEchoDirection => "UnexpectedEchoDirection",
-            },
+            "reason": admission.receive_noise.map(receive_noise_reason_name),
         }),
-        WirePacketAdmission::Filtered(rejected) => json!({
+        PacketAdmissionKind::Filtered => admission.filtered.map_or_else(
+            || audited_json!({"result": "invalid-diagnostic-state"}),
+            |rejected| audited_json!({
             "result": "filtered",
             "reason": rejection_reason_name(rejected.reason),
             "malformed_reason": malformed_reason_name(rejected.reason),
             "normalized_source": rejected.normalized_source.map(|source| source.to_string()),
             "actual_dst_id": rejected.actual_dst_id,
-        }),
+        })),
     }
 }
 
-fn accepted_json(admitted: &AdmittedWirePacket<'_>) -> Value {
-    let event = &admitted.event;
-    json!({
+fn receive_noise_reason_name(reason: super::packet_admission::ReceiveNoiseReason) -> &'static str {
+    match reason {
+        super::packet_admission::ReceiveNoiseReason::UnexpectedEchoDirection => {
+            "UnexpectedEchoDirection"
+        }
+        super::packet_admission::ReceiveNoiseReason::UnrelatedIpProtocol => "UnrelatedIpProtocol",
+        super::packet_admission::ReceiveNoiseReason::UnrelatedIcmpType => "UnrelatedIcmpType",
+        super::packet_admission::ReceiveNoiseReason::UnexpectedIpVersion => "UnexpectedIpVersion",
+    }
+}
+
+fn accepted_json(admitted: AcceptedPacketDump) -> Value {
+    audited_json!({
         "result": "accepted",
         "normalized_source": admitted.normalized_source.map(|source| source.to_string()),
-        "event_kind": payload_event_kind(event),
-        "payload_len": event.payload_len(),
-        "icmp": event.icmp_meta().map(|meta| json!({
-            "remote_source_id": meta.flow_identity().remote_source_id,
-            "inbound_header_ident": meta.inbound_header_ident(),
-            "seq": meta.seq(),
-            "advertised_reply_id": meta.advertised_reply_id(),
-            "reply_id_negotiate": meta.negotiates_reply_id(),
-            "reply_id_ack": meta.acknowledges_reply_id(),
+        "event_kind": admitted.event_kind,
+        "payload_len": admitted.payload_len,
+        "icmp": admitted.icmp.map(|meta| audited_json!({
+            "remote_source_id": meta.remote_source_id,
+            "inbound_header_ident": meta.inbound_header_ident,
+            "seq": meta.sequence,
+            "session_id": meta.session_id,
+            "advertised_reply_id": meta.advertised_reply_id,
+            "reply_id_negotiate": meta.negotiates_reply_id,
+            "reply_id_ack": meta.acknowledges_reply_id,
         })),
-        "lock_candidate": admitted.lock_candidate.map(|candidate| json!({
+        "lock_candidate": admitted.lock_candidate.map(|candidate| audited_json!({
             "flow_key": candidate.flow_key.to_string(),
-            "listener_flow_inbound": candidate.listener_flow.inbound.map(flow_tuple_string),
-            "listener_flow_outbound": candidate.listener_flow.outbound.map(flow_tuple_string),
+            "listener_flow_inbound": candidate.listener_flow_inbound.map(flow_tuple_string),
+            "listener_flow_outbound": candidate.listener_flow_outbound.map(flow_tuple_string),
         })),
-        "pending_negotiation": admitted.pending_negotiation.map(|candidate| json!({
+        "pending_negotiation": admitted.pending_negotiation.map(|candidate| audited_json!({
             "flow_key": candidate.flow_key.to_string(),
-            "listener_flow_inbound": candidate.listener_flow.inbound.map(flow_tuple_string),
-            "listener_flow_outbound": candidate.listener_flow.outbound.map(flow_tuple_string),
+            "listener_flow_inbound": candidate.listener_flow_inbound.map(flow_tuple_string),
+            "listener_flow_outbound": candidate.listener_flow_outbound.map(flow_tuple_string),
         })),
     })
 }
 
 fn parsed_headers_json(parsed: &ParsedPacketHeaders) -> Value {
-    json!({
+    audited_json!({
+        "network": network_layer_name(parsed.network),
         "transport": transport_name(parsed.transport),
-        "ip_version": ip_version(parsed.transport),
-        "src_ip": parsed.src_ip.map(|ip| ip.to_string()),
-        "dst_ip": parsed.dst_ip.map(|ip| ip.to_string()),
-        "udp": parsed.udp.map(|udp| json!({
+        "ip_version": ip_version(parsed.network),
+        "src_ip": parsed.source_ip().map(|ip| ip.to_string()),
+        "dst_ip": parsed.destination_ip().map(|ip| ip.to_string()),
+        "ipv6_flow_label": match parsed.network {
+            ParsedNetworkLayer::Valid(header)
+            | ParsedNetworkLayer::Unsupported { header, .. } => header.ipv6_flow_label,
+            _ => None,
+        },
+        "udp": parsed.udp.map(|udp| audited_json!({
             "src_port": udp.src_port,
             "dst_port": udp.dst_port,
         })),
@@ -406,6 +896,8 @@ fn parsed_headers_json(parsed: &ParsedPacketHeaders) -> Value {
 
 fn rejection_reason_name(reason: RejectionReason) -> &'static str {
     match reason {
+        RejectionReason::MalformedIpHeader(_) => "MalformedIpHeader",
+        RejectionReason::UnsupportedIpLayout(_) => "UnsupportedIpLayout",
         RejectionReason::MalformedIcmpHeader(_) => "MalformedIcmpHeader",
         RejectionReason::UnexpectedRemotePeer => "UnexpectedRemotePeer",
         RejectionReason::UnexpectedLocalReceiveId => "UnexpectedLocalReceiveId",
@@ -414,6 +906,7 @@ fn rejection_reason_name(reason: RejectionReason) -> &'static str {
         RejectionReason::IcmpReplyIdNegotiationRequired => "IcmpReplyIdNegotiationRequired",
         RejectionReason::IcmpSourceEndpointMismatch => "IcmpSourceEndpointMismatch",
         RejectionReason::IcmpReplyIdRenegotiationMismatch => "IcmpReplyIdRenegotiationMismatch",
+        RejectionReason::IcmpSessionMismatch => "IcmpSessionMismatch",
         RejectionReason::UnsupportedDisjointReplyId => "UnsupportedDisjointReplyId",
         RejectionReason::PayloadOversize => "PayloadOversize",
         RejectionReason::InvalidPayloadBounds => "InvalidPayloadBounds",
@@ -422,6 +915,24 @@ fn rejection_reason_name(reason: RejectionReason) -> &'static str {
 
 fn malformed_reason_name(reason: RejectionReason) -> Option<&'static str> {
     match reason {
+        RejectionReason::MalformedIpHeader(reason) => Some(match reason {
+            IpMalformedReason::MissingHeader => "MissingHeader",
+            IpMalformedReason::InvalidVersion { .. } => "InvalidVersion",
+            IpMalformedReason::TruncatedHeader => "TruncatedHeader",
+            IpMalformedReason::InvalidHeaderLength => "InvalidHeaderLength",
+            IpMalformedReason::InvalidPacketLength => "InvalidPacketLength",
+            IpMalformedReason::CaptureTruncated => "CaptureTruncated",
+            IpMalformedReason::ReservedIpv4Flag => "ReservedIpv4Flag",
+            IpMalformedReason::TruncatedExtension => "TruncatedExtension",
+        }),
+        RejectionReason::UnsupportedIpLayout(reason) => Some(match reason {
+            IpUnsupportedReason::Fragmented => "Fragmented",
+            IpUnsupportedReason::ExtensionChain => "ExtensionChain",
+            IpUnsupportedReason::RoutingHeaderWithSegments => "RoutingHeaderWithSegments",
+            IpUnsupportedReason::AuthenticationHeader => "AuthenticationHeader",
+            IpUnsupportedReason::EncryptedPayload => "EncryptedPayload",
+            IpUnsupportedReason::Jumbogram => "Jumbogram",
+        }),
         RejectionReason::MalformedIcmpHeader(Some(reason)) => Some(match reason {
             crate::net::packet_headers::IcmpMalformedReason::TruncatedEchoHeader => {
                 "TruncatedEchoHeader"
@@ -436,23 +947,31 @@ fn malformed_reason_name(reason: RejectionReason) -> Option<&'static str> {
             crate::net::packet_headers::IcmpMalformedReason::IllegalFrameFlags => {
                 "IllegalFrameFlags"
             }
-            crate::net::packet_headers::IcmpMalformedReason::SessionControlMissingReplyId => {
-                "SessionControlMissingReplyId"
-            }
             crate::net::packet_headers::IcmpMalformedReason::SessionControlReplyIdLength => {
                 "SessionControlReplyIdLength"
             }
+            crate::net::packet_headers::IcmpMalformedReason::InvalidSessionControlFlags => {
+                "InvalidSessionControlFlags"
+            }
+            crate::net::packet_headers::IcmpMalformedReason::InvalidSessionControlDirection => {
+                "InvalidSessionControlDirection"
+            }
+            crate::net::packet_headers::IcmpMalformedReason::MissingSessionId => "MissingSessionId",
+            crate::net::packet_headers::IcmpMalformedReason::ZeroSessionId => "ZeroSessionId",
+            crate::net::packet_headers::IcmpMalformedReason::ZeroSourceId => "ZeroSourceId",
+            crate::net::packet_headers::IcmpMalformedReason::ZeroReplyId => "ZeroReplyId",
         }),
         _ => None,
     }
 }
 
 fn parsed_icmp_json(icmp: ParsedIcmpEcho) -> Value {
-    json!({
+    audited_json!({
         "type": if icmp.is_req { "echo-request" } else { "echo-reply" },
         "code": 0,
         "echo_identifier": icmp.identity.destination_id,
         "sequence": icmp.seq,
+        "session_id": icmp.session_id,
         "shim_flags": icmp.shim_flags.map(|shim| format!("0x{shim:02x}")),
         "logical_source_id": icmp.identity.source_id,
         "logical_destination_id": icmp.identity.destination_id,
@@ -460,195 +979,19 @@ fn parsed_icmp_json(icmp: ParsedIcmpEcho) -> Value {
 }
 
 fn bounded_hex(bytes: &[u8]) -> (String, bool) {
-    let shown = &bytes[..bytes.len().min(PACKET_DUMP_HEX_LIMIT)];
+    let shown = bytes
+        .get(..bytes.len().min(PACKET_DUMP_HEX_LIMIT))
+        .unwrap_or_default();
     let mut hex = String::with_capacity(shown.len() * 2);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in shown {
-        write!(&mut hex, "{byte:02x}").expect("write to String cannot fail");
+        hex.push(char::from(HEX[usize::from(byte >> 4)]));
+        hex.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     (hex, shown.len() != bytes.len())
 }
 
-fn socket_source_string(source: &SockAddr) -> Option<String> {
-    source.as_socket().map(|addr| addr.to_string())
-}
-
-fn protocol_name(proto: SupportedProtocol) -> &'static str {
-    match proto {
-        SupportedProtocol::UDP => "UDP",
-        SupportedProtocol::ICMP => "ICMP",
-    }
-}
-
-fn socket_type_name(sock_type: Type) -> &'static str {
-    if sock_type == Type::DGRAM {
-        "DGRAM"
-    } else if sock_type == Type::RAW {
-        "RAW"
-    } else if sock_type == Type::STREAM {
-        "STREAM"
-    } else {
-        "OTHER"
-    }
-}
-
-fn role_name(role: SocketLeg) -> &'static str {
-    match role {
-        SocketLeg::ClientFacing => "client",
-        SocketLeg::UpstreamFacing => "upstream",
-    }
-}
-
-fn transport_name(transport: ParsedTransport) -> &'static str {
-    match transport {
-        ParsedTransport::UdpDatagram => "UdpDatagram",
-        ParsedTransport::HeaderlessIcmp => "HeaderlessIcmp",
-        ParsedTransport::Ipv4Icmp => "Ipv4Icmp",
-        ParsedTransport::Ipv6Icmp => "Ipv6Icmp",
-        ParsedTransport::Ipv4Udp => "Ipv4Udp",
-        ParsedTransport::Ipv6Udp => "Ipv6Udp",
-        ParsedTransport::Unsupported => "Unsupported",
-        ParsedTransport::Malformed => "Malformed",
-    }
-}
-
-fn ip_version(transport: ParsedTransport) -> Option<u8> {
-    match transport {
-        ParsedTransport::UdpDatagram => None,
-        ParsedTransport::Ipv4Icmp | ParsedTransport::Ipv4Udp => Some(4),
-        ParsedTransport::Ipv6Icmp | ParsedTransport::Ipv6Udp => Some(6),
-        _ => None,
-    }
-}
-
-fn payload_event_kind(event: &PayloadEvent<'_>) -> &'static str {
-    match event {
-        PayloadEvent::UserPayload { .. } => "user-payload",
-        PayloadEvent::SessionControl { .. } => "session-control",
-        PayloadEvent::CadencePacket { .. } => "cadence",
-    }
-}
-
-fn flow_endpoint_string(endpoint: LogicalEndpoint) -> String {
-    endpoint.to_string()
-}
-
-fn flow_tuple_string(flow: FlowTuple) -> String {
-    format!(
-        "{} -> {}",
-        flow_endpoint_string(flow.src),
-        flow_endpoint_string(flow.dst)
-    )
-}
-
-fn client_flow_key_string(flow_key: ClientFlowKey) -> String {
-    flow_key.to_string()
-}
-
 #[cfg(test)]
-mod tests {
-    use super::{
-        PACKET_DUMP_HEX_LIMIT, PacketDumpRecord, admission_json, base_packet_dump_json,
-        bounded_hex, parsed_headers_json,
-    };
-    use crate::cli::SupportedProtocol;
-    use crate::net::packet_headers::{ParsedPacketHeaders, ParsedTransport};
-    use crate::worker_support::packet_admission::{
-        RejectedPacket, WirePacketAdmission, test_support,
-    };
-    use pkthere_socket_policy::{
-        PeerSourceRequirement, ProtocolIdRequirement, ReceiveEvidencePolicy,
-    };
-    use socket2::Type;
-    use std::net::{IpAddr, Ipv4Addr};
-
-    #[test]
-    fn packet_dump_caps_hex_payload() {
-        let bytes = vec![0xab; PACKET_DUMP_HEX_LIMIT + 1];
-        let (hex, truncated) = bounded_hex(&bytes);
-        assert!(truncated);
-        assert_eq!(hex.len(), PACKET_DUMP_HEX_LIMIT * 2);
-    }
-
-    #[test]
-    fn admission_json_reports_filtered_reason() {
-        let admission = WirePacketAdmission::Filtered(RejectedPacket {
-            normalized_source: None,
-            actual_dst_id: None,
-            reason: crate::worker_support::RejectionReason::MalformedIcmpHeader(Some(
-                crate::net::packet_headers::IcmpMalformedReason::InvalidShimFlags,
-            )),
-        });
-        let json = admission_json(&admission);
-        assert_eq!(json["result"], "filtered");
-        assert_eq!(json["reason"], "MalformedIcmpHeader");
-        assert_eq!(json["malformed_reason"], "InvalidShimFlags");
-    }
-
-    #[test]
-    fn parsed_json_reports_udp_fields() {
-        let parsed = ParsedPacketHeaders {
-            transport: ParsedTransport::Ipv4Udp,
-            src_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            udp: Some(crate::net::packet_headers::ParsedUdpHeader {
-                src_port: 40000,
-                dst_port: 9999,
-            }),
-            icmp: None,
-            payload_bounds: (28, 32),
-            icmp_malformed_reason: None,
-        };
-        let json = parsed_headers_json(&parsed);
-        assert_eq!(json["transport"], "Ipv4Udp");
-        assert_eq!(json["udp"]["src_port"], 40000);
-        assert_eq!(json["udp"]["dst_port"], 9999);
-    }
-
-    #[test]
-    fn packet_dump_base_json_includes_socket_metadata() {
-        let parsed = ParsedPacketHeaders {
-            transport: ParsedTransport::Unsupported,
-            src_ip: None,
-            dst_ip: None,
-            udp: None,
-            icmp: None,
-            payload_bounds: (0, 0),
-            icmp_malformed_reason: None,
-        };
-        let spec = test_support::admission_spec(
-            crate::worker_support::SocketLeg::ClientFacing,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            ReceiveEvidencePolicy {
-                peer_source: PeerSourceRequirement::SourceMetadata,
-                protocol_id: ProtocolIdRequirement::None,
-            },
-            None,
-            Some(8080),
-            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        );
-        let json = base_packet_dump_json(
-            "received",
-            PacketDumpRecord {
-                worker_id: 7,
-                c2u: true,
-                packet_id: 11,
-                spec,
-                bytes: b"abc",
-                socket_source: None,
-                parsed: &parsed,
-            },
-        );
-        assert_eq!(json["event"], "packet_dump");
-        assert_eq!(json["worker"], 7);
-        assert_eq!(json["packet_id"], 11);
-        assert_eq!(json["socket"]["protocol"], "UDP");
-        assert!(json["socket"].get("parser_kernel").is_none());
-        assert_eq!(json["socket"]["receive_header"], "PayloadOnly");
-        assert_eq!(json["socket"]["receive_syscall"], "recv_from");
-        assert_eq!(json["socket"]["source_evidence"], "SourceMetadata");
-        assert_eq!(json["socket"]["local_kernel_addr"], "127.0.0.1:8080");
-        assert_eq!(json["socket"]["evidence_key"]["socket_slot"], 0);
-        assert!(json["socket"].get("local_kernel").is_none());
-    }
-}
+mod diagnostic_store_unit_tests;
+#[cfg(test)]
+mod tests;

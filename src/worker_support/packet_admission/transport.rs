@@ -1,22 +1,24 @@
-#[cfg(test)]
-pub(crate) use super::rejection::record_rejection_stats;
 pub(crate) use super::rejection::{RejectedPacket, RejectionReason};
-use crate::cli::{IcmpReplyIdRequest, ListenMode, RuntimeConfig, SupportedProtocol};
+use crate::cli::{RuntimeConfig, SupportedProtocol};
 use crate::endpoint::LogicalEndpoint;
-use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
+use crate::flow_key::ClientFlowKey;
 use crate::flow_state::PendingIcmpClientLock;
-use crate::net::framing_shim::{ReplyIdNegotiation, parse_icmp_reply_negotiation};
-#[cfg(test)]
-use crate::net::packet_headers::parse_packet_headers;
-use crate::net::packet_headers::{ParsedPacketHeaders, ReceiveParserKernel, SHIM_IS_DATA};
-use crate::net::payload::{PayloadEvent, TunnelFlowIdentity};
-use crate::net::sock_mgr::SocketHandles;
+use crate::net::framing_shim::{
+    IcmpTunnelControl, ReplyIdNegotiation, SessionId, parse_icmp_control,
+};
+use crate::net::packet_headers::{
+    ParsedNetworkLayer, ParsedPacketHeaders, ParsedTransport, SHIM_IS_CADENCE, SHIM_IS_DATA,
+};
+use crate::net::payload::{AdmittedIcmpIdentity, PayloadEvent};
+use pkthere_socket_policy::Ipv6DestinationScopeEvidence;
+pub(crate) use pkthere_socket_policy::PeerSourceRequirement;
 #[cfg(test)]
 pub(crate) use pkthere_socket_policy::ProtocolIdRequirement;
-use pkthere_socket_policy::ResolvedSocketPolicy;
-pub(crate) use pkthere_socket_policy::{PeerSourceRequirement, ReceiveEvidencePolicy};
-use socket2::{SockAddr, Type};
-use std::net::SocketAddr;
+#[cfg(test)]
+pub(crate) use pkthere_socket_policy::ReceiveEvidencePolicy;
+#[cfg(test)]
+use socket2::SockAddr;
+use socket2::Type;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SocketLeg {
     ClientFacing,
@@ -25,189 +27,55 @@ pub(crate) enum SocketLeg {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReceiveNoiseReason {
     UnexpectedEchoDirection,
+    UnrelatedIpProtocol,
+    UnrelatedIcmpType,
+    UnexpectedIpVersion,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReceiveSocketContext {
-    pub(crate) role: SocketLeg,
-    pub(crate) proto: SupportedProtocol,
-    pub(crate) sock_type: Type,
-    pub(crate) parser: ReceiveParserKernel,
-    pub(crate) policy: ResolvedSocketPolicy,
-    pub(crate) connected: bool,
-    pub(crate) local_filter: LogicalEndpoint,
-    pub(crate) local_kernel_addr: SocketAddr,
-    pub(crate) evidence_key: pkthere_socket_policy::SocketEvidenceKey,
-}
-impl ReceiveSocketContext {
-    pub(crate) fn evidence_policy(self) -> ReceiveEvidencePolicy {
-        self.policy.evidence_policy(self.connected)
-    }
+#[cfg(test)]
+pub(crate) use super::transport_context::{AdmissionStateContext, ReceiveSocketContext};
+pub(crate) use super::transport_context::{
+    ReceiveContext, client_receive_context, upstream_receive_context,
+};
 
-    pub(crate) const fn socket_is_ipv4(self) -> bool {
-        matches!(
-            self.parser.version(),
-            crate::net::packet_headers::IpVersion::V4
-        )
-    }
-
-    #[inline]
-    pub(crate) fn can_honor_disjoint_icmp_ids(self) -> bool {
-        self.policy
-            .icmp
-            .is_some_and(|policy| policy.can_honor_disjoint_ids())
-    }
-
-    #[inline]
-    pub(crate) fn allow_debug_kernel_echo_self_handshake(self) -> bool {
-        self.policy
-            .icmp
-            .is_some_and(|policy| policy.allow_debug_kernel_echo_self_handshake)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AdmissionStateContext {
-    pub(crate) expected_inbound: Option<FlowTuple>,
-    pub(crate) expected_local: Option<LogicalEndpoint>,
-    pub(crate) locked_flow: Option<ClientFlowKey>,
-    pub(crate) pending_icmp_client_lock: Option<PendingIcmpClientLock>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReceiveContext {
-    pub(crate) socket: ReceiveSocketContext,
-    pub(crate) admission: AdmissionStateContext,
-}
-
-impl ReceiveContext {
-    #[inline]
-    pub(crate) const fn local_filter(self) -> Option<LogicalEndpoint> {
-        Some(self.socket.local_filter)
-    }
-
-    #[inline]
-    pub(crate) fn expected_remote(self) -> Option<LogicalEndpoint> {
-        self.admission.expected_inbound.map(|flow| flow.src)
-    }
-
-    #[inline]
-    pub(crate) const fn expected_local_id(self) -> Option<u16> {
-        match self.admission.expected_inbound {
-            Some(flow) => Some(flow.dst.id()),
-            None => match self.admission.expected_local {
-                Some(endpoint) => Some(endpoint.id()),
-                None => None,
-            },
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn upstream_receive_context(
-    cfg: &RuntimeConfig,
-    handles: &SocketHandles,
-) -> ReceiveContext {
-    debug_assert_eq!(handles.upstream.parser.protocol(), cfg.upstream_proto);
-    debug_assert_eq!(
-        handles.upstream.parser.mode(),
-        handles.upstream.policy.receive_header
-    );
-    ReceiveContext {
-        socket: ReceiveSocketContext {
-            role: SocketLeg::UpstreamFacing,
-            proto: cfg.upstream_proto,
-            sock_type: handles.upstream.sock_type,
-            parser: handles.upstream.parser,
-            policy: handles.upstream.policy,
-            connected: handles.upstream_connected(),
-            local_filter: handles.upstream.upstream_local_filter,
-            local_kernel_addr: handles.upstream.upstream_local_kernel_addr,
-            evidence_key: handles.upstream.evidence_key,
-        },
-        admission: AdmissionStateContext {
-            expected_inbound: handles.upstream.upstream_flow.inbound,
-            expected_local: handles.upstream.upstream_flow.inbound.map(|flow| flow.dst),
-            locked_flow: handles.listener.flow,
-            pending_icmp_client_lock: None,
-        },
-    }
-}
-
-#[inline]
-pub(crate) fn client_receive_context(
-    cfg: &RuntimeConfig,
-    handles: &SocketHandles,
-    expected_inbound: Option<FlowTuple>,
-    pending_icmp_client_lock: Option<PendingIcmpClientLock>,
-) -> ReceiveContext {
-    let expected_local = if cfg.listen_proto == SupportedProtocol::ICMP {
-        match (cfg.listen_mode, expected_inbound) {
-            (ListenMode::Fixed, _) => Some(
-                handles
-                    .listener
-                    .listen_local_filter
-                    .with_id(cfg.listen.id()),
-            ),
-            (ListenMode::Dynamic, Some(flow)) => Some(flow.dst),
-            (ListenMode::Dynamic, None) => None,
-        }
-    } else {
-        None
-    };
-
-    debug_assert_eq!(handles.listener.parser.protocol(), cfg.listen_proto);
-    debug_assert_eq!(
-        handles.listener.parser.mode(),
-        handles.listener.policy.receive_header
-    );
-    ReceiveContext {
-        socket: ReceiveSocketContext {
-            role: SocketLeg::ClientFacing,
-            proto: cfg.listen_proto,
-            sock_type: handles.listener.sock_type,
-            parser: handles.listener.parser,
-            policy: handles.listener.policy,
-            connected: handles.listener_connected(),
-            local_filter: handles.listener.listen_local_filter,
-            local_kernel_addr: handles.listener.listen_local_kernel_addr,
-            evidence_key: handles.listener.evidence_key,
-        },
-        admission: AdmissionStateContext {
-            expected_inbound,
-            expected_local,
-            locked_flow: handles.listener.flow,
-            pending_icmp_client_lock,
-        },
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct AdmittedWirePacket<'a> {
-    pub(crate) trace: Option<crate::packet_trace::PacketTraceId>,
-    pub(crate) normalized_source: Option<LogicalEndpoint>,
-    pub(crate) event: PayloadEvent<'a>,
-    pub(crate) lock_candidate: Option<PendingIcmpClientLock>,
-    pub(crate) pending_negotiation: Option<PendingIcmpClientLock>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-// Boxing the accepted variant would allocate on every admitted packet.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum WirePacketAdmission<'a> {
-    Accepted(AdmittedWirePacket<'a>),
-    Filtered(RejectedPacket),
-    ReceiveNoise(ReceiveNoiseReason),
-}
-
+use super::admitted::ClientAdmissionCandidate;
+pub(crate) use super::admitted::{AdmittedWirePacket, WirePacketAdmission, WirePacketRejection};
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TransportPacket<'a> {
     pub(crate) normalized_source: Option<LogicalEndpoint>,
-    pub(crate) flow_identity: TunnelFlowIdentity,
+    identity: AdmittedTransportIdentity,
     pub(crate) seq: u16,
+    pub(crate) session_id: Option<SessionId>,
     pub(crate) payload: &'a [u8],
     pub(crate) shim_flags: Option<u8>,
+    pub(crate) control: Option<IcmpTunnelControl>,
     pub(crate) reply_id_negotiation: Option<ReplyIdNegotiation>,
-    pub(crate) is_handshake_or_debug: bool,
+    pub(crate) allows_control_identity_learning: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AdmittedTransportIdentity {
+    Udp { local_destination_id: u16 },
+    Icmp(AdmittedIcmpIdentity),
+}
+
+impl TransportPacket<'_> {
+    #[inline]
+    const fn local_destination_id(&self) -> u16 {
+        match self.identity {
+            AdmittedTransportIdentity::Udp {
+                local_destination_id,
+            } => local_destination_id,
+            AdmittedTransportIdentity::Icmp(identity) => identity.local_destination_id(),
+        }
+    }
+
+    #[inline]
+    pub(super) const fn icmp_identity(&self) -> Option<AdmittedIcmpIdentity> {
+        match self.identity {
+            AdmittedTransportIdentity::Udp { .. } => None,
+            AdmittedTransportIdentity::Icmp(identity) => Some(identity),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -218,329 +86,452 @@ pub(crate) enum TransportAdmission<'a> {
 }
 
 #[inline]
+fn network_source(parsed: &ParsedPacketHeaders) -> Option<LogicalEndpoint> {
+    parsed
+        .source_ip()
+        .map(|address| endpoint_from_ip(address, 0))
+}
+
+#[inline]
+fn endpoint_from_ip(address: std::net::IpAddr, id: u16) -> LogicalEndpoint {
+    match address {
+        std::net::IpAddr::V4(address) => LogicalEndpoint::from_v4(address, id),
+        std::net::IpAddr::V6(address) => LogicalEndpoint::from_v6(address, id, 0),
+    }
+}
+
+#[inline]
+pub(crate) fn admit_network_layer<'a>(
+    spec: ReceiveContext<'_>,
+    network: ParsedNetworkLayer,
+) -> Option<TransportAdmission<'a>> {
+    let header = match network {
+        ParsedNetworkLayer::NotPresent => return None,
+        ParsedNetworkLayer::Malformed(reason) => {
+            return Some(TransportAdmission::Filtered(RejectedPacket {
+                normalized_source: None,
+                actual_dst_id: None,
+                reason: RejectionReason::MalformedIpHeader(reason),
+            }));
+        }
+        ParsedNetworkLayer::UnexpectedVersion { .. } => {
+            return Some(TransportAdmission::ReceiveNoise(
+                ReceiveNoiseReason::UnexpectedIpVersion,
+            ));
+        }
+        ParsedNetworkLayer::Valid(header) | ParsedNetworkLayer::Unsupported { header, .. } => {
+            header
+        }
+    };
+    let normalized_source = Some(endpoint_from_ip(header.source, 0));
+    if let Some(local) = spec.local_filter()
+        && !local.ip().is_unspecified()
+        && header.destination != local.ip()
+    {
+        return Some(TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: None,
+            reason: RejectionReason::UnexpectedLocalReceiveAddress,
+        }));
+    }
+    if let std::net::IpAddr::V6(address) = header.destination
+        && address.is_unicast_link_local()
+    {
+        let exact_bound_scope = match (
+            spec.socket.policy.ipv6_destination_scope,
+            spec.local_filter(),
+            spec.socket.local_kernel_addr,
+        ) {
+            (
+                Ipv6DestinationScopeEvidence::ExactBoundEndpoint,
+                Some(local),
+                std::net::SocketAddr::V6(kernel),
+            ) => {
+                local.ip() == header.destination
+                    && local.scope_id() != 0
+                    && *kernel.ip() == address
+                    && kernel.scope_id() == local.scope_id()
+            }
+            (Ipv6DestinationScopeEvidence::NotApplicable, _, _)
+            | (Ipv6DestinationScopeEvidence::ExactBoundEndpoint, _, _) => false,
+        };
+        if !exact_bound_scope {
+            return Some(TransportAdmission::Filtered(RejectedPacket {
+                normalized_source,
+                actual_dst_id: None,
+                reason: RejectionReason::UnexpectedLocalReceiveAddress,
+            }));
+        }
+    }
+    if let Some(expected) = spec.expected_remote()
+        && !matches!(
+            header.source,
+            std::net::IpAddr::V6(address) if address.is_unicast_link_local()
+        )
+        && !icmp_remote_ip_matches(endpoint_from_ip(header.source, expected.id()), expected)
+    {
+        return Some(TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: None,
+            reason: RejectionReason::UnexpectedRemotePeer,
+        }));
+    }
+    if let ParsedNetworkLayer::Unsupported { reason, .. } = network {
+        return Some(TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: None,
+            reason: RejectionReason::UnsupportedIpLayout(reason),
+        }));
+    }
+    None
+}
+
+#[inline]
 #[cfg(test)]
 pub(crate) fn admit_packet<'a>(
-    spec: ReceiveContext,
+    spec: super::test_support::SyntheticReceiveContext,
     payload: &'a [u8],
     socket_source: Option<&SockAddr>,
 ) -> TransportAdmission<'a> {
-    let parsed = parse_packet_headers(payload);
-    admit_packet_with_parsed(spec, payload, socket_source, &parsed)
+    let spec = spec.as_receive_context();
+    let network = spec.socket.parser.parse_network(payload);
+    let network_layer = match network {
+        crate::net::packet_headers::NetworkParseOutcome::NotPresent => {
+            ParsedNetworkLayer::NotPresent
+        }
+        crate::net::packet_headers::NetworkParseOutcome::Valid(validated) => {
+            ParsedNetworkLayer::Valid(validated.header)
+        }
+        crate::net::packet_headers::NetworkParseOutcome::Rejected(layer) => layer,
+    };
+    if let Some(admission) = admit_network_layer(spec, network_layer) {
+        return admission;
+    }
+    let parsed = spec.socket.parser.parse_transport(payload, network);
+    admit_packet_with_parsed(
+        spec,
+        payload,
+        socket_source.and_then(SockAddr::as_socket),
+        &parsed,
+    )
 }
 
 #[inline]
 pub(crate) fn admit_packet_with_parsed<'a>(
-    spec: ReceiveContext,
+    spec: ReceiveContext<'_>,
     payload: &'a [u8],
-    socket_source: Option<&SockAddr>,
+    socket_source: Option<std::net::SocketAddr>,
     parsed: &ParsedPacketHeaders,
 ) -> TransportAdmission<'a> {
-    let (logical_src_id, logical_dst_id) = match spec.socket.proto {
-        SupportedProtocol::UDP => {
-            if spec.socket.sock_type == Type::DGRAM {
-                let src_port = socket_source
-                    .and_then(|s| s.as_socket())
-                    .map_or(0, |s| s.port());
-                let Some(dst_port) = spec.local_filter().map(LogicalEndpoint::id) else {
-                    return TransportAdmission::Filtered(RejectedPacket {
-                        normalized_source: None,
-                        actual_dst_id: None,
-                        reason: RejectionReason::UnexpectedLocalReceiveId,
-                    });
-                };
-                (src_port, dst_port)
-            } else {
-                let Some(udp) = parsed.udp else {
-                    return TransportAdmission::Filtered(RejectedPacket {
-                        normalized_source: socket_source.and_then(LogicalEndpoint::from_sock_addr),
-                        actual_dst_id: None,
-                        reason: RejectionReason::MalformedIcmpHeader(None),
-                    });
-                };
-                (udp.src_port, udp.dst_port)
-            }
+    if let Some(admission) = admit_network_layer(spec, parsed.network) {
+        return admission;
+    }
+    match parsed.transport {
+        ParsedTransport::NotParsed => {
+            return TransportAdmission::ReceiveNoise(ReceiveNoiseReason::UnrelatedIpProtocol);
         }
-        SupportedProtocol::ICMP => {
-            let Some(icmp) = parsed.icmp else {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source: socket_source.and_then(LogicalEndpoint::from_sock_addr),
-                    actual_dst_id: None,
-                    reason: RejectionReason::MalformedIcmpHeader(parsed.icmp_malformed_reason),
-                });
-            };
-            let destination_id = icmp.identity.destination_id;
-            let source_id = icmp
-                .identity
-                .source_id
-                .or_else(|| spec.expected_remote().map(|remote| remote.id()))
-                .or_else(|| {
-                    socket_source
-                        .and_then(SockAddr::as_socket)
-                        .map(|addr| addr.port())
-                        .filter(|id| *id != 0)
-                })
-                .unwrap_or(destination_id);
-            (source_id, destination_id)
+        ParsedTransport::UnrelatedProtocol => {
+            return TransportAdmission::ReceiveNoise(ReceiveNoiseReason::UnrelatedIpProtocol);
         }
-    };
-
-    let normalized_source = if spec.socket.proto == SupportedProtocol::UDP {
-        match spec.socket.evidence_policy().peer_source {
-            PeerSourceRequirement::RawPacketHeader => {
-                match parse_raw_ip_source(
-                    parsed,
-                    socket_source,
-                    spec.socket.socket_is_ipv4(),
-                    logical_src_id,
-                ) {
-                    Some(src) => Some(src),
-                    None => {
-                        return TransportAdmission::Filtered(RejectedPacket {
-                            normalized_source: None,
-                            actual_dst_id: Some(logical_dst_id),
-                            reason: RejectionReason::MissingSourceEvidence,
-                        });
-                    }
-                }
-            }
-            PeerSourceRequirement::SourceMetadata | PeerSourceRequirement::ConnectedKernel => {
-                match socket_source
-                    .and_then(|s| LogicalEndpoint::from_sock_addr_with_id(s, logical_src_id))
-                {
-                    Some(src) => Some(src),
-                    None if spec.socket.evidence_policy().peer_source
-                        == PeerSourceRequirement::ConnectedKernel =>
-                    {
-                        None
-                    }
-                    None => {
-                        return TransportAdmission::Filtered(RejectedPacket {
-                            normalized_source: None,
-                            actual_dst_id: Some(logical_dst_id),
-                            reason: RejectionReason::MissingSourceEvidence,
-                        });
-                    }
-                }
-            }
+        ParsedTransport::UnrelatedIcmp => {
+            return TransportAdmission::ReceiveNoise(ReceiveNoiseReason::UnrelatedIcmpType);
         }
-    } else {
-        None
-    };
-
-    if spec.socket.proto == SupportedProtocol::UDP {
-        if parsed_transport_has_ip(parsed)
-            && parsed
-                .src_ip
-                .is_some_and(|src| normalized_source.is_some_and(|auth| src != auth.ip()))
-        {
+        ParsedTransport::MalformedIcmp => {
             return TransportAdmission::Filtered(RejectedPacket {
-                normalized_source,
-                actual_dst_id: Some(logical_dst_id),
-                reason: RejectionReason::UnexpectedRemotePeer,
+                normalized_source: network_source(parsed),
+                actual_dst_id: None,
+                reason: RejectionReason::MalformedIcmpHeader(parsed.icmp_malformed_reason),
             });
         }
-        if let (Some(expected), Some(src)) = (spec.expected_remote(), normalized_source)
-            && !expected.matches_filter(src)
-        {
-            return TransportAdmission::Filtered(RejectedPacket {
-                normalized_source: Some(src),
-                actual_dst_id: Some(logical_dst_id),
-                reason: RejectionReason::UnexpectedRemotePeer,
-            });
-        }
+        ParsedTransport::UdpDatagram | ParsedTransport::Icmp | ParsedTransport::Udp => {}
     }
 
+    let (logical_src_id, logical_dst_id) = match resolve_transport_ids(spec, socket_source, parsed)
+    {
+        Ok(ids) => ids,
+        Err(rejected) => return TransportAdmission::Filtered(rejected),
+    };
     match spec.socket.proto {
-        SupportedProtocol::UDP => {
-            let (p_start, p_end) = if spec.socket.sock_type == Type::DGRAM {
-                (0, payload.len())
-            } else {
-                parsed.payload_bounds
-            };
-            if p_start > p_end || p_end > payload.len() {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(logical_dst_id),
-                    reason: RejectionReason::InvalidPayloadBounds,
-                });
-            }
-            TransportAdmission::Accepted(TransportPacket {
-                normalized_source,
-                flow_identity: TunnelFlowIdentity {
-                    remote_source_id: logical_src_id,
-                    local_destination_id: logical_dst_id,
-                },
-                seq: 0,
-                payload: &payload[p_start..p_end],
-                shim_flags: None,
-                reply_id_negotiation: None,
-                is_handshake_or_debug: false,
-            })
-        }
-        SupportedProtocol::ICMP => {
-            let Some(icmp) = parsed.icmp else {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(logical_dst_id),
-                    reason: RejectionReason::MalformedIcmpHeader(parsed.icmp_malformed_reason),
-                });
-            };
-            if icmp.is_req != (spec.socket.role == SocketLeg::ClientFacing) {
-                return TransportAdmission::ReceiveNoise(
-                    ReceiveNoiseReason::UnexpectedEchoDirection,
-                );
-            }
-            let (start, end) = parsed.payload_bounds;
-            if start > end || end > payload.len() {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(logical_dst_id),
-                    reason: RejectionReason::InvalidPayloadBounds,
-                });
-            }
-            let transport_payload = &payload[start..end];
-            let reply_id_negotiation = match parse_icmp_reply_negotiation_for_admission(
-                icmp.shim_flags,
-                transport_payload,
-            ) {
-                Ok(reply_id) => reply_id,
-                Err(reason) => {
-                    return TransportAdmission::Filtered(RejectedPacket {
-                        normalized_source,
-                        actual_dst_id: Some(logical_dst_id),
-                        reason,
-                    });
-                }
-            };
-
-            let normalized_source = match spec.socket.evidence_policy().peer_source {
-                PeerSourceRequirement::RawPacketHeader => {
-                    match parse_raw_ip_source(
-                        parsed,
-                        socket_source,
-                        spec.socket.socket_is_ipv4(),
-                        logical_src_id,
-                    ) {
-                        Some(src) => Some(src),
-                        None => {
-                            return TransportAdmission::Filtered(RejectedPacket {
-                                normalized_source: None,
-                                actual_dst_id: Some(logical_dst_id),
-                                reason: RejectionReason::MissingSourceEvidence,
-                            });
-                        }
-                    }
-                }
-                PeerSourceRequirement::SourceMetadata | PeerSourceRequirement::ConnectedKernel => {
-                    match socket_source
-                        .and_then(|s| LogicalEndpoint::from_sock_addr_with_id(s, logical_src_id))
-                    {
-                        Some(src) => Some(src),
-                        None if spec.socket.evidence_policy().peer_source
-                            == PeerSourceRequirement::ConnectedKernel =>
-                        {
-                            spec.expected_remote().map(|expected| {
-                                let source_id =
-                                    if icmp.shim_flags.is_none() && transport_payload.is_empty() {
-                                        expected.id()
-                                    } else {
-                                        logical_src_id
-                                    };
-                                expected.with_id(source_id)
-                            })
-                        }
-                        None => {
-                            return TransportAdmission::Filtered(RejectedPacket {
-                                normalized_source: None,
-                                actual_dst_id: Some(logical_dst_id),
-                                reason: RejectionReason::MissingSourceEvidence,
-                            });
-                        }
-                    }
-                }
-            };
-
-            let is_handshake_or_debug =
-                is_valid_handshake_or_debug(spec, parsed, normalized_source, reply_id_negotiation);
-            let connected_reflected_negotiation = spec.socket.role == SocketLeg::UpstreamFacing
-                && spec.socket.evidence_policy().peer_source
-                    == PeerSourceRequirement::ConnectedKernel
-                && socket_source.is_none()
-                && spec.local_filter().is_some_and(|local| {
-                    spec.expected_remote()
-                        .is_some_and(|remote| remote.ip() == local.ip())
-                });
-            if connected_reflected_negotiation
-                && reply_id_negotiation.is_some_and(|reply_id| {
-                    reply_id.negotiate && !reply_id.ack && !is_handshake_or_debug
-                })
-            {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(logical_dst_id),
-                    reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
-                });
-            }
-
-            if let Some(expected) = spec.expected_local_id()
-                && logical_dst_id != expected
-                && !is_handshake_or_debug
-            {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(logical_dst_id),
-                    reason: RejectionReason::UnexpectedLocalReceiveId,
-                });
-            }
-
-            if spec.socket.evidence_policy().peer_source == PeerSourceRequirement::RawPacketHeader
-                && spec.local_filter().is_some_and(|local| {
-                    !raw_packet_destination_matches(parsed, local, spec.socket.socket_is_ipv4())
-                })
-            {
-                return TransportAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(logical_dst_id),
-                    reason: RejectionReason::UnexpectedLocalReceiveAddress,
-                });
-            }
-
-            if let (Some(expected), Some(src)) = (spec.expected_remote(), normalized_source) {
-                let matches_ip = icmp_remote_ip_matches(src, expected);
-                let matches_id = src.id() == expected.id();
-
-                if !matches_ip || (!matches_id && !is_handshake_or_debug) {
-                    let reason = if matches_ip
-                        && spec
-                            .expected_local_id()
-                            .is_some_and(|id| logical_dst_id == id)
-                    {
-                        RejectionReason::IcmpSourceEndpointMismatch
-                    } else {
-                        RejectionReason::UnexpectedRemotePeer
-                    };
-                    return TransportAdmission::Filtered(RejectedPacket {
-                        normalized_source: Some(src),
-                        actual_dst_id: Some(logical_dst_id),
-                        reason,
-                    });
-                }
-            }
-
-            TransportAdmission::Accepted(TransportPacket {
-                normalized_source,
-                flow_identity: TunnelFlowIdentity {
-                    remote_source_id: logical_src_id,
-                    local_destination_id: logical_dst_id,
-                },
-                seq: icmp.seq,
-                payload: transport_payload,
-                shim_flags: icmp.shim_flags,
-                reply_id_negotiation,
-                is_handshake_or_debug,
-            })
-        }
+        SupportedProtocol::UDP => admit_udp_packet(
+            spec,
+            payload,
+            socket_source,
+            parsed,
+            logical_src_id,
+            logical_dst_id,
+        ),
+        SupportedProtocol::ICMP => admit_icmp_packet(
+            spec,
+            payload,
+            socket_source,
+            parsed,
+            logical_src_id,
+            logical_dst_id,
+        ),
     }
+}
+
+use super::endpoint_evidence::{resolve_source_endpoint, resolve_transport_ids};
+
+fn admit_udp_packet<'a>(
+    spec: ReceiveContext<'_>,
+    payload: &'a [u8],
+    socket_source: Option<std::net::SocketAddr>,
+    parsed: &ParsedPacketHeaders,
+    logical_src_id: u16,
+    logical_dst_id: u16,
+) -> TransportAdmission<'a> {
+    let normalized_source = match resolve_source_endpoint(
+        spec,
+        socket_source,
+        parsed,
+        logical_src_id,
+        logical_dst_id,
+    ) {
+        Ok(source) => source,
+        Err(rejected) => return TransportAdmission::Filtered(rejected),
+    };
+    if parsed_transport_has_ip(parsed)
+        && parsed
+            .source_ip()
+            .is_some_and(|source| normalized_source.is_some_and(|actual| source != actual.ip()))
+    {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::UnexpectedRemotePeer,
+        });
+    }
+    if let (Some(expected), Some(source)) = (spec.expected_remote(), normalized_source)
+        && !expected.matches_filter(source)
+    {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source: Some(source),
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::UnexpectedRemotePeer,
+        });
+    }
+    let (payload_start, payload_end) = if spec.socket.sock_type == Type::DGRAM {
+        (0, payload.len())
+    } else {
+        let Some(extent) = parsed.declared_extent(payload) else {
+            return TransportAdmission::Filtered(RejectedPacket {
+                normalized_source,
+                actual_dst_id: Some(logical_dst_id),
+                reason: RejectionReason::InvalidPayloadBounds,
+            });
+        };
+        (extent.payload.start, extent.payload.end)
+    };
+    if payload_start > payload_end || payload_end > payload.len() {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::InvalidPayloadBounds,
+        });
+    }
+    TransportAdmission::Accepted(TransportPacket {
+        normalized_source,
+        identity: AdmittedTransportIdentity::Udp {
+            local_destination_id: logical_dst_id,
+        },
+        seq: 0,
+        session_id: None,
+        payload: &payload[payload_start..payload_end],
+        shim_flags: None,
+        control: None,
+        reply_id_negotiation: None,
+        allows_control_identity_learning: false,
+    })
+}
+
+fn admit_icmp_packet<'a>(
+    spec: ReceiveContext<'_>,
+    payload: &'a [u8],
+    socket_source: Option<std::net::SocketAddr>,
+    parsed: &ParsedPacketHeaders,
+    logical_src_id: u16,
+    logical_dst_id: u16,
+) -> TransportAdmission<'a> {
+    let Some(icmp) = parsed.icmp else {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source: None,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::MalformedIcmpHeader(parsed.icmp_malformed_reason),
+        });
+    };
+    if icmp.is_req != (spec.socket.role == SocketLeg::ClientFacing) {
+        return TransportAdmission::ReceiveNoise(ReceiveNoiseReason::UnexpectedEchoDirection);
+    }
+    let Some(extent) = spec.socket.parser.declared_extent(*parsed, payload) else {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source: None,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::InvalidPayloadBounds,
+        });
+    };
+    if extent.payload.end > payload.len() {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source: None,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::InvalidPayloadBounds,
+        });
+    }
+    let transport_payload = &payload[extent.payload];
+    let Some(shim_flags) = icmp.shim_flags else {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source: None,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::MalformedIcmpHeader(parsed.icmp_malformed_reason.or(Some(
+                crate::net::packet_headers::IcmpMalformedReason::InvalidShimFlags,
+            ))),
+        });
+    };
+    let control = match parse_icmp_control(shim_flags, transport_payload) {
+        Ok(control) => control,
+        Err(reason) => {
+            return TransportAdmission::Filtered(RejectedPacket {
+                normalized_source: None,
+                actual_dst_id: Some(logical_dst_id),
+                reason: RejectionReason::MalformedIcmpHeader(Some(reason)),
+            });
+        }
+    };
+    let reply_id_negotiation = match control {
+        Some(IcmpTunnelControl::Negotiate(negotiation))
+        | Some(IcmpTunnelControl::NegotiateAck(negotiation)) => Some(negotiation),
+        Some(_) | None => None,
+    };
+    let normalized_source = match resolve_source_endpoint(
+        spec,
+        socket_source,
+        parsed,
+        logical_src_id,
+        logical_dst_id,
+    ) {
+        Ok(source) => source,
+        Err(rejected) => return TransportAdmission::Filtered(rejected),
+    };
+    let allows_control_identity_learning =
+        allows_control_identity_learning(spec, parsed, normalized_source, reply_id_negotiation);
+    if invalid_icmp_control_direction(spec, reply_id_negotiation, allows_control_identity_learning)
+    {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::MalformedIcmpHeader(Some(
+                crate::net::packet_headers::IcmpMalformedReason::InvalidSessionControlDirection,
+            )),
+        });
+    }
+    if rejects_connected_reflection(
+        spec,
+        socket_source,
+        reply_id_negotiation,
+        allows_control_identity_learning,
+    ) {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
+        });
+    }
+    if spec
+        .expected_local_id()
+        .is_some_and(|expected| logical_dst_id != expected)
+    {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::UnexpectedLocalReceiveId,
+        });
+    }
+    if let Some(rejected) = reject_unexpected_icmp_peer(
+        spec,
+        normalized_source,
+        logical_dst_id,
+        allows_control_identity_learning,
+    ) {
+        return TransportAdmission::Filtered(rejected);
+    }
+    let Some(identity) = AdmittedIcmpIdentity::new(logical_src_id, logical_dst_id) else {
+        return TransportAdmission::Filtered(RejectedPacket {
+            normalized_source,
+            actual_dst_id: Some(logical_dst_id),
+            reason: RejectionReason::MalformedIcmpHeader(Some(
+                crate::net::packet_headers::IcmpMalformedReason::ZeroSourceId,
+            )),
+        });
+    };
+    TransportAdmission::Accepted(TransportPacket {
+        normalized_source,
+        identity: AdmittedTransportIdentity::Icmp(identity),
+        seq: icmp.seq,
+        session_id: SessionId::new(icmp.session_id),
+        payload: transport_payload,
+        shim_flags: icmp.shim_flags,
+        control,
+        reply_id_negotiation,
+        allows_control_identity_learning,
+    })
+}
+
+fn invalid_icmp_control_direction(
+    spec: ReceiveContext<'_>,
+    reply_id: Option<crate::net::framing_shim::ReplyIdNegotiation>,
+    allows_identity_learning: bool,
+) -> bool {
+    reply_id.is_some_and(|control| {
+        (spec.socket.role == SocketLeg::ClientFacing && control.is_ack())
+            || (spec.socket.role == SocketLeg::UpstreamFacing
+                && control.is_negotiate()
+                && !allows_identity_learning)
+    })
+}
+
+fn rejects_connected_reflection(
+    spec: ReceiveContext<'_>,
+    socket_source: Option<std::net::SocketAddr>,
+    reply_id: Option<crate::net::framing_shim::ReplyIdNegotiation>,
+    allows_identity_learning: bool,
+) -> bool {
+    let connected_reflection = spec.socket.role == SocketLeg::UpstreamFacing
+        && spec.socket.evidence_policy().peer_source == PeerSourceRequirement::ConnectedKernel
+        && socket_source.is_none()
+        && spec.local_filter().is_some_and(|local| {
+            spec.expected_remote()
+                .is_some_and(|remote| remote.ip() == local.ip())
+        });
+    connected_reflection
+        && reply_id.is_some_and(|control| control.is_negotiate() && !allows_identity_learning)
+}
+
+fn reject_unexpected_icmp_peer(
+    spec: ReceiveContext<'_>,
+    normalized_source: Option<LogicalEndpoint>,
+    logical_dst_id: u16,
+    allows_identity_learning: bool,
+) -> Option<RejectedPacket> {
+    let (expected, source) = (spec.expected_remote()?, normalized_source?);
+    let matches_ip = icmp_remote_ip_matches(source, expected);
+    let matches_id = source.id() == expected.id();
+    if matches_ip && (matches_id || allows_identity_learning) {
+        return None;
+    }
+    let reason = if matches_ip
+        && spec
+            .expected_local_id()
+            .is_some_and(|id| logical_dst_id == id)
+    {
+        RejectionReason::IcmpSourceEndpointMismatch
+    } else {
+        RejectionReason::UnexpectedRemotePeer
+    };
+    Some(RejectedPacket {
+        normalized_source: Some(source),
+        actual_dst_id: Some(logical_dst_id),
+        reason,
+    })
 }
 
 #[inline]
@@ -548,104 +539,219 @@ pub(crate) fn admit_packet_with_parsed<'a>(
 pub(crate) fn admit_wire_packet<'a>(
     c2u: bool,
     cfg: &RuntimeConfig,
-    spec: ReceiveContext,
+    spec: super::test_support::SyntheticReceiveContext,
     payload: &'a [u8],
     socket_source: Option<&SockAddr>,
 ) -> WirePacketAdmission<'a> {
-    let parsed = parse_packet_headers(payload);
+    let spec = spec.as_receive_context();
+    let network = spec.socket.parser.parse_network(payload);
+    let parsed = spec.socket.parser.parse_transport(payload, network);
     admit_wire_packet_with_parsed(c2u, cfg, spec, payload, socket_source, &parsed)
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn admit_wire_packet_with_parsed<'a>(
     c2u: bool,
     cfg: &RuntimeConfig,
-    spec: ReceiveContext,
+    spec: ReceiveContext<'_>,
     payload: &'a [u8],
     socket_source: Option<&SockAddr>,
     parsed: &ParsedPacketHeaders,
+) -> WirePacketAdmission<'a> {
+    let socket_source = socket_source.and_then(SockAddr::as_socket);
+    let admitted = match admit_packet_with_parsed(spec, payload, socket_source, parsed) {
+        TransportAdmission::Accepted(admitted) => admitted,
+        TransportAdmission::Filtered(rejected) => {
+            return Err(
+                crate::worker_support::packet_admission::WirePacketRejection::Filtered(rejected),
+            );
+        }
+        TransportAdmission::ReceiveNoise(reason) => {
+            return Err(
+                crate::worker_support::packet_admission::WirePacketRejection::ReceiveNoise(reason),
+            );
+        }
+    };
+    admit_transport_packet(c2u, cfg, spec, admitted)
+}
+
+/// Reports whether an endpoint-admitted frame spends authenticated-work budget.
+/// Active/candidate data and cadence bypass it; controls and unknown sessions
+/// are charged before the remaining admission state machine.
+#[inline]
+pub(crate) fn transport_requires_authenticated_work(
+    spec: ReceiveContext<'_>,
+    admitted: &TransportPacket<'_>,
+) -> bool {
+    if spec.socket.proto != SupportedProtocol::ICMP {
+        return false;
+    }
+    if admitted.control.is_some() {
+        return true;
+    }
+    let Some(flags) = admitted.shim_flags else {
+        return false;
+    };
+    if flags & (SHIM_IS_DATA | SHIM_IS_CADENCE) == 0 {
+        return false;
+    }
+    let Some(observed_session) = admitted.session_id else {
+        return true;
+    };
+    let pending_matches = spec
+        .admission
+        .pending_icmp_client_lock
+        .is_some_and(|pending| pending.session_id() == Some(observed_session));
+    spec.admission.expected_session_id != Some(observed_session)
+        && !spec
+            .admission
+            .additional_sessions
+            .contains(observed_session)
+        && !pending_matches
+}
+
+#[inline]
+pub(crate) fn admit_transport_packet<'a>(
+    c2u: bool,
+    cfg: &RuntimeConfig,
+    spec: ReceiveContext<'_>,
+    admitted: TransportPacket<'a>,
 ) -> WirePacketAdmission<'a> {
     let dst_proto = if c2u {
         cfg.upstream_proto
     } else {
         cfg.listen_proto
     };
-
-    let admitted = match admit_packet_with_parsed(spec, payload, socket_source, parsed) {
-        TransportAdmission::Accepted(admitted) => admitted,
-        TransportAdmission::Filtered(rejected) => {
-            return WirePacketAdmission::Filtered(rejected);
-        }
-        TransportAdmission::ReceiveNoise(reason) => {
-            return WirePacketAdmission::ReceiveNoise(reason);
-        }
-    };
     let normalized_source = admitted.normalized_source;
 
     let event = match spec.socket.proto {
         SupportedProtocol::UDP => PayloadEvent::user_payload_plain(dst_proto, admitted.payload),
-        SupportedProtocol::ICMP => match decode_icmp_payload_event(
-            admitted.flow_identity.remote_source_id,
-            admitted.flow_identity.local_destination_id,
-            admitted.seq,
-            admitted.payload,
-            admitted.shim_flags,
-            admitted.reply_id_negotiation,
-            dst_proto,
-        ) {
+        SupportedProtocol::ICMP => match decode_icmp_payload_event(&admitted, dst_proto) {
             Ok(ev) => ev,
             Err(reason) => {
-                return WirePacketAdmission::Filtered(RejectedPacket {
-                    normalized_source,
-                    actual_dst_id: Some(admitted.flow_identity.local_destination_id),
-                    reason,
-                });
+                return Err(
+                    crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                        RejectedPacket {
+                            normalized_source,
+                            actual_dst_id: Some(admitted.local_destination_id()),
+                            reason,
+                        },
+                    ),
+                );
             }
         },
     };
 
     if event.payload_len() > cfg.max_payload {
-        return WirePacketAdmission::Filtered(RejectedPacket {
-            normalized_source,
-            actual_dst_id: Some(admitted.flow_identity.local_destination_id),
-            reason: RejectionReason::PayloadOversize,
-        });
+        return Err(
+            crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                RejectedPacket {
+                    normalized_source,
+                    actual_dst_id: Some(admitted.local_destination_id()),
+                    reason: RejectionReason::PayloadOversize,
+                },
+            ),
+        );
     }
 
     if event_advertised_reply_id(&event)
-        .is_some_and(|reply_id| reply_id != admitted.flow_identity.local_destination_id)
+        .is_some_and(|reply_id| reply_id != admitted.local_destination_id())
         && !spec.socket.can_honor_disjoint_icmp_ids()
-        && !admitted.is_handshake_or_debug
+        && !admitted.allows_control_identity_learning
     {
-        return WirePacketAdmission::Filtered(RejectedPacket {
-            normalized_source,
-            actual_dst_id: Some(admitted.flow_identity.local_destination_id),
-            reason: RejectionReason::UnsupportedDisjointReplyId,
-        });
+        return Err(
+            crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                RejectedPacket {
+                    normalized_source,
+                    actual_dst_id: Some(admitted.local_destination_id()),
+                    reason: RejectionReason::UnsupportedDisjointReplyId,
+                },
+            ),
+        );
     }
 
     let is_locked = spec.admission.locked_flow.is_some();
 
-    if is_locked
-        && spec.socket.proto == SupportedProtocol::ICMP
-        && event_negotiates_reply_id(&event)
-        && !admitted.is_handshake_or_debug
+    let mut unknown_session_for_reset = false;
+    if spec.socket.proto == SupportedProtocol::ICMP
+        && matches!(
+            event,
+            PayloadEvent::UserPayload { .. } | PayloadEvent::CadencePacket { .. }
+        )
     {
-        return WirePacketAdmission::Filtered(RejectedPacket {
-            normalized_source,
-            actual_dst_id: Some(admitted.flow_identity.local_destination_id),
-            reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
-        });
+        let Some(observed_session) = event.icmp_meta().map(|icmp| icmp.session_id()) else {
+            return Err(
+                crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                    RejectedPacket {
+                        normalized_source,
+                        actual_dst_id: Some(admitted.local_destination_id()),
+                        reason: RejectionReason::MalformedIcmpHeader(Some(
+                            crate::net::packet_headers::IcmpMalformedReason::MissingSessionId,
+                        )),
+                    },
+                ),
+            );
+        };
+        let pending_matches = spec
+            .admission
+            .pending_icmp_client_lock
+            .is_some_and(|pending| pending.session_id() == Some(observed_session));
+        if spec.admission.expected_session_id != Some(observed_session)
+            && !spec
+                .admission
+                .additional_sessions
+                .contains(observed_session)
+            && !pending_matches
+        {
+            if c2u && spec.socket.role == SocketLeg::ClientFacing && event.is_user_payload() {
+                unknown_session_for_reset = true;
+            } else {
+                return Err(
+                    crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                        RejectedPacket {
+                            normalized_source,
+                            actual_dst_id: Some(admitted.local_destination_id()),
+                            reason: RejectionReason::IcmpSessionMismatch,
+                        },
+                    ),
+                );
+            }
+        }
     }
 
     let mut lock_candidate = None;
     let mut pending_negotiation = None;
-    if c2u && spec.socket.role == SocketLeg::ClientFacing && !is_locked {
+    let mut reset_candidate = None;
+    if c2u && spec.socket.role == SocketLeg::ClientFacing {
         match &event {
             PayloadEvent::UserPayload { .. } => {
-                lock_candidate = if event_negotiates_reply_id(&event)
-                    || spec.socket.proto != SupportedProtocol::ICMP
-                {
+                if unknown_session_for_reset {
+                    reset_candidate = normalized_source.and_then(|src| {
+                        build_client_lock_candidate(
+                            src,
+                            spec.local_filter()?,
+                            cfg.listener_source_id_request,
+                            cfg.listen_proto,
+                            &event,
+                        )
+                    });
+                }
+                lock_candidate = if spec.socket.proto == SupportedProtocol::ICMP {
+                    spec.admission.pending_icmp_client_lock.filter(|pending| {
+                        pending_client_candidate_matches(
+                            *pending,
+                            normalized_source,
+                            event.icmp_meta().map(|icmp| icmp.session_id()),
+                        )
+                    })
+                } else if is_locked {
+                    // A stable UDP flow already carries its complete lock and
+                    // routing authority in the immutable admission snapshot.
+                    // Rebuilding and boxing that transition candidate here
+                    // would allocate once per forwarded client packet.
+                    None
+                } else {
                     normalized_source.and_then(|src| {
                         build_client_lock_candidate(
                             src,
@@ -655,101 +761,174 @@ pub(crate) fn admit_wire_packet_with_parsed<'a>(
                             &event,
                         )
                     })
-                } else if let Some(pending) = spec.admission.pending_icmp_client_lock {
-                    if normalized_source
-                        .is_some_and(|src| pending_matches_user_event(pending, src, &event))
-                    {
-                        Some(pending)
-                    } else {
-                        return WirePacketAdmission::Filtered(RejectedPacket {
-                            normalized_source,
-                            actual_dst_id: Some(admitted.flow_identity.local_destination_id),
-                            reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
-                        });
-                    }
-                } else {
-                    None
                 };
 
-                if lock_candidate.is_none() && spec.socket.proto == SupportedProtocol::ICMP {
-                    return WirePacketAdmission::Filtered(RejectedPacket {
-                        normalized_source,
-                        actual_dst_id: Some(admitted.flow_identity.local_destination_id),
-                        reason: RejectionReason::IcmpReplyIdNegotiationRequired,
-                    });
+                if !is_locked
+                    && lock_candidate.is_none()
+                    && spec.socket.proto == SupportedProtocol::ICMP
+                    && !unknown_session_for_reset
+                {
+                    return Err(
+                        crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                            RejectedPacket {
+                                normalized_source,
+                                actual_dst_id: Some(admitted.local_destination_id()),
+                                reason: RejectionReason::IcmpReplyIdNegotiationRequired,
+                            },
+                        ),
+                    );
                 }
             }
-            PayloadEvent::SessionControl { .. } => {
-                pending_negotiation = normalized_source.and_then(|src| {
-                    build_client_lock_candidate(
-                        src,
-                        spec.local_filter()?,
-                        cfg.listener_source_id_request,
-                        cfg.listen_proto,
-                        &event,
-                    )
-                });
+            PayloadEvent::SessionControl { icmp, .. } => {
+                if icmp.negotiates_reply_id() {
+                    let candidate = normalized_source.and_then(|src| {
+                        build_client_lock_candidate(
+                            src,
+                            spec.local_filter()?,
+                            cfg.listener_source_id_request,
+                            cfg.listen_proto,
+                            &event,
+                        )
+                    });
+                    pending_negotiation = if is_locked {
+                        candidate.filter(|candidate| {
+                            Some(candidate.flow_key) == spec.admission.locked_flow
+                                && candidate.listener_flow.inbound
+                                    == spec.admission.expected_inbound
+                                && candidate.session_id() != spec.admission.expected_session_id
+                        })
+                    } else {
+                        candidate
+                    };
+                    if is_locked && pending_negotiation.is_none() {
+                        return Err(
+                            crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                                RejectedPacket {
+                                    normalized_source,
+                                    actual_dst_id: Some(admitted.local_destination_id()),
+                                    reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
+                                },
+                            ),
+                        );
+                    }
+                }
             }
             PayloadEvent::CadencePacket { .. } => {}
         }
     }
 
-    WirePacketAdmission::Accepted(AdmittedWirePacket {
+    let candidate = if unknown_session_for_reset {
+        if lock_candidate.is_some() || pending_negotiation.is_some() {
+            return Err(
+                crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                    RejectedPacket {
+                        normalized_source,
+                        actual_dst_id: event.icmp_meta().map(|icmp| icmp.inbound_header_ident()),
+                        reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
+                    },
+                ),
+            );
+        }
+        ClientAdmissionCandidate::reset(reset_candidate)
+    } else {
+        match (lock_candidate, pending_negotiation) {
+            (Some(candidate), None) => ClientAdmissionCandidate::lock(candidate),
+            (None, Some(candidate)) => ClientAdmissionCandidate::negotiation(candidate),
+            (None, None) => ClientAdmissionCandidate::none(),
+            (Some(_), Some(_)) => {
+                return Err(
+                    crate::worker_support::packet_admission::WirePacketRejection::Filtered(
+                        RejectedPacket {
+                            normalized_source,
+                            actual_dst_id: event
+                                .icmp_meta()
+                                .map(|icmp| icmp.inbound_header_ident()),
+                            reason: RejectionReason::IcmpReplyIdRenegotiationMismatch,
+                        },
+                    ),
+                );
+            }
+        }
+    };
+    Ok(AdmittedWirePacket {
         trace: None,
         normalized_source,
         event,
-        lock_candidate,
-        pending_negotiation,
+        candidate,
     })
 }
 
 #[inline]
+fn pending_client_candidate_matches(
+    pending: PendingIcmpClientLock,
+    observed_source: Option<LogicalEndpoint>,
+    observed_session: Option<SessionId>,
+) -> bool {
+    let ClientFlowKey::Icmp(expected_source) = pending.flow_key else {
+        return false;
+    };
+    pending.session_id() == observed_session
+        && observed_source.is_some_and(|source| expected_source.matches_filter(source))
+}
+
+#[inline]
 fn decode_icmp_payload_event<'a>(
-    logical_src_id: u16,
-    logical_dst_id: u16,
-    seq: u16,
-    payload: &'a [u8],
-    shim_flags: Option<u8>,
-    reply_id_negotiation: Option<ReplyIdNegotiation>,
+    admitted: &TransportPacket<'a>,
     dst_proto: SupportedProtocol,
 ) -> Result<PayloadEvent<'a>, RejectionReason> {
-    let Some(shim) = shim_flags else {
-        return if payload.is_empty() {
-            Ok(PayloadEvent::cadence_packet(logical_dst_id, seq))
-        } else {
-            Err(RejectionReason::MalformedIcmpHeader(Some(
-                crate::net::packet_headers::IcmpMalformedReason::InvalidShimFlags,
-            )))
-        };
+    let identity = admitted
+        .icmp_identity()
+        .ok_or(RejectionReason::MalformedIcmpHeader(Some(
+            crate::net::packet_headers::IcmpMalformedReason::InvalidShimFlags,
+        )))?;
+    let Some(shim) = admitted.shim_flags else {
+        return Err(RejectionReason::MalformedIcmpHeader(Some(
+            crate::net::packet_headers::IcmpMalformedReason::InvalidShimFlags,
+        )));
     };
+    let session_id = admitted
+        .session_id
+        .ok_or(RejectionReason::MalformedIcmpHeader(Some(
+            crate::net::packet_headers::IcmpMalformedReason::ZeroSessionId,
+        )))?;
 
-    if (shim & SHIM_IS_DATA) != 0 {
-        return Ok(PayloadEvent::icmp_user_payload(
-            logical_src_id,
-            logical_dst_id,
-            seq,
-            dst_proto,
-            payload,
+    if (shim & SHIM_IS_CADENCE) != 0 {
+        return Ok(PayloadEvent::cadence_packet_with_source(
+            identity.remote_source_id(),
+            identity.local_destination_id(),
+            admitted.seq,
+            session_id,
         ));
     }
 
-    let Some(reply_id) = reply_id_negotiation else {
+    if (shim & SHIM_IS_DATA) != 0 {
+        return Ok(PayloadEvent::icmp_user_payload(
+            identity.remote_source_id(),
+            identity.local_destination_id(),
+            admitted.seq,
+            session_id,
+            dst_proto,
+            admitted.payload,
+        ));
+    }
+
+    let Some(control) = admitted.control else {
         return Err(RejectionReason::MalformedIcmpHeader(Some(
             crate::net::packet_headers::IcmpMalformedReason::SessionControlReplyIdLength,
         )));
     };
-    Ok(PayloadEvent::session_control_negotiation(
-        logical_src_id,
-        logical_dst_id,
-        seq,
+    Ok(PayloadEvent::session_control_v3(
+        identity.remote_source_id(),
+        identity.local_destination_id(),
+        admitted.seq,
         SupportedProtocol::ICMP,
-        reply_id,
+        control,
     ))
 }
 
 #[inline]
-fn is_valid_handshake_or_debug(
-    spec: ReceiveContext,
+fn allows_control_identity_learning(
+    spec: ReceiveContext<'_>,
     parsed: &ParsedPacketHeaders,
     normalized_source: Option<LogicalEndpoint>,
     reply_id: Option<ReplyIdNegotiation>,
@@ -763,7 +942,7 @@ fn is_valid_handshake_or_debug(
     if parsed
         .icmp
         .is_some_and(|icmp| icmp.identity.destination_id == expected_local_id)
-        && reply_id.is_some_and(|reply_id| reply_id.ack)
+        && reply_id.is_some_and(ReplyIdNegotiation::is_ack)
     {
         return true;
     }
@@ -776,7 +955,7 @@ fn is_valid_handshake_or_debug(
             return false;
         };
         let src_ip = parsed
-            .src_ip
+            .source_ip()
             .or_else(|| normalized_source.map(LogicalEndpoint::ip));
         let src_id = parsed.icmp.and_then(|icmp| icmp.identity.source_id);
 
@@ -797,199 +976,24 @@ fn is_valid_handshake_or_debug(
 
         if source_matches_local || connected_kernel_filtered_self {
             return reply_id.is_some_and(|reply_id| {
-                reply_id.negotiate && !reply_id.ack && reply_id.reply_id == expected_local_id
+                reply_id.is_negotiate() && reply_id.reply_id() == expected_local_id
             });
         }
     }
     false
 }
 
+use super::transport_client_flow::{build_client_lock_candidate, event_advertised_reply_id};
+
 #[inline]
-fn parse_icmp_reply_negotiation_for_admission(
-    shim_flags: Option<u8>,
-    payload: &[u8],
-) -> Result<Option<ReplyIdNegotiation>, RejectionReason> {
-    let Some(shim) = shim_flags else {
-        return if payload.is_empty() {
-            Ok(None)
-        } else {
-            Err(RejectionReason::MalformedIcmpHeader(Some(
-                crate::net::packet_headers::IcmpMalformedReason::InvalidShimFlags,
-            )))
-        };
-    };
-    parse_icmp_reply_negotiation(shim, payload)
-        .map_err(|reason| RejectionReason::MalformedIcmpHeader(Some(reason)))
+fn icmp_remote_ip_matches(actual: LogicalEndpoint, expected: LogicalEndpoint) -> bool {
+    expected.matches_ip_filter(actual)
 }
 
 #[inline]
-fn event_negotiates_reply_id(event: &PayloadEvent<'_>) -> bool {
-    match event {
-        PayloadEvent::UserPayload {
-            icmp: Some(icmp), ..
-        }
-        | PayloadEvent::SessionControl { icmp, .. } => icmp.negotiates_reply_id(),
-        _ => false,
-    }
+fn parsed_transport_has_ip(parsed: &ParsedPacketHeaders) -> bool {
+    matches!(
+        parsed.network,
+        ParsedNetworkLayer::Valid(_) | ParsedNetworkLayer::Unsupported { .. }
+    )
 }
-
-#[inline]
-fn event_advertised_reply_id(event: &PayloadEvent<'_>) -> Option<u16> {
-    match event {
-        PayloadEvent::UserPayload {
-            icmp: Some(icmp), ..
-        }
-        | PayloadEvent::SessionControl { icmp, .. } => icmp.advertised_reply_id(),
-        _ => None,
-    }
-}
-
-#[inline]
-fn pending_matches_user_event(
-    pending: PendingIcmpClientLock,
-    src: LogicalEndpoint,
-    event: &PayloadEvent<'_>,
-) -> bool {
-    let PayloadEvent::UserPayload {
-        icmp: Some(icmp), ..
-    } = event
-    else {
-        return false;
-    };
-    if pending.flow_key
-        != ClientFlowKey::from_icmp_reply_id(src, icmp.flow_identity().remote_source_id)
-    {
-        return false;
-    }
-    pending.listener_flow.inbound.is_some_and(|flow| {
-        icmp_remote_ip_matches(src, flow.src)
-            && flow.src.id() == icmp.flow_identity().remote_source_id
-            && flow.dst.id() == icmp.inbound_header_ident()
-    })
-}
-
-#[inline]
-fn build_client_lock_candidate(
-    src: LogicalEndpoint,
-    listen_local_recv: LogicalEndpoint,
-    listener_source_id_request: IcmpReplyIdRequest,
-    listen_proto: SupportedProtocol,
-    event: &PayloadEvent<'_>,
-) -> Option<PendingIcmpClientLock> {
-    let flow_key = client_flow_key_from_event(src, listen_proto, event)?;
-    let remote = match listen_proto {
-        SupportedProtocol::UDP => src,
-        SupportedProtocol::ICMP => match event {
-            PayloadEvent::UserPayload {
-                icmp: Some(icmp), ..
-            }
-            | PayloadEvent::SessionControl { icmp, .. } => {
-                src.with_id(icmp.flow_identity().remote_source_id)
-            }
-            _ => return None,
-        },
-    };
-    let inbound_local = match listen_proto {
-        SupportedProtocol::UDP => listen_local_recv,
-        SupportedProtocol::ICMP => match event {
-            PayloadEvent::UserPayload {
-                icmp: Some(icmp), ..
-            }
-            | PayloadEvent::SessionControl { icmp, .. } => {
-                listen_local_recv.with_id(icmp.inbound_header_ident())
-            }
-            _ => return None,
-        },
-    };
-    let outbound_local = match listen_proto {
-        SupportedProtocol::UDP => listen_local_recv,
-        SupportedProtocol::ICMP => match event {
-            PayloadEvent::UserPayload {
-                icmp: Some(icmp), ..
-            }
-            | PayloadEvent::SessionControl { icmp, .. } => listen_local_recv.with_id(
-                match listener_source_id_request.resolved_reply_id(icmp.inbound_header_ident()) {
-                    Some(id) => id,
-                    None => icmp.inbound_header_ident(),
-                },
-            ),
-            _ => return None,
-        },
-    };
-    Some(PendingIcmpClientLock {
-        flow_key,
-        listener_flow: SocketLegFlow::new(
-            Some(FlowTuple::new(remote, inbound_local)),
-            Some(FlowTuple::new(
-                outbound_local,
-                outbound_remote_for_event(remote, listen_proto, event),
-            )),
-        ),
-    })
-}
-
-#[inline]
-fn outbound_remote_for_event(
-    remote: LogicalEndpoint,
-    listen_proto: SupportedProtocol,
-    event: &PayloadEvent<'_>,
-) -> LogicalEndpoint {
-    if listen_proto != SupportedProtocol::ICMP {
-        return remote;
-    }
-    match event {
-        PayloadEvent::UserPayload {
-            icmp: Some(icmp), ..
-        }
-        | PayloadEvent::SessionControl { icmp, .. } => {
-            let reply_id = match icmp.reply_id_negotiation() {
-                Some(negotiation) => negotiation.reply_id,
-                None => icmp.flow_identity().remote_source_id,
-            };
-            remote.with_id(reply_id)
-        }
-        _ => remote,
-    }
-}
-
-#[inline]
-fn client_flow_key_from_event(
-    src: LogicalEndpoint,
-    listen_proto: SupportedProtocol,
-    event: &PayloadEvent<'_>,
-) -> Option<ClientFlowKey> {
-    match listen_proto {
-        SupportedProtocol::UDP => Some(ClientFlowKey::Udp(src)),
-        SupportedProtocol::ICMP => match event {
-            PayloadEvent::UserPayload {
-                icmp: Some(icmp), ..
-            }
-            | PayloadEvent::SessionControl { icmp, .. } => Some(ClientFlowKey::from_icmp_reply_id(
-                src,
-                icmp.flow_identity().remote_source_id,
-            )),
-            _ => None,
-        },
-    }
-}
-
-#[cfg(test)]
-#[path = "tests/general.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "tests/debug.rs"]
-mod debug_tests;
-
-#[cfg(test)]
-#[path = "tests/shim.rs"]
-mod shim_tests;
-
-#[cfg(test)]
-#[path = "tests/support.rs"]
-pub(crate) mod test_support;
-
-use super::raw_ip::{
-    icmp_remote_ip_matches, parse_raw_ip_source, parsed_transport_has_ip,
-    raw_packet_destination_matches,
-};

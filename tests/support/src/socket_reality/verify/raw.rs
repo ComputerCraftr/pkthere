@@ -45,16 +45,9 @@ fn find_observation(
         if key.domain != domain || key.role != role {
             continue;
         }
-        let kernel_addr = dump
-            .value
-            .pointer("/socket/local_kernel_addr")
-            .and_then(Value::as_str)
-            .ok_or_else(|| error("packet dump omitted local kernel address"))?
-            .parse::<SocketAddr>()
-            .map_err(|parse| error(format!("invalid kernel address: {parse}")))?;
-        if !same_socket_generation(diagnostics, key_value, kernel_addr) {
+        let Some(kernel_addr) = same_socket_generation(diagnostics, key_value)? else {
             continue;
-        }
+        };
         let source_id = icmp_id(&dump.value, "logical_source_id");
         let echo_id = icmp_id(&dump.value, "logical_destination_id");
         let (Some(source_id), Some(echo_id)) = (source_id, echo_id) else {
@@ -83,13 +76,19 @@ fn find_observation(
 fn same_socket_generation(
     diagnostics: &DiagnosticLogIndex,
     key_value: &Value,
-    kernel_addr: SocketAddr,
-) -> bool {
-    diagnostics.socket_evidence().any(|line| {
-        line.value.get("key") == Some(key_value)
-            && line.value.get("getsockname").and_then(Value::as_str)
-                == Some(kernel_addr.to_string().as_str())
-    })
+) -> Result<Option<SocketAddr>, VerificationError> {
+    diagnostics
+        .socket_evidence()
+        .find(|line| line.value.get("key") == Some(key_value))
+        .map(|line| {
+            line.value
+                .get("getsockname")
+                .and_then(Value::as_str)
+                .ok_or_else(|| error("socket evidence omitted getsockname"))?
+                .parse::<SocketAddr>()
+                .map_err(|parse| error(format!("invalid kernel address: {parse}")))
+        })
+        .transpose()
 }
 
 fn icmp_id(value: &Value, field: &str) -> Option<u16> {

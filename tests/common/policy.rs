@@ -1,93 +1,55 @@
-use pkthere_test_support::managed_child::{ChildIdentity, ChildLimits, ManagedChild};
-use pkthere_test_support::test_paths as path_policy;
-use pkthere_test_support::timing::MAX_WAIT_SECS;
-
 use proc_macro2::Span;
 use quote::ToTokens;
-use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::path::PathBuf;
 use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
-
-#[path = "policy_syntax.rs"]
+mod audit_authority_policy;
+#[cfg(test)]
+mod audit_authority_policy_tests;
+mod debug_assertion_policy;
+mod failure_containment_policy;
+mod finding_assertions;
+mod function_logic;
+#[cfg(test)]
+mod graph_policy_tests;
+mod inventory;
 mod policy_syntax;
-#[path = "portable_policy.rs"]
+mod policy_types;
 mod portable_policy;
-#[path = "socket_authority_policy.rs"]
+mod release_evidence_policy;
+#[cfg(test)]
+mod release_evidence_policy_tests;
+#[cfg(test)]
+mod reservation_policy_tests;
 mod socket_authority_policy;
-use policy_syntax::{attr_is_test_context, cfg_fragments, path_string, use_tree_has_glob};
-
-const MAX_SOURCE_LINES_EXCLUSIVE: usize = 1000;
-const MAX_FACADE_LINES: usize = 200;
-const DUPLICATE_FUNCTION_BODY_MIN_LEN: usize = 80;
-const DUPLICATE_TEST_BODY_MIN_LEN: usize = 80;
-const FACADE_ROOTS: &[&str] = &[
-    "src/net/sock_mgr",
-    "crates/wire/src/packet_headers",
-    "src/worker_support/packet_admission",
-    "tests/support/src/socket_reality",
-];
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum PolicyKind {
-    SyntacticDirectRecursion,
-    WildcardImport,
-    ForbiddenAllow,
-    LoopbackAlias,
-    UnconditionalDebug,
-    RetiredEndpointAuthority,
-    SocketLifecycleAuthority,
-    ManagerVersionAuthority,
-}
-
-impl PolicyKind {
-    fn description(self) -> &'static str {
-        match self {
-            Self::SyntacticDirectRecursion => "syntactic direct recursion",
-            Self::WildcardImport => "wildcard import",
-            Self::ForbiddenAllow => "forbidden allow attribute",
-            Self::LoopbackAlias => "forbidden loopback alias",
-            Self::UnconditionalDebug => "unconditional debug emission",
-            Self::RetiredEndpointAuthority => "retired endpoint authority",
-            Self::SocketLifecycleAuthority => "socket lifecycle authority violation",
-            Self::ManagerVersionAuthority => "socket-manager version authority violation",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct PolicyFinding {
-    pub kind: PolicyKind,
-    pub path: String,
-    pub line: usize,
-    pub item: String,
-    pub cfg_domain: String,
-    pub detail: String,
-}
-
-impl PolicyFinding {
-    fn render(&self) -> String {
-        let domain = if self.cfg_domain.is_empty() {
-            String::new()
-        } else {
-            format!(" [{}]", self.cfg_domain)
-        };
-        format!(
-            "{}:{}: {} in {}{}: {}",
-            self.path,
-            self.line,
-            self.kind.description(),
-            self.item,
-            domain,
-            self.detail
-        )
-    }
-}
+#[cfg(test)]
+mod socket_reality_policy_tests;
+mod test_execution_policy;
+#[cfg(test)]
+mod test_execution_policy_tests;
+mod workflow_policy;
+#[cfg(test)]
+mod workflow_policy_tests;
+use crate::common::rust_semantics::{atomic_operation_method, expression_uses_seq_cst};
+use function_logic::{
+    BindingCollector, DuplicateBodyKind, FunctionCallCollector, canonical_function_body,
+    contains_direct_recursion, duplicate_body_kind, expression_ast_depth,
+    function_graph_violations, module_scope_for_path,
+};
+use inventory::{
+    inventory_from_metadata, parse_file, read, relative, repo_root, source_line as line,
+    workspace_analysis, workspace_inventory,
+};
+use policy_syntax::{
+    TargetMask, attr_is_test_context, cfg_attr_has_ident, cfg_fragments, cfg_target_mask,
+    path_string, use_tree_has_glob,
+};
+use policy_types::{PolicyFinding, PolicyKind};
+pub use test_execution_policy::assert_tests_do_not_return_without_running;
+const POSIX_PRIVATE_TEMP_ROOT: &str = concat!("/private/", "tmp");
+const POSIX_TEMP_ROOT: &str = concat!("/", "tmp");
 
 #[derive(Clone, Debug)]
 struct FunctionRecord {
@@ -95,7 +57,15 @@ struct FunctionRecord {
     line: usize,
     name: String,
     cfg_domain: String,
+    target_mask: TargetMask,
     is_test: bool,
+    duplicate_body_kind: DuplicateBodyKind,
+    explicit_argument_count: usize,
+    has_receiver: bool,
+    module: String,
+    scope: String,
+    calls: BTreeSet<function_logic::CallReference>,
+    ast_depth: usize,
     body: String,
 }
 
@@ -103,14 +73,7 @@ struct FunctionRecord {
 struct ParsedSource {
     findings: Vec<PolicyFinding>,
     functions: Vec<FunctionRecord>,
-    top_level_items: Vec<TopLevelItem>,
-}
-
-#[derive(Debug)]
-struct TopLevelItem {
-    line: usize,
-    kind: &'static str,
-    facade_allowed: bool,
+    displaced_module_constants: Vec<(usize, String)>,
 }
 
 #[derive(Debug)]
@@ -127,66 +90,71 @@ struct WorkspaceAnalysis {
     parsed: BTreeMap<PathBuf, ParsedSource>,
 }
 
-pub fn assert_rust_source_files_stay_under_1000_lines() {
-    let inventory = workspace_inventory();
-    let offenders = inventory
-        .sources
-        .iter()
-        .filter_map(|path| {
-            let contents = read(path);
-            let lines = contents.lines().count();
-            (lines >= MAX_SOURCE_LINES_EXCLUSIVE)
-                .then(|| format!("{} has {lines} lines", relative(&inventory.repo_root, path)))
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        offenders.is_empty(),
-        "Rust source files must stay under {MAX_SOURCE_LINES_EXCLUSIVE} lines:\n{}",
-        offenders.join("\n")
-    );
+pub fn assert_rust_items_have_bounded_complexity() {
+    crate::common::source_layout_policy::assert_repository_valid();
+}
+
+pub fn assert_ci_workflow_has_executable_semantics() {
+    workflow_policy::assert_ci_workflow_has_executable_semantics();
+}
+
+pub fn assert_release_evidence_tests_execute_required_semantics() {
+    release_evidence_policy::assert_release_evidence_tests_execute_required_semantics();
+}
+
+pub(super) fn repository_root() -> PathBuf {
+    repo_root()
 }
 
 pub fn assert_tests_do_not_use_loopback_aliases() {
     assert_no_findings(&[PolicyKind::LoopbackAlias]);
 }
 
-pub fn assert_scoped_mod_files_are_small_facades() {
-    let repo_root = repo_root();
-    let mut files = Vec::new();
-    for root in FACADE_ROOTS {
-        collect_named_files(&repo_root.join(root), "mod.rs", &mut files);
-    }
-    let mut violations = Vec::new();
-    for path in files {
-        let rel = relative(&repo_root, &path);
-        let contents = read(&path);
-        let count = contents.lines().count();
-        if count > MAX_FACADE_LINES {
-            violations.push(format!("{rel} has {count} lines"));
-        }
-        let canonical = path.canonicalize().expect("canonical facade path");
-        let parsed = workspace_analysis()
-            .parsed
-            .get(&canonical)
-            .expect("facade belongs to workspace inventory");
-        for item in &parsed.top_level_items {
-            if !item.facade_allowed {
-                violations.push(format!(
-                    "{rel}:{} contains non-facade {}",
-                    item.line, item.kind
-                ));
-            }
-        }
-    }
+pub fn assert_rust_sources_use_platform_temporary_directories() {
+    assert_no_findings(&[PolicyKind::HardcodedTemporaryRoot]);
+}
+
+pub fn assert_module_constants_are_grouped_at_the_top() {
+    let analysis = workspace_analysis();
+    let violations = analysis
+        .parsed
+        .iter()
+        .flat_map(|(path, parsed)| {
+            let relative = relative(&analysis.inventory.repo_root, path);
+            parsed
+                .displaced_module_constants
+                .iter()
+                .map(move |(line, scope)| {
+                    format!(
+                        "{relative}:{line}: module-level const/static in {scope} follows a runtime item"
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
     assert!(
         violations.is_empty(),
-        "Scoped mod.rs files must be facade-only and at most {MAX_FACADE_LINES} lines:\n{}",
+        "Module-level constants and statics must be grouped after imports/module declarations and before runtime items:\n{}",
         violations.join("\n")
     );
 }
 
+pub fn assert_production_protocols_use_explicit_publication_ordering() {
+    assert_no_findings(&[PolicyKind::SequentiallyConsistentProtocol]);
+}
+
 pub fn assert_syntactic_direct_recursion_is_forbidden() {
     assert_no_findings(&[PolicyKind::SyntacticDirectRecursion]);
+    let violations = function_graph_violations(
+        workspace_analysis()
+            .parsed
+            .values()
+            .flat_map(|parsed| parsed.functions.iter()),
+    );
+    assert!(
+        violations.is_empty(),
+        "Recursive or excessively deep function graphs are forbidden:\n{}",
+        violations.join("\n")
+    );
 }
 
 pub fn assert_dead_code_allows_are_forbidden() {
@@ -208,6 +176,7 @@ pub fn assert_endpoint_and_socket_authority_is_centralized() {
     assert_no_findings(&[
         PolicyKind::RetiredEndpointAuthority,
         PolicyKind::SocketLifecycleAuthority,
+        PolicyKind::InlineSocketPlatformDecision,
     ]);
 }
 
@@ -215,62 +184,110 @@ pub fn assert_manager_version_authority_is_transactional() {
     assert_no_findings(&[PolicyKind::ManagerVersionAuthority]);
 }
 
-pub fn assert_legacy_text_scanners_are_forbidden() {
-    let forbidden_names = [
-        ["sanitize_rust_", "source"].concat(),
-        ["find_function_", "defs"].concat(),
-        ["collect_preceding_", "attrs"].concat(),
-        ["strip_cfg_test_", "items"].concat(),
-        ["detect_direct_recursion_", "in_rust_text"].concat(),
-    ];
-    let inventory = workspace_inventory();
-    let violations = inventory
-        .sources
-        .iter()
-        .filter_map(|path| {
-            let source = read(path);
-            forbidden_names
-                .iter()
-                .find(|name| source.contains(name.as_str()))
-                .map(|name| {
-                    format!(
-                        "{} contains retired text scanner {name}",
-                        relative(&inventory.repo_root, path)
-                    )
-                })
-        })
-        .collect::<Vec<_>>();
+pub fn assert_stats_and_required_evidence_fail_closed() {
+    assert_no_findings(&[
+        PolicyKind::CoherentStatsAuthority,
+        PolicyKind::RequiredEvidenceDefault,
+    ]);
+}
+
+pub fn assert_production_code_has_no_debug_only_assertions() {
+    assert_no_findings(&[PolicyKind::ProductionDebugAssertion]);
+}
+
+pub fn assert_production_code_has_no_explicit_panic_surfaces() {
+    assert_no_findings(&[PolicyKind::ProductionPanicSurface]);
+}
+
+pub fn assert_failure_containment_is_fail_closed() {
+    assert_no_findings(&[PolicyKind::FailureContainmentAuthority]);
+}
+
+pub fn assert_interior_mutability_authorities_are_registered() {
+    assert_no_findings(&[PolicyKind::InteriorMutabilityAuthority]);
+}
+
+pub fn assert_production_types_have_no_mutable_test_only_authority() {
+    assert_no_findings(&[PolicyKind::TestStateAuthority]);
+}
+
+pub fn assert_no_duplicate_function_logic_in_workspace() {
+    let violations = duplicate_logic_violations(
+        workspace_analysis()
+            .parsed
+            .values()
+            .flat_map(|parsed| parsed.functions.iter()),
+    );
     assert!(
         violations.is_empty(),
-        "legacy source scanners must not return:\n{}",
+        "AST-normalized function logic is duplicated:\n{}",
         violations.join("\n")
     );
 }
 
-pub fn assert_no_exact_duplicate_bodies_in_workspace() {
-    let mut groups = BTreeMap::<(bool, String, String), Vec<&FunctionRecord>>::new();
-    for parsed in workspace_analysis().parsed.values() {
-        for function in &parsed.functions {
-            let minimum = if function.is_test {
-                DUPLICATE_TEST_BODY_MIN_LEN
-            } else {
-                DUPLICATE_FUNCTION_BODY_MIN_LEN
-            };
-            if function.body.len() >= minimum {
-                groups
-                    .entry((
-                        function.is_test,
-                        function.cfg_domain.clone(),
-                        function.body.clone(),
-                    ))
-                    .or_default()
-                    .push(function);
+pub fn assert_rust_source_semantic_policies_are_ast_backed() {
+    let root = repo_root();
+    let policy_root = root.join("tests/common");
+    let parsed = workspace_inventory()
+        .sources
+        .iter()
+        .filter(|source| source.starts_with(&policy_root))
+        .map(|source| (source, crate::common::rust_semantics::parse_file(source)))
+        .collect::<Vec<_>>();
+    let mut source_readers = std::collections::BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (_, syntax) in &parsed {
+            for reader in
+                crate::common::rust_semantics::source_text_reader_functions(syntax, &source_readers)
+            {
+                changed |= source_readers.insert(reader);
             }
         }
+        if !changed {
+            break;
+        }
     }
-    let violations = groups
+    let violations = parsed
+        .iter()
+        .filter_map(|(source, syntax)| {
+            let scans = crate::common::rust_semantics::raw_rust_source_semantic_scans_with_readers(
+                syntax,
+                &source_readers,
+            );
+            (!scans.is_empty())
+                .then(|| format!("{}: {}", relative(&root, source), scans.join(", ")))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        violations.is_empty(),
+        "Rust source semantics must be derived from parsed ASTs, not raw text:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn duplicate_logic_violations<'a>(
+    functions: impl IntoIterator<Item = &'a FunctionRecord>,
+) -> Vec<String> {
+    let mut groups = BTreeMap::<(bool, String), Vec<&FunctionRecord>>::new();
+    for function in functions {
+        if function.duplicate_body_kind == DuplicateBodyKind::TrivialAdapter {
+            continue;
+        }
+        groups
+            .entry((function.is_test, function.body.clone()))
+            .or_default()
+            .push(function);
+    }
+    groups
         .into_values()
-        .filter(|records| records.len() > 1)
+        .filter(|records| {
+            records.iter().enumerate().any(|(index, left)| {
+                records[index + 1..]
+                    .iter()
+                    .any(|right| left.target_mask.overlaps(right.target_mask))
+            })
+        })
         .map(|records| {
             let category = if records[0].is_test {
                 "test"
@@ -282,14 +299,9 @@ pub fn assert_no_exact_duplicate_bodies_in_workspace() {
                 .map(|record| format!("{}:{}: {}()", record.path, record.line, record.name))
                 .collect::<Vec<_>>()
                 .join("\n  ");
-            format!("exact duplicate {category} body in one cfg domain:\n  {locations}")
+            format!("alpha-equivalent duplicate {category} logic in one cfg domain:\n  {locations}")
         })
-        .collect::<Vec<_>>();
-    assert!(
-        violations.is_empty(),
-        "Exact normalized function bodies are duplicated:\n{}",
-        violations.join("\n")
-    );
+        .collect()
 }
 
 pub fn assert_portable_build_configuration() {
@@ -299,27 +311,20 @@ pub fn assert_portable_build_configuration() {
 fn analyze_rust_source(path: &str, source: &str) -> ParsedSource {
     let file = parse_file(path, source);
     let socket_aliases = socket_authority_policy::socket_type_aliases(&file);
-    let top_level_items = file
-        .items
-        .iter()
-        .map(|item| TopLevelItem {
-            line: line(item.span()),
-            kind: item_kind(item),
-            facade_allowed: matches!(
-                item,
-                syn::Item::Use(syn::ItemUse {
-                    vis: syn::Visibility::Public(_) | syn::Visibility::Restricted(_),
-                    ..
-                }) | syn::Item::Mod(syn::ItemMod { content: None, .. })
-            ),
-        })
-        .collect();
+    let mut displaced_module_constants = Vec::new();
+    finding_assertions::collect_displaced_constants(
+        &file.items,
+        "crate",
+        &mut displaced_module_constants,
+    );
     let mut collector = AstCollector::new(path, socket_aliases);
+    let file_state = collector.enter_attrs(&file.attrs);
     collector.visit_file(&file);
+    collector.leave_attrs(file_state);
     ParsedSource {
         findings: collector.findings,
         functions: collector.functions,
-        top_level_items,
+        displaced_module_constants,
     }
 }
 
@@ -328,30 +333,7 @@ fn assert_no_findings(kinds: &[PolicyKind]) {
 }
 
 fn assert_no_findings_in_paths(kinds: &[PolicyKind], governed_paths: &[&str]) {
-    let analysis = workspace_analysis();
-    let expected = kinds.iter().copied().collect::<BTreeSet<_>>();
-    let mut findings = Vec::new();
-    for (path, parsed) in &analysis.parsed {
-        let rel = relative(&analysis.inventory.repo_root, path);
-        if !governed_paths.is_empty() && !governed_paths.contains(&rel.as_str()) {
-            continue;
-        }
-        findings.extend(
-            parsed
-                .findings
-                .iter()
-                .filter(|finding| expected.contains(&finding.kind)),
-        );
-    }
-    assert!(
-        findings.is_empty(),
-        "Rust syntax policy violations:\n{}",
-        findings
-            .iter()
-            .map(|finding| finding.render())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    finding_assertions::assert_none(workspace_analysis(), kinds, governed_paths);
 }
 
 struct AstCollector<'a> {
@@ -359,9 +341,16 @@ struct AstCollector<'a> {
     findings: Vec<PolicyFinding>,
     functions: Vec<FunctionRecord>,
     cfg_stack: Vec<String>,
+    target_mask: TargetMask,
     test_depth: usize,
+    const_depth: usize,
     drop_impl_depth: usize,
+    trait_impl_depth: usize,
+    function_depth: usize,
     socket_aliases: BTreeSet<String>,
+    scope: Vec<String>,
+    module_depth: usize,
+    generic_type_scopes: Vec<BTreeSet<String>>,
 }
 
 impl<'a> AstCollector<'a> {
@@ -371,31 +360,93 @@ impl<'a> AstCollector<'a> {
             findings: Vec::new(),
             functions: Vec::new(),
             cfg_stack: Vec::new(),
+            target_mask: TargetMask::all(),
             test_depth: 0,
+            const_depth: 0,
             drop_impl_depth: 0,
+            trait_impl_depth: 0,
+            function_depth: 0,
             socket_aliases,
+            scope: vec![module_scope_for_path(path)],
+            module_depth: 1,
+            generic_type_scopes: Vec::new(),
         }
     }
 
-    fn enter_attrs(&mut self, attrs: &[syn::Attribute]) -> (usize, usize) {
+    fn enter_generics(&mut self, generics: &syn::Generics) {
+        self.generic_type_scopes.push(
+            generics
+                .params
+                .iter()
+                .filter_map(|parameter| match parameter {
+                    syn::GenericParam::Type(parameter) => Some(parameter.ident.to_string()),
+                    syn::GenericParam::Lifetime(_) | syn::GenericParam::Const(_) => None,
+                })
+                .collect(),
+        );
+    }
+
+    fn leave_generics(&mut self) {
+        drop(self.generic_type_scopes.pop());
+    }
+
+    fn generic_type_shadows(&self, path: &syn::Path) -> bool {
+        path.leading_colon.is_none()
+            && path.segments.len() == 1
+            && self.generic_type_scopes.iter().rev().any(|scope| {
+                path.segments
+                    .first()
+                    .is_some_and(|segment| scope.contains(&segment.ident.to_string()))
+            })
+    }
+
+    fn enter_attrs(&mut self, attrs: &[syn::Attribute]) -> (usize, usize, TargetMask) {
         let cfg_len = self.cfg_stack.len();
         let test_depth = self.test_depth;
+        let target_mask = self.target_mask;
         self.cfg_stack.extend(cfg_fragments(attrs));
+        self.target_mask = self.target_mask.intersect(cfg_target_mask(attrs));
         if attrs.iter().any(attr_is_test_context) {
             self.test_depth += 1;
         }
-        (cfg_len, test_depth)
+        (cfg_len, test_depth, target_mask)
     }
 
-    fn leave_attrs(&mut self, state: (usize, usize)) {
+    fn leave_attrs(&mut self, state: (usize, usize, TargetMask)) {
         self.cfg_stack.truncate(state.0);
         self.test_depth = state.1;
+        self.target_mask = state.2;
     }
 
     fn cfg_domain(&self) -> String {
         let mut fragments = self.cfg_stack.clone();
         fragments.sort();
         fragments.join(" && ")
+    }
+
+    fn is_production_context(&self) -> bool {
+        if self.test_depth != 0 || self.const_depth != 0 {
+            return false;
+        }
+        let governed_root = self.path.starts_with("src/")
+            || self.path.starts_with("crates/socket_policy/src/")
+            || self.path.starts_with("crates/wire/src/");
+        governed_root
+            && !self.path.contains("/tests/")
+            && !self.path.ends_with("/tests.rs")
+            && !self.path.ends_with("/test_support.rs")
+            && !self.path.ends_with("_tests.rs")
+    }
+
+    fn record_panic_surface(&mut self, span: Span, item: &str, detail: String) {
+        self.findings.push(PolicyFinding {
+            kind: PolicyKind::ProductionPanicSurface,
+            path: self.path.to_string(),
+            line: line(span),
+            item: item.to_string(),
+            cfg_domain: self.cfg_domain(),
+            detail,
+        });
     }
 
     fn record_function(
@@ -406,9 +457,21 @@ impl<'a> AstCollector<'a> {
         is_method: bool,
     ) {
         let name = ident.to_string();
-        let mut recursion = RecursionVisitor::new(&name, is_method);
-        recursion.visit_block(block);
-        if recursion.found {
+        let explicit_argument_count = inputs
+            .iter()
+            .filter(|input| matches!(input, syn::FnArg::Typed(_)))
+            .count();
+        let has_receiver = inputs
+            .iter()
+            .any(|input| matches!(input, syn::FnArg::Receiver(_)));
+        if contains_direct_recursion(
+            &name,
+            is_method,
+            self.trait_impl_depth != 0,
+            has_receiver,
+            explicit_argument_count,
+            block,
+        ) {
             self.findings.push(PolicyFinding {
                 kind: PolicyKind::SyntacticDirectRecursion,
                 path: self.path.to_string(),
@@ -422,20 +485,51 @@ impl<'a> AstCollector<'a> {
             .extend(socket_authority_policy::analyze_function(
                 self.path,
                 &name,
-                self.test_depth != 0,
+                self.test_depth != 0
+                    || self.path.contains("/tests/")
+                    || self.path.ends_with("/tests.rs")
+                    || self.path.ends_with("_tests.rs"),
                 self.cfg_domain(),
                 inputs,
                 &self.socket_aliases,
                 block,
             ));
+        self.findings
+            .extend(failure_containment_policy::analyze_function(
+                self.path,
+                &name,
+                !self.is_production_context(),
+                self.cfg_domain(),
+                block,
+            ));
         if self.drop_impl_depth == 0 || name != "drop" {
+            let mut bindings = BindingCollector::default();
+            for input in inputs {
+                if let syn::FnArg::Typed(argument) = input {
+                    bindings.visit_pat(&argument.pat);
+                }
+            }
+            bindings.visit_block(block);
+            let mut calls = FunctionCallCollector {
+                calls: BTreeSet::new(),
+                local_bindings: bindings.names.into_iter().collect(),
+            };
+            calls.visit_block(block);
             self.functions.push(FunctionRecord {
                 path: self.path.to_string(),
                 line: line(ident.span()),
                 name,
                 cfg_domain: self.cfg_domain(),
+                target_mask: self.target_mask,
                 is_test: self.test_depth != 0,
-                body: block.to_token_stream().to_string(),
+                duplicate_body_kind: duplicate_body_kind(block, self.trait_impl_depth != 0),
+                explicit_argument_count,
+                has_receiver,
+                module: self.scope[..self.module_depth].join("::"),
+                scope: self.scope.join("::"),
+                calls: calls.calls,
+                ast_depth: expression_ast_depth(block),
+                body: canonical_function_body(inputs, block),
             });
         }
     }
@@ -444,6 +538,24 @@ impl<'a> AstCollector<'a> {
 impl<'ast> Visit<'ast> for AstCollector<'_> {
     fn visit_lit_str(&mut self, value: &'ast syn::LitStr) {
         let text = value.value();
+        if text == POSIX_TEMP_ROOT
+            || text
+                .strip_prefix(POSIX_TEMP_ROOT)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            || text == POSIX_PRIVATE_TEMP_ROOT
+            || text
+                .strip_prefix(POSIX_PRIVATE_TEMP_ROOT)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::HardcodedTemporaryRoot,
+                path: self.path.to_string(),
+                line: line(value.span()),
+                item: "string literal".to_string(),
+                cfg_domain: self.cfg_domain(),
+                detail: "use std::env::temp_dir() and PathBuf composition".to_string(),
+            });
+        }
         for alias in [["127.0.0.", "2"].concat(), ["127.0.0.", "3"].concat()] {
             if text.contains(&alias) {
                 self.findings.push(PolicyFinding {
@@ -459,10 +571,19 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
         syn::visit::visit_lit_str(self, value);
     }
 
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        syn::visit::visit_expr_path(self, expression);
+    }
+
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+        if let Some(finding) =
+            debug_assertion_policy::analyze_attribute(self.path, self.cfg_domain(), attr)
+        {
+            self.findings.push(finding);
+        }
         if attr.path().is_ident("allow") {
             let mut forbidden = Vec::new();
-            let _ = attr.parse_nested_meta(|meta| {
+            drop(attr.parse_nested_meta(|meta| {
                 let name = path_string(&meta.path);
                 if matches!(
                     name.as_str(),
@@ -471,11 +592,12 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
                         | "unused_imports"
                         | "unused_variables"
                         | "clippy::duplicate_mod"
+                        | "clippy::large_enum_variant"
                 ) {
                     forbidden.push(name);
                 }
                 Ok(())
-            });
+            }));
             if !forbidden.is_empty() {
                 self.findings.push(PolicyFinding {
                     kind: PolicyKind::ForbiddenAllow,
@@ -487,10 +609,32 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
                 });
             }
         }
+        if self.path == "src/net/socket.rs"
+            && attr.path().is_ident("cfg")
+            && ["unix", "windows", "target_os"]
+                .iter()
+                .any(|expected| cfg_attr_has_ident(attr, expected))
+        {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::InlineSocketPlatformDecision,
+                path: self.path.to_string(),
+                line: line(attr.span()),
+                item: "socket setup attribute".to_string(),
+                cfg_domain: self.cfg_domain(),
+                detail:
+                    "consume typed socket policy and dispatch through src/net/socket/platform.rs"
+                        .to_string(),
+            });
+        }
         syn::visit::visit_attribute(self, attr);
     }
 
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if let Some(finding) =
+            socket_authority_policy::analyze_use(self.path, self.cfg_domain(), item)
+        {
+            self.findings.push(finding);
+        }
         if use_tree_has_glob(&item.tree) {
             self.findings.push(PolicyFinding {
                 kind: PolicyKind::WildcardImport,
@@ -505,6 +649,11 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
     }
 
     fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        self.findings.extend(audit_authority_policy::analyze_struct(
+            self.path,
+            self.cfg_domain(),
+            item,
+        ));
         if item.ident != "SocketStateSnapshot" {
             for field in &item.fields {
                 if field.ident.as_ref().is_some_and(|ident| {
@@ -525,10 +674,48 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
         self.findings
             .extend(socket_authority_policy::analyze_struct(
                 self.path,
+                self.test_depth != 0
+                    || self.path.contains("/tests/")
+                    || self.path.ends_with("/tests.rs")
+                    || self.path.ends_with("_tests.rs"),
                 self.cfg_domain(),
                 item,
             ));
+        self.enter_generics(&item.generics);
         syn::visit::visit_item_struct(self, item);
+        self.leave_generics();
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if self.is_production_context()
+            && atomic_operation_method(&call.method.to_string())
+            && call.args.iter().any(expression_uses_seq_cst)
+        {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::SequentiallyConsistentProtocol,
+                path: self.path.to_string(),
+                line: line(call.span()),
+                item: "atomic ordering".to_string(),
+                cfg_domain: self.cfg_domain(),
+                detail: "use explicit Acquire observation, Release publication, and AcqRel CAS ownership"
+                    .to_string(),
+            });
+        }
+        if self.is_production_context()
+            && matches!(call.method.to_string().as_str(), "unwrap" | "expect")
+        {
+            self.record_panic_surface(
+                call.method.span(),
+                &format!("{}()", call.method),
+                "production Result/Option handling must be typed or fail-closed".to_string(),
+            );
+        }
+        if let Some(finding) =
+            audit_authority_policy::analyze_method_call(self.path, self.cfg_domain(), call)
+        {
+            self.findings.push(finding);
+        }
+        syn::visit::visit_expr_method_call(self, call);
     }
 
     fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
@@ -537,7 +724,9 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
         {
             self.findings.push(finding);
         }
+        self.enter_generics(&item.generics);
         syn::visit::visit_item_enum(self, item);
+        self.leave_generics();
     }
 
     fn visit_ident(&mut self, ident: &'ast syn::Ident) {
@@ -554,7 +743,59 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
         syn::visit::visit_ident(self, ident);
     }
 
+    fn visit_path(&mut self, path: &'ast syn::Path) {
+        if self.is_production_context()
+            && self.function_depth == 0
+            && !self.generic_type_shadows(path)
+            && let Some(finding) = audit_authority_policy::analyze_interior_mutability_path(
+                self.path,
+                self.cfg_domain(),
+                path,
+            )
+        {
+            self.findings.push(finding);
+        }
+        syn::visit::visit_path(self, path);
+    }
+
     fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        if self.is_production_context()
+            && let Some(finding) = audit_authority_policy::analyze_interior_mutability_macro(
+                self.path,
+                self.cfg_domain(),
+                item,
+            )
+        {
+            self.findings.push(finding);
+        }
+        if self.is_production_context()
+            && item.path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.to_string().as_str(),
+                    "assert"
+                        | "assert_eq"
+                        | "assert_ne"
+                        | "panic"
+                        | "unreachable"
+                        | "todo"
+                        | "unimplemented"
+                )
+            })
+        {
+            self.record_panic_surface(
+                item.span(),
+                "macro",
+                format!(
+                    "{}! is forbidden in production runtime context",
+                    item.path.to_token_stream()
+                ),
+            );
+        }
+        if let Some(finding) =
+            debug_assertion_policy::analyze_macro(self.path, self.cfg_domain(), item)
+        {
+            self.findings.push(finding);
+        }
         if item
             .path
             .segments
@@ -586,12 +827,57 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         let state = self.enter_attrs(&item.attrs);
+        self.scope.push(item.ident.to_string());
+        self.module_depth += 1;
         syn::visit::visit_item_mod(self, item);
+        self.module_depth -= 1;
+        self.scope.pop();
         self.leave_attrs(state);
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        self.const_depth += 1;
+        syn::visit::visit_item_const(self, item);
+        self.const_depth -= 1;
+    }
+
+    fn visit_impl_item_const(&mut self, item: &'ast syn::ImplItemConst) {
+        self.const_depth += 1;
+        syn::visit::visit_impl_item_const(self, item);
+        self.const_depth -= 1;
+    }
+
+    fn visit_trait_item_const(&mut self, item: &'ast syn::TraitItemConst) {
+        self.const_depth += 1;
+        syn::visit::visit_trait_item_const(self, item);
+        self.const_depth -= 1;
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        self.const_depth += 1;
+        syn::visit::visit_item_static(self, item);
+        self.const_depth -= 1;
     }
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         let state = self.enter_attrs(&item.attrs);
+        if let Some(finding) =
+            audit_authority_policy::analyze_unsafe_thread_impl(self.path, self.cfg_domain(), item)
+        {
+            self.findings.push(finding);
+        }
+        let implementation_scope = item.trait_.as_ref().map_or_else(
+            || item.self_ty.to_token_stream().to_string(),
+            |(trait_path, _)| {
+                format!(
+                    "{} as {}",
+                    item.self_ty.to_token_stream(),
+                    trait_path.to_token_stream()
+                )
+            },
+        );
+        self.scope.push(implementation_scope);
+        self.enter_generics(&item.generics);
         let drop_impl = item.trait_.as_ref().is_some_and(|(path, _)| {
             path.segments
                 .last()
@@ -600,375 +886,111 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
         if drop_impl {
             self.drop_impl_depth += 1;
         }
+        if item.trait_.is_some() {
+            self.trait_impl_depth += 1;
+        }
         syn::visit::visit_item_impl(self, item);
+        if item.trait_.is_some() {
+            self.trait_impl_depth -= 1;
+        }
         if drop_impl {
             self.drop_impl_depth -= 1;
         }
+        self.leave_generics();
+        self.scope.pop();
+        self.leave_attrs(state);
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        let state = self.enter_attrs(&field.attrs);
+        syn::visit::visit_field(self, field);
         self.leave_attrs(state);
     }
 
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
         let state = self.enter_attrs(&item.attrs);
+        self.scope.push(item.ident.to_string());
+        self.enter_generics(&item.generics);
         syn::visit::visit_item_trait(self, item);
+        self.leave_generics();
+        self.scope.pop();
         self.leave_attrs(state);
     }
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if let Some(finding) = audit_authority_policy::analyze_test_only_mutator(
+            self.path,
+            self.cfg_domain(),
+            &item.attrs,
+            &item.sig,
+            &item.block,
+        ) {
+            self.findings.push(finding);
+        }
         let state = self.enter_attrs(&item.attrs);
+        if let Some(finding) = audit_authority_policy::analyze_function_signature(
+            self.path,
+            self.cfg_domain(),
+            &item.sig,
+        ) {
+            self.findings.push(finding);
+        }
         self.record_function(&item.sig.ident, &item.sig.inputs, &item.block, false);
+        self.enter_generics(&item.sig.generics);
+        self.function_depth += 1;
         syn::visit::visit_item_fn(self, item);
+        self.function_depth -= 1;
+        self.leave_generics();
         self.leave_attrs(state);
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if let Some(finding) = audit_authority_policy::analyze_test_only_mutator(
+            self.path,
+            self.cfg_domain(),
+            &item.attrs,
+            &item.sig,
+            &item.block,
+        ) {
+            self.findings.push(finding);
+        }
         let state = self.enter_attrs(&item.attrs);
+        if let Some(finding) = audit_authority_policy::analyze_function_signature(
+            self.path,
+            self.cfg_domain(),
+            &item.sig,
+        ) {
+            self.findings.push(finding);
+        }
         self.record_function(&item.sig.ident, &item.sig.inputs, &item.block, true);
+        self.enter_generics(&item.sig.generics);
+        self.function_depth += 1;
         syn::visit::visit_impl_item_fn(self, item);
+        self.function_depth -= 1;
+        self.leave_generics();
         self.leave_attrs(state);
     }
 
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
         let state = self.enter_attrs(&item.attrs);
+        if let Some(finding) = audit_authority_policy::analyze_function_signature(
+            self.path,
+            self.cfg_domain(),
+            &item.sig,
+        ) {
+            self.findings.push(finding);
+        }
         if let Some(block) = &item.default {
             self.record_function(&item.sig.ident, &item.sig.inputs, block, true);
         }
+        self.enter_generics(&item.sig.generics);
+        self.function_depth += 1;
         syn::visit::visit_trait_item_fn(self, item);
+        self.function_depth -= 1;
+        self.leave_generics();
         self.leave_attrs(state);
     }
 }
 
-struct RecursionVisitor<'a> {
-    name: &'a str,
-    is_method: bool,
-    found: bool,
-}
-
-impl<'a> RecursionVisitor<'a> {
-    fn new(name: &'a str, is_method: bool) -> Self {
-        Self {
-            name,
-            is_method,
-            found: false,
-        }
-    }
-}
-
-impl<'ast> Visit<'ast> for RecursionVisitor<'_> {
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = &*call.func {
-            let segments = path
-                .path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect::<Vec<_>>();
-            let bare_free = !self.is_method && segments.as_slice() == [self.name];
-            let self_free = !self.is_method
-                && segments.len() == 2
-                && segments[0] == "self"
-                && segments[1] == self.name;
-            let self_associated = self.is_method
-                && segments.len() == 2
-                && segments[0] == "Self"
-                && segments[1] == self.name;
-            self.found |= bare_free || self_free || self_associated;
-        }
-        syn::visit::visit_expr_call(self, call);
-    }
-
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        let self_receiver = matches!(
-            &*call.receiver,
-            syn::Expr::Path(path) if path.path.is_ident("self")
-        );
-        self.found |= self.is_method && self_receiver && call.method == self.name;
-        syn::visit::visit_expr_method_call(self, call);
-    }
-
-    fn visit_item_fn(&mut self, _item: &'ast syn::ItemFn) {}
-    fn visit_impl_item_fn(&mut self, _item: &'ast syn::ImplItemFn) {}
-    fn visit_trait_item_fn(&mut self, _item: &'ast syn::TraitItemFn) {}
-}
-
-fn workspace_inventory() -> &'static WorkspaceInventory {
-    &workspace_analysis().inventory
-}
-
-fn workspace_analysis() -> &'static WorkspaceAnalysis {
-    static ANALYSIS: OnceLock<WorkspaceAnalysis> = OnceLock::new();
-    ANALYSIS.get_or_init(|| {
-        let inventory = load_workspace_inventory();
-        let parsed = inventory
-            .sources
-            .iter()
-            .map(|path| {
-                let relative_path = relative(&inventory.repo_root, path);
-                (
-                    path.clone(),
-                    analyze_rust_source(&relative_path, &read(path)),
-                )
-            })
-            .collect();
-        WorkspaceAnalysis { inventory, parsed }
-    })
-}
-
-fn load_workspace_inventory() -> WorkspaceInventory {
-    let repo_root = repo_root();
-    let mut command = Command::new(env!("CARGO"));
-    command.current_dir(&repo_root).args([
-        "metadata",
-        "--locked",
-        "--format-version",
-        "1",
-        "--no-deps",
-    ]);
-    let child = ManagedChild::spawn(
-        &mut command,
-        ChildIdentity::new("workspace cargo metadata"),
-        ChildLimits::default(),
-    )
-    .expect("spawn cargo metadata");
-    let completed = child
-        .wait_until(Instant::now() + MAX_WAIT_SECS)
-        .expect("bounded cargo metadata");
-    assert!(
-        completed.exit.success,
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&completed.output.stderr)
-    );
-    let metadata: JsonValue =
-        serde_json::from_slice(&completed.output.stdout).expect("parse cargo metadata JSON");
-    inventory_from_metadata(&repo_root, &metadata)
-}
-
-fn inventory_from_metadata(repo_root: &Path, metadata: &JsonValue) -> WorkspaceInventory {
-    let workspace_ids = metadata["workspace_members"]
-        .as_array()
-        .expect("workspace member IDs")
-        .iter()
-        .filter_map(JsonValue::as_str)
-        .collect::<BTreeSet<_>>();
-    let packages = metadata["packages"].as_array().expect("metadata packages");
-    let mut manifests = Vec::new();
-    let mut roots = Vec::new();
-    let mut has_custom_build_target = false;
-    for package in packages {
-        let id = package["id"].as_str().expect("package id");
-        if !workspace_ids.contains(id) {
-            continue;
-        }
-        let manifest = PathBuf::from(package["manifest_path"].as_str().expect("manifest path"));
-        let root = manifest
-            .parent()
-            .expect("package root")
-            .canonicalize()
-            .expect("canonical package root");
-        assert!(
-            root.starts_with(repo_root),
-            "workspace package escapes repository: {}",
-            root.display()
-        );
-        manifests.push(manifest);
-        roots.push(root);
-        has_custom_build_target |= package["targets"]
-            .as_array()
-            .expect("package targets")
-            .iter()
-            .any(|target| {
-                target["kind"].as_array().is_some_and(|kinds| {
-                    kinds
-                        .iter()
-                        .any(|kind| kind.as_str() == Some("custom-build"))
-                })
-            });
-    }
-    roots.sort();
-    roots.dedup();
-    manifests.sort();
-
-    let root_set = roots.iter().cloned().collect::<BTreeSet<_>>();
-    let mut canonical_sources = BTreeSet::new();
-    for package_root in &roots {
-        collect_package_sources(repo_root, package_root, &root_set, &mut canonical_sources);
-    }
-    WorkspaceInventory {
-        repo_root: repo_root.to_path_buf(),
-        manifests,
-        sources: canonical_sources.into_iter().collect(),
-        has_custom_build_target,
-    }
-}
-
-fn collect_package_sources(
-    repo_root: &Path,
-    package_root: &Path,
-    package_roots: &BTreeSet<PathBuf>,
-    sources: &mut BTreeSet<PathBuf>,
-) {
-    let mut pending = vec![package_root.to_path_buf()];
-    let mut visited = BTreeSet::new();
-    while let Some(directory) = pending.pop() {
-        let canonical_directory = directory
-            .canonicalize()
-            .expect("canonical source directory");
-        assert!(
-            canonical_directory.starts_with(repo_root),
-            "source directory symlink escapes repository: {}",
-            directory.display()
-        );
-        if !visited.insert(canonical_directory.clone()) {
-            continue;
-        }
-        let mut entries = fs::read_dir(&directory)
-            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-            .map(|entry| entry.expect("source entry"))
-            .collect::<Vec<_>>();
-        entries.sort_by_key(std::fs::DirEntry::path);
-        for entry in entries {
-            let path = entry.path();
-            let file_type = entry.file_type().expect("source file type");
-            let canonical = path.canonicalize().expect("canonical source path");
-            assert!(
-                canonical.starts_with(repo_root),
-                "source symlink escapes repository: {}",
-                path.display()
-            );
-            if file_type.is_dir() || file_type.is_symlink() && canonical.is_dir() {
-                let name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default();
-                if matches!(
-                    name,
-                    "target" | ".git" | ".artifacts" | "docker-artifacts" | "cross-artifacts"
-                ) {
-                    continue;
-                }
-                if canonical != *package_root && package_roots.contains(&canonical) {
-                    continue;
-                }
-                pending.push(path);
-            } else if canonical.extension().and_then(|value| value.to_str()) == Some("rs") {
-                sources.insert(canonical);
-            }
-        }
-    }
-}
-
-fn build_surface_paths(inventory: &WorkspaceInventory) -> Vec<PathBuf> {
-    let mut paths = inventory.manifests.clone();
-    for cargo_config in [".cargo/config", ".cargo/config.toml"] {
-        let path = inventory.repo_root.join(cargo_config);
-        if path.exists() {
-            paths.push(path);
-        }
-    }
-    paths.push(inventory.repo_root.join("Cross.toml"));
-    paths.push(inventory.repo_root.join(".github/workflows/rust.yml"));
-    paths.push(
-        inventory
-            .repo_root
-            .join("docker/alpine/portable_builder.Dockerfile"),
-    );
-    paths.push(inventory.repo_root.join("docker/rust_build/Dockerfile"));
-    paths.extend(
-        inventory
-            .sources
-            .iter()
-            .filter(|path| path.file_name().is_some_and(|name| name == "build.rs"))
-            .cloned(),
-    );
-    for root in [".github/scripts", "docker/alpine"] {
-        collect_extensions(
-            &inventory.repo_root.join(root),
-            &["sh", "py", "toml", "yml", "yaml"],
-            &mut paths,
-        );
-    }
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-fn collect_extensions(root: &Path, extensions: &[&str], output: &mut Vec<PathBuf>) {
-    if !root.exists() {
-        return;
-    }
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory).expect("build surface directory") {
-            let path = entry.expect("build surface entry").path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|extension| extensions.contains(&extension))
-            {
-                output.push(path);
-            }
-        }
-    }
-}
-
-fn parse_file(path: &str, source: &str) -> syn::File {
-    syn::parse_file(source).unwrap_or_else(|error| panic!("failed to parse {path}: {error}"))
-}
-
-fn line(span: Span) -> usize {
-    span.start().line
-}
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .canonicalize()
-        .expect("canonical repository root")
-}
-
-fn relative(root: &Path, path: &Path) -> String {
-    path_policy::render_repo_relative_path(root, path)
-}
-
-fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
-}
-
-fn collect_named_files(root: &Path, name: &str, output: &mut Vec<PathBuf>) {
-    if !root.exists() {
-        return;
-    }
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(directory).expect("facade directory") {
-            let path = entry.expect("facade entry").path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
-                output.push(path);
-            }
-        }
-    }
-    output.sort();
-}
-
-fn item_kind(item: &syn::Item) -> &'static str {
-    match item {
-        syn::Item::Const(_) => "const",
-        syn::Item::Enum(_) => "enum",
-        syn::Item::Fn(_) => "function",
-        syn::Item::Impl(_) => "impl",
-        syn::Item::Macro(_) => "macro",
-        syn::Item::Mod(_) => "inline module",
-        syn::Item::Static(_) => "static",
-        syn::Item::Struct(_) => "struct",
-        syn::Item::Trait(_) => "trait",
-        syn::Item::Type(_) => "type alias",
-        syn::Item::Union(_) => "union",
-        _ => "unsupported item",
-    }
-}
-
 #[cfg(test)]
-#[path = "policy_tests.rs"]
 mod tests;

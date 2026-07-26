@@ -1,6 +1,5 @@
 use pkthere_test_support::test_paths as path_policy;
 use std::fs;
-use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 
 #[derive(Default)]
@@ -9,6 +8,8 @@ struct LifecycleVisitor {
     child_type_references: usize,
     read_impls: usize,
     join_handle_returns: usize,
+    inline_durations: usize,
+    blocking_file_locks: usize,
 }
 
 impl<'ast> Visit<'ast> for LifecycleVisitor {
@@ -19,7 +20,38 @@ impl<'ast> Visit<'ast> for LifecycleVisitor {
         ) {
             self.forbidden_methods.push(call.method.to_string());
         }
+        if call.method == "lock"
+            && matches!(
+                call.receiver.as_ref(),
+                syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| segment.ident == "file")
+            )
+        {
+            self.blocking_file_locks += 1;
+        }
         syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && let Some(function) = path.path.segments.last()
+        {
+            if matches!(
+                function.ident.to_string().as_str(),
+                "from_secs" | "from_millis"
+            ) && path
+                .path
+                .segments
+                .iter()
+                .any(|segment| segment.ident == "Duration")
+            {
+                self.inline_durations += 1;
+            }
+            if function.ident == "flock" {
+                self.blocking_file_locks += 1;
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
     }
 
     fn visit_path(&mut self, path: &'ast syn::Path) {
@@ -77,9 +109,15 @@ fn return_type_mentions_join_handle(output: &syn::ReturnType) -> bool {
 }
 
 pub fn assert_test_harness_lifecycle_boundaries() {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo_root_path = crate::common::policy::repository_root();
+    let repo_root = repo_root_path.as_path();
     let tests_root = repo_root.join("tests");
-    let mut sources = rust_sources(&tests_root);
+    let mut sources = crate::common::source_layout_policy::governed_source_paths(Some(
+        crate::common::source_layout_policy::SourceKind::Rust,
+    ))
+    .into_iter()
+    .filter(|source| source.starts_with(&tests_root))
+    .collect::<Vec<_>>();
     sources.sort();
     let mut violations = Vec::new();
 
@@ -116,17 +154,17 @@ pub fn assert_test_harness_lifecycle_boundaries() {
         if visitor.join_handle_returns != 0 {
             violations.push(format!("{relative}: bare JoinHandle return"));
         }
-        if relative != "tests/support/src/timing.rs"
-            && (contents.contains("Duration::from_secs(")
-                || contents.contains("Duration::from_millis("))
-        {
+        if relative != "tests/support/src/timing.rs" && visitor.inline_durations != 0 {
             violations.push(format!("{relative}: inline governed duration"));
         }
     }
 
     let raw_lock = fs::read_to_string(tests_root.join("support/src/raw_icmp.rs"))
         .expect("read RAW ICMP lock implementation");
-    if raw_lock.contains("file.lock()") || raw_lock.contains("flock(") {
+    let raw_lock = syn::parse_file(&raw_lock).expect("parse RAW ICMP lock implementation");
+    let mut raw_lock_visitor = LifecycleVisitor::default();
+    raw_lock_visitor.visit_file(&raw_lock);
+    if raw_lock_visitor.blocking_file_locks != 0 {
         violations.push("tests/support/src/raw_icmp.rs: blocking file lock".to_string());
     }
     assert!(
@@ -134,22 +172,4 @@ pub fn assert_test_harness_lifecycle_boundaries() {
         "Test harness lifecycle boundaries were bypassed:\n{}",
         violations.join("\n")
     );
-}
-
-fn rust_sources(root: &Path) -> Vec<PathBuf> {
-    let mut sources = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)
-            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
-        {
-            let path = entry.expect("test source entry").path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
-                sources.push(path);
-            }
-        }
-    }
-    sources
 }

@@ -23,11 +23,10 @@ pub const MULTI_WORKER_CANDIDATE_PREFIX: &[u8] = b"multi-worker-candidate-";
 pub const LIFECYCLE_ACCEPTED_PAYLOAD: &[u8] = b"hello";
 pub const LIFECYCLE_OVERSIZE_PAYLOAD: &[u8] = b"hello world this is long";
 pub const LIFECYCLE_PENDING_FOLLOWUP_PAYLOAD: &[u8] = b"world";
-
+pub const DEBUG_TRACE_LOGS: &[&str] = &["packets", "drops", "handles"];
 pub const WRONG_PEER_TARGET_PORT_ID: u16 = 4141;
 pub const WRONG_PEER_LEGIT_PORT_ID: u16 = 1111;
 pub const WRONG_PEER_STRAY_PORT_ID: u16 = 2222;
-
 pub const QUICK_STATS_TIMEOUT_SECS: u64 = 1;
 pub const REALITY_RELOCK_TIMEOUT_SECS: u64 = 2;
 pub const MULTIHOP_NODE_TIMEOUT_SECS: u64 = 3;

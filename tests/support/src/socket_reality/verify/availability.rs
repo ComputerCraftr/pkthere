@@ -1,16 +1,14 @@
-use super::implementation::verify;
+use super::implementation::verify_observation;
 use super::model::{VerificationError, VerificationErrorKind, VerifiedReality};
-use crate::socket_reality::case::{ICMP_DGRAM_FIXED_ID, RealityOperation};
 use crate::socket_reality::evidence::{CallResult, RawReceiveEvidence, RealityEvidence};
 use crate::socket_reality::requirement::RealityRequirement;
-use pkthere_socket_policy::upstream_socket_creation_policy;
-use pkthere_wire::SupportedProtocol;
-use socket2::Type;
+use pkthere_socket_policy::SocketCreationFailureClass;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CollectionAvailability {
     Executed,
-    AuthoritativeUnsupported,
+    AuthoritativeUnsupported(SocketCreationFailureClass),
+    Failed(SocketCreationFailureClass),
 }
 
 pub fn verify_requirement(
@@ -18,65 +16,144 @@ pub fn verify_requirement(
     evidence: &RealityEvidence,
 ) -> Result<VerifiedReality, VerificationError> {
     let case = requirement.case;
-    let (remote_id, local_id) = match case.operation {
-        RealityOperation::IcmpDgramFixedId => (ICMP_DGRAM_FIXED_ID, ICMP_DGRAM_FIXED_ID),
-        _ => (0, 0),
-    };
-    let policy_declares_available = case.protocol != SupportedProtocol::ICMP
-        || case.socket_type != Type::DGRAM
-        || upstream_socket_creation_policy(case.protocol, case.domain, remote_id, local_id, false)
-            .primary
-            .socket_type
-            == Type::DGRAM;
-    let collection = if primary_creation_error(evidence).is_some() {
-        CollectionAvailability::AuthoritativeUnsupported
-    } else {
-        CollectionAvailability::Executed
-    };
-    classify_availability(requirement.required, policy_declares_available, collection).map_err(
-        |kind| VerificationError {
-            kind,
-            message: primary_creation_error(evidence).map_or_else(
-                || format!("availability contradiction for {case:?}"),
-                |os_error| {
-                    format!(
-                        "socket creation for {:?} failed with OS evidence: {}",
-                        case, os_error.message
-                    )
-                },
-            ),
+    let creation_policy = super::creation::production_creation_policy(case);
+    let creation_error = primary_creation_error(evidence);
+    let collection = match creation_error {
+        Some(error) => match classify_creation_failure(error) {
+            failure_class @ (SocketCreationFailureClass::UnsupportedCandidate
+            | SocketCreationFailureClass::UnavailableInCurrentExecutionDomain) => {
+                CollectionAvailability::AuthoritativeUnsupported(failure_class)
+            }
+            failure_class => CollectionAvailability::Failed(failure_class),
         },
-    )?;
-    verify(case, evidence)
+        None => CollectionAvailability::Executed,
+    };
+    let fallback_accepts = match collection {
+        CollectionAvailability::AuthoritativeUnsupported(failure_class) => {
+            case.socket_create_spec() == creation_policy.primary
+                && creation_policy.fallback.is_some_and(|fallback| {
+                    fallback.from == creation_policy.primary && fallback.permits(failure_class)
+                })
+        }
+        CollectionAvailability::Executed | CollectionAvailability::Failed(_) => false,
+    };
+    classify_availability(fallback_accepts, collection).map_err(|kind| VerificationError {
+        kind,
+        message: primary_creation_error(evidence).map_or_else(
+            || format!("availability contradiction for {case:?}"),
+            |os_error| {
+                format!(
+                    "socket creation for {:?} failed with OS evidence: {}",
+                    case, os_error.message
+                )
+            },
+        ),
+    })?;
+    verify_observation(
+        case,
+        evidence,
+        matches!(
+            collection,
+            CollectionAvailability::AuthoritativeUnsupported(_)
+        )
+        .then_some(creation_error)
+        .flatten(),
+    )
 }
 
 pub(super) fn classify_availability(
-    required: bool,
-    policy_available: bool,
+    production_fallback_accepts: bool,
     collection: CollectionAvailability,
 ) -> Result<(), VerificationErrorKind> {
-    if required && !policy_available {
-        return Err(VerificationErrorKind::PolicyCapabilityContradiction);
-    }
-    match (required, collection) {
-        (_, CollectionAvailability::Executed) => Ok(()),
-        (true, CollectionAvailability::AuthoritativeUnsupported) => {
+    match (production_fallback_accepts, collection) {
+        (_, CollectionAvailability::Executed)
+        | (true, CollectionAvailability::AuthoritativeUnsupported(_)) => Ok(()),
+        (false, CollectionAvailability::AuthoritativeUnsupported(_)) => {
             Err(VerificationErrorKind::RequiredButUnavailable)
         }
-        (false, CollectionAvailability::AuthoritativeUnsupported) => {
-            Err(VerificationErrorKind::UnsupportedByRuntime)
-        }
+        (_, CollectionAvailability::Failed(_)) => Err(VerificationErrorKind::EvidenceMismatch),
     }
+}
+
+pub(super) fn classify_creation_failure(
+    error: &crate::socket_reality::evidence::OsErrorEvidence,
+) -> SocketCreationFailureClass {
+    if unsupported_candidate(error) {
+        return SocketCreationFailureClass::UnsupportedCandidate;
+    }
+    match error.kind {
+        std::io::ErrorKind::PermissionDenied => SocketCreationFailureClass::PermissionDenied,
+        std::io::ErrorKind::Interrupted => SocketCreationFailureClass::TransientInterrupted,
+        std::io::ErrorKind::OutOfMemory => SocketCreationFailureClass::ResourceExhausted,
+        std::io::ErrorKind::InvalidInput => SocketCreationFailureClass::InvalidSpecification,
+        std::io::ErrorKind::Unsupported => {
+            SocketCreationFailureClass::UnavailableInCurrentExecutionDomain
+        }
+        _ if resource_exhausted(error) => SocketCreationFailureClass::ResourceExhausted,
+        _ => SocketCreationFailureClass::Unexpected,
+    }
+}
+
+#[cfg(unix)]
+fn unsupported_candidate(error: &crate::socket_reality::evidence::OsErrorEvidence) -> bool {
+    matches!(
+        error.raw_os_error,
+        Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::ESOCKTNOSUPPORT | libc::EPROTOTYPE)
+    )
+}
+
+#[cfg(windows)]
+fn unsupported_candidate(error: &crate::socket_reality::evidence::OsErrorEvidence) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAEAFNOSUPPORT, WSAEPROTONOSUPPORT, WSAEPROTOTYPE, WSAESOCKTNOSUPPORT,
+    };
+    matches!(
+        error.raw_os_error,
+        Some(WSAEAFNOSUPPORT | WSAEPROTONOSUPPORT | WSAEPROTOTYPE | WSAESOCKTNOSUPPORT)
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unsupported_candidate(_error: &crate::socket_reality::evidence::OsErrorEvidence) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn resource_exhausted(error: &crate::socket_reality::evidence::OsErrorEvidence) -> bool {
+    matches!(
+        error.raw_os_error,
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM | libc::ENOBUFS)
+    )
+}
+
+#[cfg(windows)]
+fn resource_exhausted(error: &crate::socket_reality::evidence::OsErrorEvidence) -> bool {
+    use windows_sys::Win32::Networking::WinSock::{WSAEMFILE, WSAENOBUFS};
+    matches!(error.raw_os_error, Some(WSAEMFILE | WSAENOBUFS))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn resource_exhausted(_error: &crate::socket_reality::evidence::OsErrorEvidence) -> bool {
+    false
 }
 
 fn primary_creation_error(
     evidence: &RealityEvidence,
 ) -> Option<&crate::socket_reality::evidence::OsErrorEvidence> {
+    if let RealityEvidence::SocketDisconnect(evidence) = evidence {
+        return match &evidence.attempt {
+            CallResult::Ok(_) => None,
+            CallResult::OsError(error) => Some(error),
+        };
+    }
     let direct = match evidence {
         RealityEvidence::DatagramReceive(evidence) => Some(&evidence.direct),
+        RealityEvidence::DatagramDisconnect(_) => None,
+        RealityEvidence::SocketDisconnect(_) => None,
         RealityEvidence::ConnectedFilter(evidence) => Some(&evidence.direct),
         RealityEvidence::IcmpDgram(evidence) => Some(&evidence.direct),
-        RealityEvidence::ReusePortFanout(_) => None,
+        RealityEvidence::IcmpDgramSharedId(evidence) => Some(&evidence.direct),
+        RealityEvidence::ReusePortFanout(_) | RealityEvidence::ListenerOwnerReplacement(_) => None,
         RealityEvidence::RawReceive(RawReceiveEvidence::Direct { direct, .. }) => Some(direct),
         RealityEvidence::RawReceive(RawReceiveEvidence::ProductionForwarder(_))
         | RealityEvidence::RawFourId(_)

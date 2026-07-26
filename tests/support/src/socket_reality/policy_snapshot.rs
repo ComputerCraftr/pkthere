@@ -1,29 +1,60 @@
-use super::names::{role_name, socket_type_name};
+use super::diagnostic::{role_name, socket_type_name};
 use pkthere_socket_policy::{
-    IcmpChecksumMode, IcmpKernelIdPolicy, IcmpSocketIdCapability, IcmpWildcardIdPolicy,
-    IpHeaderMode, LockedPeerMode, PeerSourceRequirement, ProtocolIdRequirement, ReceiveSyscall,
-    ResolvedIcmpSocketPolicy, ResolvedSocketPolicy, SocketReresolveMode, StartupPeerMode,
-    TimeoutClearMode,
+    CapabilityEvidence, IcmpChecksumMode, IcmpKernelIdPolicy, IcmpSocketIdCapability,
+    IcmpWildcardIdPolicy, IpHeaderMode, Ipv6DestinationScopeEvidence, ListenerLockLifecycle,
+    PeerSourceRequirement, PeerVerification, ProtocolIdRequirement, ReceiveCaptureScope,
+    ReceiveSyscall, ResolvedIcmpSocketPolicy, ResolvedSocketPolicy, SocketReresolveMode,
 };
-use pkthere_wire::packet_headers::ReceiveHeaderMode;
+use pkthere_wire::packet_headers::{Ipv4PacketLengthEncoding, ReceiveHeaderMode};
 use serde_json::{Value, json};
 
 pub(super) fn policy_snapshot(policy: ResolvedSocketPolicy) -> Value {
+    let (disconnect_status, disconnect_capability) = match policy.disconnect.evidence {
+        CapabilityEvidence::Measured { capability, .. } => ("measured", Some(capability)),
+        CapabilityEvidence::Unsupported(_) => ("unsupported", None),
+        CapabilityEvidence::Unverified(_) => ("unverified", None),
+    };
     json!({
+        "creation_path": format!("{:?}", policy.creation_path),
+        "receive_capture_scope": receive_capture_scope(policy.receive_capture_scope),
+        "peer_verification": peer_verification(policy.peer_verification),
+        "listener_lifecycle": policy.listener_lifecycle.map(ListenerLockLifecycle::wire_name),
         "reuse": {
-            "startup_peer_mode": startup_mode(policy.reuse.startup_peer_mode),
-            "locked_peer_mode": locked_mode(policy.reuse.locked_peer_mode),
+            "startup_peer_mode": policy.reuse.startup_peer_mode.wire_name(),
             "reresolve_mode": reresolve_mode(policy.reuse.reresolve_mode),
-            "timeout_clear_mode": timeout_clear_mode(policy.reuse.timeout_clear_mode),
         },
-        "datagram_disconnect": {
-            "disconnect_call_supported":
-                policy.datagram_disconnect.disconnect_call_supported,
+        "disconnect": {
+            "evidence_status": disconnect_status,
+            "fingerprint": {
+                "platform": format!("{:?}", policy.disconnect.fingerprint.platform),
+                "family": format!("{:?}", policy.disconnect.fingerprint.family),
+                "protocol": format!("{:?}", policy.disconnect.fingerprint.protocol),
+                "socket_type": socket_type_name(policy.disconnect.fingerprint.socket_type),
+                "role": role_name(policy.disconnect.fingerprint.role),
+                "creation_path": format!("{:?}", policy.disconnect.fingerprint.creation_path),
+                "bind_shape": format!("{:?}", policy.disconnect.fingerprint.bind_shape),
+                "reuse_address": policy.disconnect.fingerprint.reuse_address,
+                "reuse_port": policy.disconnect.fingerprint.reuse_port,
+                "v6_only": policy.disconnect.fingerprint.v6_only,
+                "receive_header":
+                    receive_header_mode(policy.disconnect.fingerprint.receive_header),
+                "protocol_zero_capture":
+                    policy.disconnect.fingerprint.protocol_zero_capture,
+                "bound_interface":
+                    policy.disconnect.fingerprint.bound_interface.map(|value| format!("{value:?}")),
+                "connected_peer_mode":
+                    peer_verification(policy.disconnect.fingerprint.connected_peer_mode),
+            },
+            "association_clear_supported":
+                disconnect_capability.map(|value| value.association_clear_supported),
+            "exact_local_bind_preserved":
+                disconnect_capability.map(|value| value.exact_local_bind_preserved),
             "reconnect_after_disconnect_supported":
-                policy.datagram_disconnect.reconnect_after_disconnect_supported,
-            "listener_original_bind_receive_after_disconnect_supported":
-                policy.datagram_disconnect
-                    .listener_original_bind_receive_after_disconnect_supported,
+                disconnect_capability.map(|value| value.reconnect_after_disconnect_supported),
+            "peer_inspection_supported":
+                disconnect_capability.map(|value| value.peer_inspection_supported),
+            "stale_receive_queue_isolated":
+                disconnect_capability.map(|value| value.stale_receive_queue_isolated),
         },
         "icmp": policy.icmp.map(icmp_policy),
         "send_policy": {
@@ -31,6 +62,9 @@ pub(super) fn policy_snapshot(policy: ResolvedSocketPolicy) -> Value {
             "ip_header": ip_header_mode(policy.send_policy.ip_header),
         },
         "receive_header": receive_header_mode(policy.receive_header),
+        "ipv6_destination_scope":
+            ipv6_destination_scope(policy.ipv6_destination_scope),
+        "ipv4_receive_length": ipv4_receive_length(policy.ipv4_receive_length),
         "receive_syscall": {
             "connected": receive_syscall(policy.receive_syscall.connected),
             "unconnected": receive_syscall(policy.receive_syscall.unconnected),
@@ -48,6 +82,46 @@ pub(super) fn policy_snapshot(policy: ResolvedSocketPolicy) -> Value {
             },
         },
     })
+}
+
+pub(super) fn bind_preservation_json(
+    capability: pkthere_socket_policy::DatagramBindPreservation,
+) -> Value {
+    json!({
+        "exact_local_bind_preserved": capability.exact_local_bind_preserved,
+        "local_port_preserved": capability.local_port_preserved,
+        "original_destination_receive_supported":
+            capability.original_destination_receive_supported,
+    })
+}
+
+const fn ipv6_destination_scope(scope: Ipv6DestinationScopeEvidence) -> &'static str {
+    match scope {
+        Ipv6DestinationScopeEvidence::NotApplicable => "not-applicable",
+        Ipv6DestinationScopeEvidence::ExactBoundEndpoint => "exact-bound-endpoint",
+    }
+}
+
+const fn receive_capture_scope(scope: ReceiveCaptureScope) -> &'static str {
+    match scope {
+        ReceiveCaptureScope::ProtocolFiltered => "protocol-filtered",
+        ReceiveCaptureScope::InterfaceIpv4 => "interface-ipv4",
+    }
+}
+
+const fn peer_verification(verification: PeerVerification) -> &'static str {
+    match verification {
+        PeerVerification::RequirePeerAddr => "exact-peer-address",
+        PeerVerification::RequirePeerNetworkAddress => "peer-network-address",
+        PeerVerification::ConnectSuccess => "connect-success",
+    }
+}
+
+const fn ipv4_receive_length(encoding: Ipv4PacketLengthEncoding) -> &'static str {
+    match encoding {
+        Ipv4PacketLengthEncoding::NetworkTotal => "network-total",
+        Ipv4PacketLengthEncoding::DarwinHostPayload => "darwin-host-payload",
+    }
 }
 
 const fn receive_syscall(syscall: ReceiveSyscall) -> &'static str {
@@ -71,33 +145,12 @@ fn icmp_policy(policy: ResolvedIcmpSocketPolicy) -> Value {
     })
 }
 
-const fn startup_mode(mode: StartupPeerMode) -> &'static str {
-    match mode {
-        StartupPeerMode::Connected => "connected",
-        StartupPeerMode::Unconnected => "unconnected",
-    }
-}
-
-const fn locked_mode(mode: LockedPeerMode) -> &'static str {
-    match mode {
-        LockedPeerMode::ConnectAfterLock => "connect-after-lock",
-        LockedPeerMode::StayUnconnected => "stay-unconnected",
-    }
-}
-
 const fn reresolve_mode(mode: SocketReresolveMode) -> &'static str {
     match mode {
         SocketReresolveMode::ReconnectInPlace => "reconnect-in-place",
         SocketReresolveMode::ReplaceSocket => "replace-socket",
         SocketReresolveMode::MetadataOnlyWhenUnconnected => "metadata-only-when-unconnected",
-    }
-}
-
-const fn timeout_clear_mode(mode: TimeoutClearMode) -> &'static str {
-    match mode {
-        TimeoutClearMode::DisconnectSocket => "disconnect-socket",
-        TimeoutClearMode::ProcessExit => "process-exit",
-        TimeoutClearMode::NoConnectedState => "no-connected-state",
+        SocketReresolveMode::ProcessExitOnly => "process-exit-only",
     }
 }
 

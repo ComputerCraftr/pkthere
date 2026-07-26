@@ -3,31 +3,56 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
-import fnmatch
+import errno
+import importlib
+import json
 import os
-from pathlib import Path
 import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Literal
+import time
+import uuid
+from collections.abc import Callable, Generator, Mapping, Sequence
+from contextlib import contextmanager
+from pathlib import Path
+from typing import BinaryIO, Literal, cast
 
-from docker.alpine.pkthere_harness.cargo import cargo_executables
-from docker.alpine.pkthere_harness.command_runner import CommandResult, CommandRunner
-from docker.alpine.pkthere_harness.timing import (
+from ci.pkthere_ci.build_environment import (
+    sanitize_environment,
+)
+from ci.pkthere_ci.cargo import cargo_executables
+from ci.pkthere_ci.command_runner import CommandResult, CommandRunner
+from ci.pkthere_ci.provenance import record_source_provenance, sha256_file
+from ci.pkthere_ci.source_cache import (
+    commit_source_aware_target_cache,
+    prepare_source_aware_target_cache,
+    target_cache_identity,
+)
+from ci.pkthere_ci.test_manifest import (
+    ALPINE_CONCURRENCY_TESTS,
+    PRIVILEGED_ICMP_TESTS,
+    RAW_SOCKET_REALITY_TEST,
+)
+from ci.pkthere_ci.timing import (
     ARTIFACT_BUILD_TIMEOUT_SECONDS,
     DOCKER_CONTROL_TIMEOUT_SECONDS,
     VERIFIER_TIMEOUT_SECONDS,
 )
+
+__all__ = ("sanitize_environment",)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_STAGE = ROOT / ".artifacts/alpine"
 X86_TARGET = "x86_64-unknown-linux-musl"
 AARCH64_TARGET = "aarch64-unknown-linux-musl"
 AARCH64_NATIVE_PLATFORM = "linux/arm64"
+X86_NATIVE_PLATFORM = "linux/amd64"
+X86_TARGET_DIR = ROOT / "target/portable-x86_64-musl"
+AARCH64_CROSS_TARGET_DIR = ROOT / "target/cross-aarch64-musl"
+AARCH64_NATIVE_TARGET_DIR = ROOT / "target/portable-aarch64-native-musl"
 CROSS_IMAGE = (
     "ghcr.io/cross-rs/aarch64-unknown-linux-musl@"
     "sha256:53a761857a806b4f73b209a15bf71eacc38a82d5a02e05b166300c4794d7ad83"
@@ -37,87 +62,23 @@ NATIVE_CONTAINER_MARKER = "PKTHERE_PORTABLE_NATIVE_CONTAINER"
 NATIVE_CONTAINER_RUSTFLAGS = (
     "-C linker=clang "
     "-C link-arg=-fuse-ld=lld "
+    "-C link-arg=-Wno-unused-command-line-argument "
     "-C target-feature=+crt-static "
-    "-C relocation-model=pic "
-    "-C link-arg=-static-pie "
-    "-C link-arg=-Wl,--eh-frame-hdr "
     "-C target-cpu=generic"
 )
 Aarch64Backend = Literal["auto", "cross", "native-container"]
+X86Backend = Literal["host", "native-container"]
 STAGED_EXECUTABLE_NAMES = {
     "pkthere": "pkthere",
+    "pkthere_authority_audit": "pkthere-authority-audit",
     "socket_reality": "socket-reality-test",
     "icmp_integration": "icmp-integration-test",
     "worker_modes": "worker-modes-test",
     "pkthere_test_support": "pkthere-test-support-test",
     "pkthere_unit_test": "pkthere-unit-test",
+    "stress": "stress-test",
     "topology-verifier": "topology-verifier",
 }
-_EXACT_BUILD_VARIABLES = frozenset(
-    {
-        "RUSTFLAGS",
-        "RUSTDOCFLAGS",
-        "RUSTC",
-        "RUSTDOC",
-        "RUSTC_WRAPPER",
-        "RUSTC_WORKSPACE_WRAPPER",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "CARGO_ENCODED_RUSTDOCFLAGS",
-        "CARGO_BUILD_RUSTFLAGS",
-        "CARGO_BUILD_RUSTDOCFLAGS",
-        "CARGO_BUILD_TARGET",
-        "CC",
-        "CXX",
-        "AR",
-        "CFLAGS",
-        "CXXFLAGS",
-        "LDFLAGS",
-        "HOST_CC",
-        "HOST_CXX",
-        "HOST_AR",
-        "HOST_CFLAGS",
-        "HOST_CXXFLAGS",
-        "HOST_LDFLAGS",
-        "TARGET_CC",
-        "TARGET_CXX",
-        "TARGET_AR",
-        "TARGET_CFLAGS",
-        "TARGET_CXXFLAGS",
-        "TARGET_LDFLAGS",
-    }
-)
-_BUILD_VARIABLE_PATTERNS = (
-    "CARGO_TARGET_*_RUSTFLAGS",
-    "CARGO_TARGET_*_RUSTDOCFLAGS",
-    "CARGO_TARGET_*_LINKER",
-    "CARGO_TARGET_*_RUNNER",
-    "CC_*",
-    "CXX_*",
-    "AR_*",
-    "CFLAGS_*",
-    "CXXFLAGS_*",
-    "LDFLAGS_*",
-)
-
-
-def sanitize_environment(
-    source: Mapping[str, str],
-) -> tuple[dict[str, str], tuple[str, ...]]:
-    environment = dict(source)
-    removed = tuple(
-        sorted(
-            name
-            for name in environment
-            if name in _EXACT_BUILD_VARIABLES
-            or any(
-                fnmatch.fnmatchcase(name, pattern)
-                for pattern in _BUILD_VARIABLE_PATTERNS
-            )
-        )
-    )
-    for name in removed:
-        del environment[name]
-    return environment, removed
 
 
 def verify_static_elf(
@@ -180,25 +141,50 @@ def build_x86_64(
     *,
     runner: CommandRunner,
     source_environment: Mapping[str, str],
+    backend: X86Backend = "host",
 ) -> None:
     environment = _portable_environment(source_environment, evidence_dir)
-    _require_tools(("cargo", "rustc", "musl-gcc", "file", "readelf"), environment)
-    _record_toolchain(
-        (
+    inside_native_container = environment.get(NATIVE_CONTAINER_MARKER) == "1"
+    if backend == "native-container" and not inside_native_container:
+        _run_native_container(
+            "x86_64",
+            X86_NATIVE_PLATFORM,
+            evidence_dir,
+            output,
+            runner=runner,
+            environment=environment,
+        )
+        return
+    toolchain: tuple[tuple[str, ...], ...]
+    if inside_native_container and backend == "native-container":
+        environment["RUSTFLAGS"] = NATIVE_CONTAINER_RUSTFLAGS
+        environment["CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"] = "clang"
+        _require_tools(("cargo", "rustc", "clang", "file", "readelf"), environment)
+        toolchain = (
+            ("rustc", "-vV"),
+            ("cargo", "-V"),
+            ("clang", "--version"),
+        )
+    else:
+        _require_tools(("cargo", "rustc", "musl-gcc", "file", "readelf"), environment)
+        toolchain = (
             ("rustc", "-vV"),
             ("cargo", "-V"),
             ("musl-gcc", "--version"),
-        ),
+        )
+    _record_toolchain(
+        toolchain,
         evidence_dir,
         runner=runner,
         environment=environment,
     )
-    executables = _build_alpine_executables(
+    executables = _build_alpine_executables_with_cache(
         X86_TARGET,
         ("cargo",),
         evidence_dir,
         runner=runner,
         environment=environment,
+        target_dir=X86_TARGET_DIR,
     )
     _stage_alpine_executables(
         executables,
@@ -227,18 +213,21 @@ def _build_alpine_executables(
     if target_dir is not None:
         common.extend(("--target-dir", str(target_dir)))
     executables: dict[str, Path] = {}
-    executables.update(
-        cargo_executables(
-            ["build", *common, "-p", "pkthere", "--bin", "pkthere"],
-            {"pkthere"},
-            root=ROOT,
-            runner=runner,
-            environment=environment,
-            cargo_command=cargo_command,
-            evidence_prefix=evidence_dir / "cargo-build-pkthere",
-            container_target_dir=container_target_dir,
-        )
+    production = cargo_executables(
+        ["build", *common, "-p", "pkthere", "--bin", "pkthere"],
+        {"pkthere"},
+        root=ROOT,
+        runner=runner,
+        environment=environment,
+        cargo_command=cargo_command,
+        evidence_prefix=evidence_dir / "cargo-build-pkthere",
+        container_target_dir=container_target_dir,
     )
+    preserved_dir = evidence_dir / "staged-executables"
+    preserved_dir.mkdir(parents=True, exist_ok=True)
+    preserved_production = preserved_dir / "pkthere-production"
+    shutil.copy2(production["pkthere"], preserved_production)
+    executables["pkthere"] = preserved_production
     pkthere_unit_test = cargo_executables(
         [
             "test",
@@ -282,6 +271,50 @@ def _build_alpine_executables(
             container_target_dir=container_target_dir,
         )
     )
+    audited_app = cargo_executables(
+        [
+            "build",
+            *common,
+            "--features",
+            "authority-audit",
+            "-p",
+            "pkthere",
+            "--bin",
+            "pkthere",
+        ],
+        {"pkthere"},
+        root=ROOT,
+        runner=runner,
+        environment=environment,
+        cargo_command=cargo_command,
+        evidence_prefix=evidence_dir / "cargo-build-pkthere-authority-audit",
+        container_target_dir=container_target_dir,
+    )
+    preserved_audited_app = preserved_dir / "pkthere-authority-audit"
+    shutil.copy2(audited_app["pkthere"], preserved_audited_app)
+    executables["pkthere_authority_audit"] = preserved_audited_app
+    executables.update(
+        cargo_executables(
+            [
+                "test",
+                *common,
+                "--features",
+                "authority-audit",
+                "-p",
+                "pkthere",
+                "--test",
+                "stress",
+                "--no-run",
+            ],
+            {"stress"},
+            root=ROOT,
+            runner=runner,
+            environment=environment,
+            cargo_command=cargo_command,
+            evidence_prefix=evidence_dir / "cargo-test-authority-stress",
+            container_target_dir=container_target_dir,
+        )
+    )
     executables.update(
         cargo_executables(
             [
@@ -321,6 +354,48 @@ def _build_alpine_executables(
         )
     )
     return executables
+
+
+def _build_alpine_executables_with_cache(
+    target: str | None,
+    cargo_command: Sequence[str],
+    evidence_dir: Path,
+    *,
+    runner: CommandRunner,
+    environment: Mapping[str, str],
+    target_dir: Path,
+    container_target_dir: Path | None = None,
+) -> dict[str, Path]:
+    with _exclusive_file_lock(
+        target_dir / ".pkthere-source-cache.lock",
+        timeout_seconds=ARTIFACT_BUILD_TIMEOUT_SECONDS,
+    ):
+        cache_identity = target_cache_identity(target, cargo_command, environment)
+        state_path, current_inputs, refresh = prepare_source_aware_target_cache(
+            ROOT,
+            target_dir,
+            cache_identity,
+        )
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        (evidence_dir / "source-cache-refresh.json").write_text(
+            json.dumps(refresh, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        executables = _build_alpine_executables(
+            target,
+            cargo_command,
+            evidence_dir,
+            runner=runner,
+            environment=environment,
+            target_dir=target_dir,
+            container_target_dir=container_target_dir,
+        )
+        commit_source_aware_target_cache(
+            state_path,
+            current_inputs,
+            cache_identity,
+        )
+        return executables
 
 
 def _stage_alpine_executables(
@@ -381,7 +456,9 @@ def build_aarch64(
                 environment=environment,
             )
         else:
-            _run_aarch64_native_container(
+            _run_native_container(
+                "aarch64",
+                AARCH64_NATIVE_PLATFORM,
                 evidence_dir,
                 output,
                 runner=runner,
@@ -477,15 +554,14 @@ def _build_aarch64_with_cross(
         runner=runner,
         environment=environment,
     )
-    cross_target_dir = ROOT / "target/cross-aarch64-musl"
-    executables = _build_alpine_executables(
+    executables = _build_alpine_executables_with_cache(
         AARCH64_TARGET,
         ("cross",),
         evidence_dir,
         runner=runner,
         environment=environment,
-        target_dir=cross_target_dir,
-        container_target_dir=cross_target_dir,
+        target_dir=AARCH64_CROSS_TARGET_DIR,
+        container_target_dir=AARCH64_CROSS_TARGET_DIR,
     )
     _stage_alpine_executables(
         executables,
@@ -498,14 +574,18 @@ def _build_aarch64_with_cross(
     )
 
 
-def _run_aarch64_native_container(
+def _run_native_container(
+    architecture: str,
+    platform_name: str,
     evidence_dir: Path,
     output: Path,
     *,
     runner: CommandRunner,
     environment: Mapping[str, str],
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="pkthere-aarch64-native-") as temporary:
+    with tempfile.TemporaryDirectory(
+        prefix=f"pkthere-{architecture}-native-"
+    ) as temporary:
         export_root = Path(temporary)
         _recorded_command(
             [
@@ -513,7 +593,9 @@ def _run_aarch64_native_container(
                 "buildx",
                 "build",
                 "--platform",
-                AARCH64_NATIVE_PLATFORM,
+                platform_name,
+                "--build-arg",
+                f"PORTABLE_ARCHITECTURE={architecture}",
                 "--file",
                 str(NATIVE_CONTAINER_DOCKERFILE.relative_to(ROOT)),
                 "--target",
@@ -531,7 +613,7 @@ def _run_aarch64_native_container(
         exported_evidence = export_root / "evidence"
         if not exported_artifacts.is_dir() or not exported_evidence.is_dir():
             raise RuntimeError(
-                "native AArch64 container did not export Alpine artifacts and evidence"
+                f"native {architecture} container did not export Alpine artifacts and evidence"
             )
         _replace_directory(exported_artifacts, output)
         shutil.copytree(exported_evidence, evidence_dir, dirs_exist_ok=True)
@@ -566,12 +648,13 @@ def _build_aarch64_in_native_container(
         runner=runner,
         environment=native_environment,
     )
-    executables = _build_alpine_executables(
-        None,
+    executables = _build_alpine_executables_with_cache(
+        AARCH64_TARGET,
         ("cargo",),
         evidence_dir,
         runner=runner,
         environment=native_environment,
+        target_dir=AARCH64_NATIVE_TARGET_DIR,
     )
     _stage_alpine_executables(
         executables,
@@ -585,10 +668,81 @@ def _build_aarch64_in_native_container(
 
 
 def _replace_directory(source: Path, destination: Path) -> None:
-    if destination.exists():
-        shutil.rmtree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination)
+    token = f"{os.getpid()}-{uuid.uuid4().hex}"
+    staging = destination.parent / f".{destination.name}.staging-{token}"
+    backup = destination.parent / f".{destination.name}.backup-{token}"
+    lock_path = destination.parent / f".{destination.name}.publish.lock"
+    shutil.copytree(source, staging)
+    try:
+        with _exclusive_file_lock(lock_path):
+            if destination.exists():
+                os.replace(destination, backup)
+            try:
+                os.replace(staging, destination)
+            except BaseException:
+                if backup.exists() and not destination.exists():
+                    os.replace(backup, destination)
+                raise
+            if backup.exists():
+                shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup.exists():
+            shutil.rmtree(backup)
+
+
+@contextmanager
+def _exclusive_file_lock(
+    path: Path,
+    timeout_seconds: float = DOCKER_CONTROL_TIMEOUT_SECONDS,
+) -> Generator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+    with path.open("a+b") as lock_file:
+        if os.name == "nt":
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+        while True:
+            try:
+                _set_file_lock(lock_file, acquire=True)
+                break
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"timed out publishing portable artifacts through {path}"
+                    ) from error
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            _set_file_lock(lock_file, acquire=False)
+
+
+def _set_file_lock(lock_file: BinaryIO, *, acquire: bool) -> None:
+    if os.name == "nt":
+        module = importlib.import_module("msvcrt")
+        locking = cast(
+            Callable[[int, int, int], None],
+            module.locking,
+        )
+        mode_name = "LK_NBLCK" if acquire else "LK_UNLCK"
+        mode = cast(int, getattr(module, mode_name))
+        lock_file.seek(0)
+        locking(lock_file.fileno(), mode, 1)
+        return
+
+    module = importlib.import_module("fcntl")
+    flock = cast(Callable[[int, int], None], module.flock)
+    exclusive = cast(int, module.LOCK_EX)
+    nonblocking = cast(int, module.LOCK_NB)
+    unlock = cast(int, module.LOCK_UN)
+    flock(lock_file.fileno(), exclusive | nonblocking if acquire else unlock)
 
 
 def _portable_environment(
@@ -666,9 +820,16 @@ def parse_args() -> argparse.Namespace:
     x86 = subparsers.add_parser("x86_64")
     x86.add_argument("--evidence-dir", type=Path, required=True)
     x86.add_argument("--output", type=Path, default=DEFAULT_STAGE)
+    x86.add_argument("--require-clean-source", action="store_true")
+    x86.add_argument(
+        "--backend",
+        choices=("host", "native-container"),
+        default="host",
+    )
     arm = subparsers.add_parser("aarch64")
     arm.add_argument("--evidence-dir", type=Path, required=True)
     arm.add_argument("--output", type=Path, default=DEFAULT_STAGE)
+    arm.add_argument("--require-clean-source", action="store_true")
     arm.add_argument(
         "--backend",
         choices=("auto", "cross", "native-container"),
@@ -680,20 +841,63 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     runner = CommandRunner()
+    evidence_dir = args.evidence_dir.resolve()
+    output = args.output.resolve()
+    source_evidence: dict[str, object] = {}
+    if os.environ.get(NATIVE_CONTAINER_MARKER) != "1":
+        source_evidence = record_source_provenance(
+            ROOT,
+            evidence_dir,
+            runner=runner,
+            environment=os.environ,
+        )
+        if args.require_clean_source and source_evidence["dirty_worktree"]:
+            raise RuntimeError(
+                "release artifact build requires a clean source tree; "
+                "dirty worktrees are development evidence only"
+            )
     if args.architecture == "x86_64":
         build_x86_64(
-            args.evidence_dir.resolve(),
-            args.output.resolve(),
-            runner=runner,
-            source_environment=os.environ,
-        )
-    else:
-        build_aarch64(
-            args.evidence_dir.resolve(),
-            args.output.resolve(),
+            evidence_dir,
+            output,
             runner=runner,
             source_environment=os.environ,
             backend=args.backend,
+        )
+        target = X86_TARGET
+        builder = args.backend
+    else:
+        build_aarch64(
+            evidence_dir,
+            output,
+            runner=runner,
+            source_environment=os.environ,
+            backend=args.backend,
+        )
+        target = AARCH64_TARGET
+        builder = args.backend
+    if source_evidence:
+        selections = (
+            *PRIVILEGED_ICMP_TESTS,
+            RAW_SOCKET_REALITY_TEST,
+            *ALPINE_CONCURRENCY_TESTS,
+        )
+        artifact_evidence = {
+            path.name: sha256_file(path)
+            for path in sorted(output.iterdir())
+            if path.is_file()
+        }
+        manifest = {
+            **source_evidence,
+            "artifact_sha256": artifact_evidence,
+            "builder_identity": builder,
+            "evidence_ids": [selection.evidence_id for selection in selections],
+            "selected_test_count": len(selections),
+            "target_triple": target,
+        }
+        (evidence_dir / "portable-artifact-evidence.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
         )
 
 

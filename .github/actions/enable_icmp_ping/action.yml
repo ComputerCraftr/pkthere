@@ -1,0 +1,9 @@
+name: Enable unprivileged ICMP ping sockets
+description: Configure the Linux runner for ICMP-DGRAM socket tests
+runs:
+  using: composite
+  steps:
+    - name: Extend the Linux ping group range
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"

@@ -19,6 +19,7 @@ fn main() {
             std::thread::sleep(CAPTURE_DRAIN_WAIT * 3);
         }
         "json-record" => json_record(),
+        "two-json-records" => two_json_records(),
         "delayed-exit" => {
             std::thread::sleep(TEST_RETRY_INTERVAL * 2);
             println!("delayed-final");
@@ -111,6 +112,18 @@ fn json_record() {
     println!("not-json");
     println!(r#"{{"ready":true,"sequence":7}}"#);
     io::stdout().flush().expect("flush JSON record");
+    loop {
+        std::thread::park();
+    }
+}
+
+fn two_json_records() {
+    println!(r#"{{"ready":true,"sequence":1}}"#);
+    println!(r#"{{"ready":true,"sequence":2}}"#);
+    eprintln!(r#"{{"ready":true,"sequence":1}}"#);
+    eprintln!(r#"{{"ready":true,"sequence":2}}"#);
+    io::stdout().flush().expect("flush JSON records");
+    io::stderr().flush().expect("flush stderr JSON records");
     loop {
         std::thread::park();
     }

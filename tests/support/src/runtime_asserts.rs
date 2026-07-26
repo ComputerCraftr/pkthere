@@ -1,6 +1,6 @@
 use crate::forwarder::{ForwarderSession, snapshot_forwarder_output_tail};
 use crate::runtime_io::{parse_locked_client, parse_stats_json};
-use crate::timing::TEST_RETRY_INTERVAL;
+use crate::timing::{MAX_WAIT_SECS, STATS_WAIT_MS, TEST_RETRY_INTERVAL};
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -155,6 +155,49 @@ pub fn send_until_session_locked(
     None
 }
 
+pub fn send_until_session_stats_matching(
+    client: &UdpSocket,
+    payload: &[u8],
+    session: &mut ForwarderSession,
+    max_wait: Duration,
+    context: &str,
+    mut predicate: impl FnMut(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + max_wait;
+    let mut last_seen = None;
+    while Instant::now() < deadline {
+        client
+            .send(payload)
+            .unwrap_or_else(|error| panic!("{context}: send retry payload: {error}"));
+        let event_deadline = deadline.min(Instant::now() + TEST_RETRY_INTERVAL);
+        let result = session.wait_for_stdout_line(
+            event_deadline,
+            "matching stats JSON while sending retry payloads",
+            |line| {
+                let candidate = parse_stats_json(line)?;
+                let matched = predicate(&candidate);
+                last_seen = Some(candidate.clone());
+                matched.then_some(candidate)
+            },
+        );
+        match result {
+            Ok(stats) => return stats,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => panic!(
+                "{context}: forwarder stopped while waiting for matching stats: {error}\n{}",
+                session.diagnostic_snapshot(40)
+            ),
+        }
+    }
+    let outcome = StatsWaitOutcome {
+        matched: false,
+        last_seen,
+        recent_stdout_tail: None,
+        recent_stderr_tail: None,
+    };
+    panic!("{context}\n{}", outcome.failure_details());
+}
+
 pub fn wait_for_locked_client(
     session: &mut ForwarderSession,
     max_wait: Duration,
@@ -192,6 +235,68 @@ pub fn expect_no_echo(client: &UdpSocket, buf: &mut [u8]) {
         Err(e) => panic!("unexpected recv error: {e}"),
         Ok(n) => panic!("unexpected payload of {n} bytes"),
     }
+}
+
+pub fn exercise_max_payload_boundary(
+    session: &mut ForwarderSession,
+    client: &UdpSocket,
+    max_payload: usize,
+    receive_buffer: &mut [u8],
+    context: &str,
+) -> serde_json::Value {
+    let oversize = vec![u8::MAX; max_payload + 1];
+    client.send(&oversize).expect("send oversize payload");
+    expect_no_echo(client, receive_buffer);
+    let oversize_stats = expect_session_stats_matching(
+        session,
+        STATS_WAIT_MS,
+        "oversize drop was not published before the stats deadline",
+        |stats| {
+            stats["c2u_drops_oversize"]
+                .as_u64()
+                .expect("missing c2u_drops_oversize")
+                == 1
+        },
+    );
+    assert!(
+        !oversize_stats["locked"]
+            .as_bool()
+            .expect("missing locked field"),
+        "an oversize first datagram must not establish a client lock"
+    );
+
+    let accepted = vec![u8::MAX; max_payload];
+    client.send(&accepted).expect("send max payload");
+    recv_legitimate_echo_with_retry(
+        client,
+        &accepted,
+        receive_buffer,
+        context,
+        "max payload echo",
+    )
+    .unwrap_or_else(|error| panic!("{error}\n{}", session.diagnostic_snapshot(80)));
+
+    let stats = expect_session_stats_matching(
+        session,
+        STATS_WAIT_MS,
+        "accepted max-payload datagram did not establish the expected lock",
+        |candidate| candidate["locked"].as_bool().expect("missing locked field"),
+    );
+    session
+        .terminate(Instant::now() + MAX_WAIT_SECS)
+        .expect("terminate max-payload forwarder");
+    assert_eq!(
+        stats["c2u_drops_oversize"]
+            .as_u64()
+            .expect("missing c2u_drops_oversize"),
+        1,
+        "one controlled oversize datagram must produce one oversize drop"
+    );
+    assert!(
+        stats["locked"].as_bool().expect("missing locked field"),
+        "max-payload case should remain locked after successful in-range payload"
+    );
+    stats
 }
 
 pub fn assert_recv_payload(
@@ -328,19 +433,4 @@ pub fn json_addr(v: &serde_json::Value) -> io::Result<SocketAddr> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::StatsWaitOutcome;
-
-    #[test]
-    fn stats_timeout_diagnostics_preserve_last_seen_stats() {
-        let outcome = StatsWaitOutcome {
-            matched: false,
-            last_seen: Some(serde_json::json!({"locked": true})),
-            recent_stdout_tail: Some("last output".to_string()),
-            recent_stderr_tail: None,
-        };
-        let details = outcome.failure_details();
-        assert!(details.contains("\"locked\":true"));
-        assert!(details.contains("last output"));
-    }
-}
+mod tests;

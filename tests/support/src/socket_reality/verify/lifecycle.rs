@@ -3,7 +3,9 @@ use super::model::{DerivedFacts, VerificationError};
 use crate::packet_diagnostics::DiagnosticLogIndex;
 use crate::socket_reality::case::{RealityCase, RealityOperation};
 use crate::socket_reality::evidence::ForwarderLifecycleEvidence;
-use pkthere_socket_policy::{ResolvedSocketPolicy, SocketEvidenceKey};
+use pkthere_socket_policy::{
+    ListenerClearStrategy, ListenerLockLifecycle, ResolvedSocketPolicy, SocketEvidenceKey,
+};
 use serde_json::Value;
 
 pub(super) fn verify_lifecycle(
@@ -58,21 +60,16 @@ pub(super) fn verify_lifecycle(
 
     let (old_key, new_key, update_kind) = if requested.operation == RealityOperation::ListenerRelock
     {
-        let keys = packet_socket_keys(&diagnostics, expected.2)?;
-        let first = *keys
-            .first()
-            .ok_or_else(|| error("listener relock packet dumps contained no socket key"))?;
-        if keys.iter().any(|key| *key != first) {
-            return Err(error("listener relock changed socket slot or generation"));
-        }
-        (first, first, None)
+        listener_relock_transition_keys(&diagnostics, policy.listener_lifecycle, expected.2)?
     } else {
         let (old, new, update) = resolver_transition_keys(&diagnostics, requested.operation)?;
         (old, new, Some(update))
     };
     require_key_has_getsockname(&diagnostics, old_key)?;
     require_key_has_getsockname(&diagnostics, new_key)?;
-    if old_key.socket_slot != new_key.socket_slot {
+    if requested.operation != RealityOperation::ListenerRelock
+        && old_key.socket_slot != new_key.socket_slot
+    {
         return Err(error("lifecycle update changed logical socket_slot"));
     }
     match requested.operation {
@@ -87,7 +84,7 @@ pub(super) fn verify_lifecycle(
                     update_kind.as_deref(),
                     "upstream",
                 )?;
-            } else if requested.connected {
+            } else if !requested.connection_scenario.debug_force_unconnected() {
                 if policy.reuse.reconnects_in_place() {
                     if update_kind.as_deref() != Some("reconnected-in-place") {
                         return Err(error(format!(
@@ -179,22 +176,74 @@ pub(super) fn verify_lifecycle(
             }
         }
         RealityOperation::ListenerRelock => {
-            if old_key != new_key {
-                return Err(error("listener relock replaced the socket"));
+            match policy.listener_lifecycle {
+                Some(ListenerLockLifecycle::StayUnconnectedReplaceOnClear)
+                | Some(ListenerLockLifecycle::Connected {
+                    clear: ListenerClearStrategy::ReplaceOwnerSameBind,
+                }) => {
+                    if old_key.socket_slot != new_key.socket_slot
+                        || old_key.domain != new_key.domain
+                        || new_key.generation != old_key.generation.saturating_add(1)
+                    {
+                        return Err(error(
+                            "listener owner replacement did not preserve slot/domain and increment generation",
+                        ));
+                    }
+                }
+                _ if old_key.domain != new_key.domain
+                    || old_key.generation != new_key.generation =>
+                {
+                    return Err(error(
+                        "listener relock changed domain/generation without replacement lifecycle authority",
+                    ));
+                }
+                _ => {}
             }
-            let final_stats = diagnostics
+            let relocked_client = evidence
+                .client_sends
+                .iter()
+                .find(|send| send.probe_id == 23)
+                .ok_or_else(|| error("listener relock omitted client B send evidence"))?
+                .source
+                .to_string();
+            let relock_stats = diagnostics
                 .stats()
-                .next_back()
-                .ok_or_else(|| error("listener relock emitted no stats evidence"))?;
-            let listener_connected = final_stats.value["worker_flows"]
+                .find(|record| {
+                    record.value["worker_flows"]
+                        .as_array()
+                        .is_some_and(|flows| {
+                            flows.iter().any(|flow| {
+                                flow["locked"].as_bool() == Some(true)
+                                    && flow["flow_key"].as_str() == Some(relocked_client.as_str())
+                            })
+                        })
+                })
+                .ok_or_else(|| {
+                    error("listener relock emitted no locked stats evidence for client B")
+                })?;
+            let locked_flows = relock_stats.value["worker_flows"]
                 .as_array()
-                .and_then(|flows| flows.first())
-                .and_then(|flow| flow["listener_connected"].as_bool())
-                .ok_or_else(|| error("listener relock stats omitted listener_connected"))?;
-            let expected_connected = requested.connected && policy.reuse.connects_after_lock();
-            if listener_connected != expected_connected {
+                .ok_or_else(|| error("listener relock stats omitted worker_flows"))?
+                .iter()
+                .filter(|flow| flow["locked"].as_bool() == Some(true))
+                .collect::<Vec<_>>();
+            if locked_flows.is_empty() {
+                return Err(error(
+                    "listener relock stats contained no locked worker flow",
+                ));
+            }
+            let connected_owner_count = locked_flows
+                .iter()
+                .filter(|flow| flow["listener_connected"].as_bool() == Some(true))
+                .count();
+            let expected_connected = !requested.connection_scenario.debug_force_unconnected()
+                && policy
+                    .listener_lifecycle
+                    .is_some_and(pkthere_socket_policy::ListenerLockLifecycle::connects_after_lock);
+            let expected_connected_owner_count = usize::from(expected_connected);
+            if connected_owner_count != expected_connected_owner_count {
                 return Err(error(format!(
-                    "listener relock connected state was {listener_connected}, expected {expected_connected}"
+                    "listener relock had {connected_owner_count} connected owners, expected {expected_connected_owner_count}"
                 )));
             }
         }
@@ -213,6 +262,56 @@ pub(super) fn verify_lifecycle(
         new_key,
         observed_probe_ids,
     })
+}
+
+pub(super) fn listener_relock_transition_keys(
+    diagnostics: &DiagnosticLogIndex,
+    lifecycle: Option<ListenerLockLifecycle>,
+    role: &str,
+) -> Result<(SocketEvidenceKey, SocketEvidenceKey, Option<String>), VerificationError> {
+    if matches!(
+        lifecycle,
+        Some(ListenerLockLifecycle::StayUnconnectedReplaceOnClear)
+            | Some(ListenerLockLifecycle::Connected {
+                clear: ListenerClearStrategy::ReplaceOwnerSameBind,
+            })
+    ) {
+        let (old, new) = listener_replacement_keys(diagnostics)?;
+        return Ok((old, new, Some("replaced".to_string())));
+    }
+    let keys = packet_socket_keys(diagnostics, role)?;
+    let first = *keys
+        .first()
+        .ok_or_else(|| error("listener relock packet dumps contained no socket key"))?;
+    let last = *keys
+        .last()
+        .ok_or_else(|| error("listener relock packet dumps contained no final key"))?;
+    Ok((first, last, None))
+}
+
+fn listener_replacement_keys(
+    diagnostics: &DiagnosticLogIndex,
+) -> Result<(SocketEvidenceKey, SocketEvidenceKey), VerificationError> {
+    let replacement = diagnostics
+        .socket_evidence()
+        .find(|record| {
+            record.value.get("action").and_then(Value::as_str) == Some("replace-listener-on-clear")
+        })
+        .ok_or_else(|| error("listener relock emitted no listener-replacement evidence"))?;
+    let new_key = replacement
+        .value
+        .get("key")
+        .ok_or_else(|| error("listener replacement evidence omitted its key"))
+        .and_then(parse_evidence_key)?;
+    let old_generation = new_key
+        .generation
+        .checked_sub(1)
+        .ok_or_else(|| error("listener replacement generation cannot precede generation one"))?;
+    let old_key = SocketEvidenceKey {
+        generation: old_generation,
+        ..new_key
+    };
+    Ok((old_key, new_key))
 }
 
 fn require_witnessed_probe(

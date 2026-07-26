@@ -84,6 +84,15 @@ pub enum SocketCall {
         milliseconds: u64,
         result: CallResult<()>,
     },
+    SetReuseAddress {
+        result: CallResult<()>,
+    },
+    SetReusePort {
+        result: CallResult<()>,
+    },
+    GetHeaderIncludedV4 {
+        result: CallResult<bool>,
+    },
     Send {
         destination: Option<SocketAddr>,
         bytes: Vec<u8>,
@@ -141,10 +150,90 @@ pub struct ConnectedFilterEvidence {
     pub rejected_peer: ProbeSocketId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatagramBindShape {
+    ConcreteEphemeralPort,
+    WildcardEphemeralPort,
+    ConcreteFixedPort,
+    WildcardFixedPort,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatagramDisconnectAttempt {
+    pub bind_shape: DatagramBindShape,
+    pub bound_before: SocketAddr,
+    pub original_destination: SocketAddr,
+    pub connected_local: SocketAddr,
+    pub new_peer: SocketAddr,
+    pub disconnect_result: CallResult<()>,
+    pub peer_after_disconnect: CallResult<Option<SocketAddr>>,
+    pub local_after_disconnect: CallResult<SocketAddr>,
+    pub receive_after_disconnect: CallResult<ReceiveEvidence>,
+    pub reconnect_result: CallResult<()>,
+    pub peer_after_reconnect: CallResult<SocketAddr>,
+    pub local_after_reconnect: CallResult<SocketAddr>,
+    pub peer_received_after_reconnect: CallResult<Vec<u8>>,
+    pub queue_isolation: CallResult<DatagramQueueIsolationEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatagramQueueIsolationEvidence {
+    pub queued_before_disconnect: Vec<u8>,
+    pub queued_while_gate_closed: Vec<u8>,
+    pub fresh_after_reconnect: Vec<u8>,
+    pub received_after_reconnect: Vec<ReceiveEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatagramDisconnectEvidence {
+    pub sent_bytes: Vec<u8>,
+    pub attempts: Vec<DatagramDisconnectAttempt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SocketDisconnectAttempt {
+    pub bound_before: CallResult<SocketAddr>,
+    pub post_bind_setup: CallResult<()>,
+    pub connected_local: CallResult<SocketAddr>,
+    pub peer_before: CallResult<Option<SocketAddr>>,
+    pub disconnect_result: CallResult<()>,
+    pub peer_after_disconnect: CallResult<Option<SocketAddr>>,
+    pub local_after_disconnect: CallResult<SocketAddr>,
+    pub reconnect_result: CallResult<()>,
+    pub peer_after_reconnect: CallResult<Option<SocketAddr>>,
+    pub local_after_reconnect: CallResult<SocketAddr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SocketDisconnectEvidence {
+    pub attempt: CallResult<SocketDisconnectAttempt>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IcmpDgramEvidence {
     pub direct: DirectSocketEvidence,
     pub socket: ProbeSocketId,
+    pub outcome: IcmpDgramCollectionOutcome,
+    pub zero_checksum_sequence: Option<u16>,
+    pub zero_checksum_outcome: Option<IcmpDgramCollectionOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IcmpDgramSharedIdEvidence {
+    pub direct: DirectSocketEvidence,
+    pub sockets: Vec<ProbeSocketId>,
+    pub outcomes: Vec<IcmpDgramCollectionOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcmpDgramCollectionOutcome {
+    NotAttempted,
+    ReplyObserved,
+    ReceiveEnded,
+    NoiseLimitExceeded {
+        limit: usize,
+        observed_noise_packets: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +242,22 @@ pub struct ReusePortFanoutEvidence {
     pub successful_bind_count: usize,
     pub sent_flow_count: usize,
     pub received_flow_counts: Vec<usize>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListenerOwnerReplacementEvidence {
+    pub receiver_count: usize,
+    pub successful_initial_bind_count: usize,
+    pub bound_addr: Option<SocketAddr>,
+    pub initial_owner_peer: Option<SocketAddr>,
+    pub initial_owner_received: bool,
+    pub initial_sibling_received: bool,
+    pub replacement_bind_succeeded: bool,
+    pub replacement_addr: Option<SocketAddr>,
+    pub relock_owner_peer: Option<SocketAddr>,
+    pub relock_owner_received: bool,
+    pub unsupported: Option<OsErrorEvidence>,
     pub error: Option<String>,
 }
 
@@ -214,9 +319,13 @@ pub struct ForwarderLifecycleEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RealityEvidence {
     DatagramReceive(DatagramReceiveEvidence),
+    DatagramDisconnect(DatagramDisconnectEvidence),
+    SocketDisconnect(SocketDisconnectEvidence),
     ConnectedFilter(ConnectedFilterEvidence),
     IcmpDgram(IcmpDgramEvidence),
+    IcmpDgramSharedId(IcmpDgramSharedIdEvidence),
     ReusePortFanout(ReusePortFanoutEvidence),
+    ListenerOwnerReplacement(ListenerOwnerReplacementEvidence),
     RawReceive(RawReceiveEvidence),
     RawFourId(ForwarderEvidence),
     Lifecycle(ForwarderLifecycleEvidence),

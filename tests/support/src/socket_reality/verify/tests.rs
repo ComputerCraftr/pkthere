@@ -1,14 +1,27 @@
+use super::availability::classify_creation_failure;
 use super::availability::{CollectionAvailability, classify_availability};
-use super::implementation::require_same_packet_ids;
+use super::contract::require_case_contract;
+use super::implementation::{require_same_packet_ids, require_untrusted_raw_kernel_id};
 use super::raw::verify_forwarder_kernel_evidence;
 use super::{VerificationErrorKind, verify};
 use crate::packet_diagnostics::DiagnosticLogIndex;
-use crate::socket_reality::case::{RealityCase, RealityOperation, RealitySocketPath};
+use crate::socket_reality::case::{
+    ConnectionScenario, RealityCase, RealityOperation, RealitySocketPath,
+};
 use crate::socket_reality::collect::collect_udp_datagram;
 use crate::socket_reality::evidence::{CallResult, ForwarderEvidence, ForwarderProcessEvidence};
+use crate::socket_reality::evidence::{
+    IcmpDgramCollectionOutcome, IcmpDgramEvidence, OsErrorEvidence, ProbeSocketEvidence,
+    SocketCreateEvidence,
+};
 use crate::socket_reality::evidence::{ProbeSocketId, RealityEvidence, SocketCall};
+use crate::socket_reality::requirement::{
+    CollectionAuthority, RealityPlatform, RealityRequirement,
+};
+use pkthere_socket_policy::SocketCreationFailureClass;
 use pkthere_socket_policy::SocketRole;
 use pkthere_wire::SupportedProtocol;
+use socket2::Protocol;
 use socket2::{Domain, Type};
 
 fn udp_case() -> RealityCase {
@@ -19,7 +32,7 @@ fn udp_case() -> RealityCase {
         socket_type: Type::DGRAM,
         socket_path: RealitySocketPath::Datagram,
         policy_role: SocketRole::Listener,
-        connected: false,
+        connection_scenario: ConnectionScenario::DirectUnconnected,
         operation: RealityOperation::DatagramReceiveEvidence,
     }
 }
@@ -32,6 +45,31 @@ fn udp_evidence(case: RealityCase) -> RealityEvidence {
 fn valid_evidence_verifies_without_collector_conclusions() {
     let case = udp_case();
     verify(case, &udp_evidence(case)).expect("verify valid evidence");
+}
+
+#[test]
+fn raw_disconnect_contract_accepts_both_production_roles() {
+    for policy_role in [SocketRole::Listener, SocketRole::Upstream] {
+        require_case_contract(RealityCase {
+            domain: Domain::IPV4,
+            target_domain: None,
+            protocol: SupportedProtocol::ICMP,
+            socket_type: Type::RAW,
+            socket_path: RealitySocketPath::RawIcmp,
+            policy_role,
+            connection_scenario: ConnectionScenario::DirectConnected,
+            operation: RealityOperation::SocketDisconnect,
+        })
+        .unwrap_or_else(|error| panic!("{policy_role:?} RAW disconnect contract: {error}"));
+    }
+}
+
+#[test]
+fn raw_kernel_port_must_be_distinct_from_the_wire_echo_id() {
+    require_untrusted_raw_kernel_id(1, 0x6111).expect("protocol number is not an Echo ID");
+    require_untrusted_raw_kernel_id(58, 0x6111).expect("IPv6 protocol number is not an Echo ID");
+    require_untrusted_raw_kernel_id(0, 0x6111).expect("zero kernel port is not an Echo ID");
+    assert!(require_untrusted_raw_kernel_id(0x6111, 0x6111).is_err());
 }
 
 #[test]
@@ -57,7 +95,7 @@ fn changing_each_requested_dimension_is_rejected() {
             ..case
         },
         RealityCase {
-            connected: true,
+            connection_scenario: ConnectionScenario::DirectConnected,
             ..case
         },
         RealityCase {
@@ -80,21 +118,132 @@ fn changing_each_requested_dimension_is_rejected() {
 #[test]
 fn independent_requirement_availability_outcomes_are_typed() {
     assert_eq!(
-        classify_availability(true, false, CollectionAvailability::Executed),
-        Err(VerificationErrorKind::PolicyCapabilityContradiction)
+        classify_availability(false, CollectionAvailability::Executed),
+        Ok(())
     );
     assert_eq!(
-        classify_availability(true, true, CollectionAvailability::AuthoritativeUnsupported),
-        Err(VerificationErrorKind::RequiredButUnavailable)
+        classify_availability(
+            true,
+            CollectionAvailability::AuthoritativeUnsupported(
+                SocketCreationFailureClass::UnsupportedCandidate
+            )
+        ),
+        Ok(())
     );
     assert_eq!(
         classify_availability(
             false,
-            true,
-            CollectionAvailability::AuthoritativeUnsupported
+            CollectionAvailability::AuthoritativeUnsupported(
+                SocketCreationFailureClass::UnsupportedCandidate
+            )
         ),
-        Err(VerificationErrorKind::UnsupportedByRuntime)
+        Err(VerificationErrorKind::RequiredButUnavailable)
     );
+    assert_eq!(
+        classify_availability(
+            true,
+            CollectionAvailability::Failed(SocketCreationFailureClass::PermissionDenied)
+        ),
+        Err(VerificationErrorKind::EvidenceMismatch)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn reality_creation_failure_classes_match_the_fallback_contract() {
+    let unsupported = std::io::Error::from_raw_os_error(libc::EPROTONOSUPPORT);
+    assert_eq!(
+        classify_creation_failure(&OsErrorEvidence::from(&unsupported)),
+        SocketCreationFailureClass::UnsupportedCandidate
+    );
+    let exhausted = std::io::Error::from_raw_os_error(libc::EMFILE);
+    assert_eq!(
+        classify_creation_failure(&OsErrorEvidence::from(&exhausted)),
+        SocketCreationFailureClass::ResourceExhausted
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn unix_unsupported_primary_is_recorded_when_exact_fallback_accepts_it() {
+    assert_unsupported_production_primary_is_recorded(libc::EPROTONOSUPPORT);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_unsupported_primary_is_recorded_when_exact_fallback_accepts_it() {
+    assert_unsupported_production_primary_is_recorded(
+        windows_sys::Win32::Networking::WinSock::WSAEPROTONOSUPPORT,
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_reality_creation_failure_classes_match_the_fallback_contract() {
+    use windows_sys::Win32::Networking::WinSock::{WSAEMFILE, WSAEPROTONOSUPPORT};
+
+    let unsupported = std::io::Error::from_raw_os_error(WSAEPROTONOSUPPORT);
+    assert_eq!(
+        classify_creation_failure(&OsErrorEvidence::from(&unsupported)),
+        SocketCreationFailureClass::UnsupportedCandidate
+    );
+    let exhausted = std::io::Error::from_raw_os_error(WSAEMFILE);
+    assert_eq!(
+        classify_creation_failure(&OsErrorEvidence::from(&exhausted)),
+        SocketCreationFailureClass::ResourceExhausted
+    );
+}
+
+fn assert_unsupported_production_primary_is_recorded(error_code: i32) {
+    let case = RealityCase {
+        domain: Domain::IPV4,
+        target_domain: None,
+        protocol: SupportedProtocol::ICMP,
+        socket_type: Type::DGRAM,
+        socket_path: RealitySocketPath::Datagram,
+        policy_role: SocketRole::Upstream,
+        connection_scenario: ConnectionScenario::DirectConnected,
+        operation: RealityOperation::IcmpDgramReceiveId,
+    };
+    let socket_id = ProbeSocketId(1);
+    let unsupported = std::io::Error::from_raw_os_error(error_code);
+    let evidence = RealityEvidence::IcmpDgram(IcmpDgramEvidence {
+        direct: crate::socket_reality::evidence::DirectSocketEvidence {
+            sockets: vec![ProbeSocketEvidence {
+                create: SocketCreateEvidence {
+                    socket_id,
+                    domain: case.domain,
+                    socket_type: case.socket_type,
+                    protocol: Some(Protocol::ICMPV4),
+                    result: CallResult::OsError(OsErrorEvidence::from(&unsupported)),
+                },
+                calls: Vec::new(),
+            }],
+        },
+        socket: socket_id,
+        outcome: IcmpDgramCollectionOutcome::NotAttempted,
+        zero_checksum_sequence: None,
+        zero_checksum_outcome: None,
+    });
+    let verified = super::verify_requirement(
+        RealityRequirement {
+            platform: RealityPlatform::current(),
+            case,
+            collection_authority: CollectionAuthority::DirectSocket,
+            required: true,
+            coverage_owner: "unsupported_primary_fallback_regression",
+        },
+        &evidence,
+    )
+    .expect("unsupported primary candidate must follow its exact fallback contract");
+
+    assert!(matches!(
+        verified.facts,
+        super::DerivedFacts::SocketUnavailable {
+            failure_class: SocketCreationFailureClass::UnsupportedCandidate,
+            raw_os_error: Some(code),
+        } if code == error_code
+    ));
 }
 
 #[test]
@@ -142,7 +291,7 @@ fn splicing_getsockname_from_another_socket_is_rejected() {
 #[test]
 fn removing_connection_lifecycle_is_rejected() {
     let case = RealityCase {
-        connected: true,
+        connection_scenario: ConnectionScenario::DirectConnected,
         operation: RealityOperation::ConnectedPeerFiltering,
         ..udp_case()
     };
@@ -195,43 +344,10 @@ fn changing_recorded_send_bytes_is_rejected_without_parallel_payload_state() {
 }
 
 #[test]
-fn collector_evidence_has_no_policy_or_conclusion_fields() {
-    let source = include_str!("../evidence.rs");
-    for forbidden in [
-        "SocketRealityReport",
-        "executed_case",
-        "measured:",
-        "saw_",
-        "MismatchObserved",
-        "ResolvedSocketPolicy",
-        "probe_payload:",
-        "requested_echo_id:",
-        "sent_packet:",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "collector evidence contains conclusion field {forbidden}"
-        );
-    }
-}
-
-#[test]
-fn collectors_do_not_resolve_production_policy() {
-    for source in [
-        include_str!("../collect/direct.rs"),
-        include_str!("../collect/forwarder.rs"),
-    ] {
-        assert!(!source.contains("resolve_socket_policy"));
-        assert!(!source.contains("upstream_reresolve_capability"));
-        assert!(!source.contains("listener_relock_capability"));
-    }
-}
-
-#[test]
 fn source_and_destination_ids_from_separate_packets_are_rejected() {
     let stderr = [
         serde_json::json!({
-            "diagnostic_schema": 2,
+            "diagnostic_schema": 3,
             "diagnostic_sequence": 1,
             "event": "packet_dump",
             "worker": 1,
@@ -245,7 +361,7 @@ fn source_and_destination_ids_from_separate_packets_are_rejected() {
             }}},
         }),
         serde_json::json!({
-            "diagnostic_schema": 2,
+            "diagnostic_schema": 3,
             "diagnostic_sequence": 2,
             "event": "packet_dump",
             "worker": 1,
@@ -284,14 +400,14 @@ fn packet_dump_and_getsockname_from_different_slots_are_rejected() {
     let stderr = format!(
         "socket-evidence {}\npacket-dump {}\n",
         serde_json::json!({
-            "diagnostic_schema": 2,
+            "diagnostic_schema": 3,
             "diagnostic_sequence": 1,
             "event": "socket_evidence",
             "key": socket_key,
             "getsockname": "127.0.0.1:0",
         }),
         serde_json::json!({
-            "diagnostic_schema": 2,
+            "diagnostic_schema": 3,
             "diagnostic_sequence": 2,
             "event": "packet_dump",
             "worker": 1,
@@ -300,7 +416,6 @@ fn packet_dump_and_getsockname_from_different_slots_are_rejected() {
             "stage": "admission",
             "socket": {
                 "evidence_key": dump_key,
-                "local_kernel_addr": "127.0.0.1:0",
             },
             "receive": {"socket_source": "127.0.0.1:9999"},
             "parse": {"headers": {

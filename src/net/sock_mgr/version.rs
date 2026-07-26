@@ -9,7 +9,7 @@ use super::ManagerError;
 ///
 /// This clock deliberately excludes association changes within an existing
 /// `ManagedSocket`; those are ordered by that socket's `association_epoch`.
-pub(crate) struct StateVersion(u64);
+pub(crate) struct StateVersion(pub(super) u64);
 
 impl StateVersion {
     pub(crate) const INITIAL: Self = Self(0);
@@ -34,13 +34,20 @@ pub(super) struct VersionCapacityGuard {
 }
 
 pub(super) struct VersionClock {
-    value: AtomicU64,
+    value: crate::authority::AuthorityAtomic<crate::authority::tags::ManagerState, AtomicU64>,
 }
 
 impl VersionClock {
     pub(super) const fn new() -> Self {
+        Self::with_initial(StateVersion::INITIAL)
+    }
+
+    pub(super) const fn with_initial(initial: StateVersion) -> Self {
         Self {
-            value: AtomicU64::new(StateVersion::INITIAL.0),
+            value: crate::authority::AuthorityAtomic::new_u64(
+                initial.0,
+                crate::authority::AtomicProtocolId::ManagerPublication,
+            ),
         }
     }
 
@@ -60,97 +67,33 @@ impl VersionClock {
     }
 
     #[inline]
-    pub(super) fn publish_prechecked(&self, capacity: VersionCapacityGuard) -> StateVersion {
-        let previous = self
-            .value
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .expect("prechecked manager version capacity must remain available");
-        assert_eq!(
-            previous, capacity.current.0,
-            "manager version changed while its transaction lock was held"
-        );
-        StateVersion(
-            previous
-                .checked_add(1)
-                .expect("prechecked manager version cannot wrap"),
-        )
-    }
-
-    #[cfg(all(test, not(miri)))]
-    pub(super) fn set_for_test(&self, version: StateVersion) {
-        self.value.store(version.0, Ordering::Release);
-    }
-}
-
-// Loom uses stackful generators whose Unix stack allocator calls `getrlimit`.
-// Miri intentionally does not implement that foreign function, so the Loom
-// model belongs to the normal test runner while Miri continues exercising the
-// remaining production unit suite.
-#[cfg(all(test, not(miri)))]
-mod tests {
-    use loom::sync::atomic::{AtomicU64, Ordering};
-    use loom::sync::{Arc, Mutex};
-    use loom::thread;
-
-    #[test]
-    fn version_publication_loom_keeps_multi_leg_snapshots_coherent() {
-        let mut model = loom::model::Builder::new();
-        model.preemption_bound = Some(2);
-        model.check(|| {
-            let transaction = Arc::new(Mutex::new(()));
-            let listener = Arc::new(Mutex::new(0u64));
-            let upstream = Arc::new(Mutex::new(0u64));
-            let version = Arc::new(AtomicU64::new(0));
-            let allocations = Arc::new(Mutex::new(Vec::new()));
-
-            let mut writers = Vec::new();
-            for topology in [1u64, 2u64] {
-                let transaction = Arc::clone(&transaction);
-                let listener = Arc::clone(&listener);
-                let upstream = Arc::clone(&upstream);
-                let version = Arc::clone(&version);
-                let allocations = Arc::clone(&allocations);
-                writers.push(thread::spawn(move || {
-                    let _transaction = transaction.lock().unwrap();
-                    *listener.lock().unwrap() = topology;
-                    *upstream.lock().unwrap() = topology;
-                    let previous = version
-                        .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
-                            value.checked_add(1)
-                        })
-                        .unwrap();
-                    allocations.lock().unwrap().push(previous + 1);
-                }));
-            }
-
-            let reader = {
-                let transaction = Arc::clone(&transaction);
-                let listener = Arc::clone(&listener);
-                let upstream = Arc::clone(&upstream);
-                let version = Arc::clone(&version);
-                thread::spawn(move || {
-                    let observed = version.load(Ordering::Acquire);
-                    if observed == 0 {
-                        return;
-                    }
-                    let _transaction = transaction.lock().unwrap();
-                    let listener = *listener.lock().unwrap();
-                    let upstream = *upstream.lock().unwrap();
-                    let captured_version = version.load(Ordering::Acquire);
-                    assert_eq!(listener, upstream);
-                    assert!(captured_version >= observed);
+    pub(super) fn publish_prechecked(
+        &self,
+        capacity: VersionCapacityGuard,
+    ) -> Result<StateVersion, ManagerError> {
+        // Release publishes manager topology written while the transaction
+        // mutex is held. Relaxed failure ordering observes no usable state.
+        match crate::atomic_core::publish_expected_u64(&self.value, capacity.current.0) {
+            Ok(next) => Ok(StateVersion(next)),
+            Err(crate::atomic_core::ExpectedPublicationError::Exhausted) => {
+                crate::runtime_support::publish_process_fatal(format_args!(
+                    "prechecked manager version wrapped during publication"
+                ));
+                Err(ManagerError::VersionPublicationFailed {
+                    expected: capacity.current,
+                    actual: None,
                 })
-            };
-
-            for writer in writers {
-                writer.join().unwrap();
             }
-            reader.join().unwrap();
-            let mut allocations = allocations.lock().unwrap().clone();
-            allocations.sort_unstable();
-            assert_eq!(allocations, [1, 2]);
-        });
+            Err(crate::atomic_core::ExpectedPublicationError::Changed(actual)) => {
+                crate::runtime_support::publish_process_fatal(format_args!(
+                    "manager version changed during reserved publication: expected {}, observed {actual}",
+                    capacity.current
+                ));
+                Err(ManagerError::VersionPublicationFailed {
+                    expected: capacity.current,
+                    actual: Some(StateVersion(actual)),
+                })
+            }
+        }
     }
 }

@@ -1,8 +1,23 @@
 use crate::cli::RuntimeConfig;
 use crate::endpoint::LogicalEndpoint;
-use crate::net::sock_mgr::{SocketHandles, SocketManager};
+use crate::net::sock_mgr::{PublishedUpdate, SocketHandles, SocketManager};
 use socket2::SockAddr;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+pub(crate) const fn descriptor_cache_lane_count(worker_pairs: usize) -> Option<usize> {
+    worker_pairs.checked_mul(3)
+}
+
+pub(crate) const fn auxiliary_descriptor_cache_lane(
+    worker_pairs: usize,
+    worker_id: usize,
+) -> Option<usize> {
+    match worker_pairs.checked_mul(2) {
+        Some(forwarding_threads) => forwarding_threads.checked_add(worker_id / 2),
+        None => None,
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct CachedSendRoute {
@@ -37,10 +52,100 @@ pub(crate) struct CachedClientState {
     worker_id: usize,
     pub(crate) route: CachedSendRoute,
     pub(crate) session_control_reply_route: Option<CachedSendRoute>,
+    descriptor_cache: crate::net::managed_socket::WorkerDescriptorCache,
     log_handles: bool,
 }
 
+/// One lexical send capability tying the direction-owned descriptor lease to
+/// the route facts captured from the same cache. It cannot be cloned or
+/// constructed outside this module.
+pub(crate) struct CachedSendLease<'cache> {
+    pub(crate) socket: crate::net::managed_socket::ManagedSendLease<'cache>,
+    pub(crate) destination: &'cache SockAddr,
+    pub(crate) source_ip: Option<IpAddr>,
+    pub(crate) icmp_header_id: u16,
+    pub(crate) icmp_source_id: u16,
+}
+
+pub(crate) enum WorkerStateOutcome<'flow> {
+    Current(crate::flow_state::FlowTopologyReadLease<'flow>),
+    Reconciled(crate::flow_state::FlowTopologyReadLease<'flow>),
+}
+
+/// Sole entry point for one complete manager-to-worker publication transfer.
+/// The captured resources never escape between capture and installation, so
+/// callers cannot reorder, repeat, or partially apply either phase.
+struct WorkerStateTransaction<Resource> {
+    staged: Resource,
+}
+
+impl<Resource> WorkerStateTransaction<Resource> {
+    fn run<Output, Error>(
+        capture: impl FnOnce() -> Result<Resource, Error>,
+        install: impl FnOnce(Resource) -> Result<Output, Error>,
+    ) -> Result<Output, Error> {
+        let transaction = WorkerStateTransaction { staged: capture()? };
+        let WorkerStateTransaction { staged } = transaction;
+        install(staged)
+    }
+}
+
 impl CachedClientState {
+    pub(crate) fn service_descriptor_revocation(&mut self) -> io::Result<bool> {
+        self.descriptor_cache.service_revocation()
+    }
+
+    fn reconcile_direction_cache(&mut self, handles: &SocketHandles) -> io::Result<()> {
+        let socket = if self.c2u {
+            &handles.upstream_sock
+        } else {
+            &handles.client_sock
+        };
+        self.descriptor_cache.reconcile(socket)
+    }
+
+    /// Acquires the send lease for this cache's fixed direction. The cache
+    /// itself owns destination selection, so callers cannot pair a C2U cache
+    /// with a listener descriptor or a U2C cache with an upstream descriptor.
+    /// An unreconciled or revoked cache returns an error before socket I/O.
+    pub(crate) fn acquire_prepared_send<'cache>(
+        &'cache mut self,
+        handles: &'cache SocketHandles,
+    ) -> io::Result<CachedSendLease<'cache>> {
+        let socket = if self.c2u {
+            &handles.upstream_sock
+        } else {
+            &handles.client_sock
+        };
+        let send_lease = socket.acquire_send_lease(&mut self.descriptor_cache)?;
+        Ok(CachedSendLease {
+            socket: send_lease,
+            destination: &self.route.dest_sa,
+            source_ip: self.route.source_ip,
+            icmp_header_id: self.route.icmp_header_id,
+            icmp_source_id: self.route.icmp_source_id(),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn expected_upstream_ack_destination_id(
+        &self,
+        handles: &SocketHandles,
+    ) -> io::Result<u16> {
+        let id = match handles.upstream.upstream_local_filter.id() {
+            0 => self.route.icmp_header_id,
+            realized => realized,
+        };
+        if id == 0 {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ICMP upstream ACK destination ID is unresolved",
+            ))
+        } else {
+            Ok(id)
+        }
+    }
+
     #[inline]
     fn build_send_route(
         c2u: bool,
@@ -74,6 +179,30 @@ impl CachedClientState {
                 }
             },
         }
+    }
+
+    fn build_direction_send_route(
+        c2u: bool,
+        handles: &SocketHandles,
+        previous_destination: Option<LogicalEndpoint>,
+    ) -> CachedSendRoute {
+        let destination = if c2u {
+            match handles.upstream.upstream_flow.outbound_destination() {
+                Some(destination) => destination,
+                None => handles.upstream.upstream_remote_filter,
+            }
+        } else {
+            match handles.listener.listener_flow.outbound_destination() {
+                Some(destination) => destination,
+                None => previous_destination.unwrap_or_else(|| {
+                    LogicalEndpoint::from_socket_addr_with_id(
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                        0,
+                    )
+                }),
+            }
+        };
+        Self::build_send_route(c2u, handles, destination)
     }
 
     #[inline]
@@ -127,365 +256,172 @@ impl CachedClientState {
     pub(crate) fn new(
         c2u: bool,
         worker_id: usize,
+        cfg: &RuntimeConfig,
+        handles: &SocketHandles,
+        log_handles: bool,
+    ) -> io::Result<Self> {
+        Self::new_with_descriptor_lane(c2u, worker_id, worker_id, cfg, handles, log_handles)
+    }
+
+    pub(crate) fn new_with_descriptor_lane(
+        c2u: bool,
+        worker_id: usize,
+        descriptor_lane: usize,
         _cfg: &RuntimeConfig,
         handles: &SocketHandles,
         log_handles: bool,
-    ) -> Self {
-        if c2u {
-            Self {
-                c2u,
-                worker_id,
-                route: Self::build_send_route(
-                    c2u,
-                    handles,
-                    match handles.upstream.upstream_flow.outbound_destination() {
-                        Some(dest) => dest,
-                        None => handles.upstream.upstream_remote_filter,
-                    },
-                ),
-                session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
-                log_handles,
-            }
-        } else {
-            let remote = match handles.listener.listener_flow.outbound_destination() {
-                Some(dest) => dest,
-                None => LogicalEndpoint::from_socket_addr_with_id(
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-                    0,
-                ),
-            };
-            Self {
-                c2u,
-                worker_id,
-                route: Self::build_send_route(c2u, handles, remote),
-                session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
-                log_handles,
-            }
-        }
+    ) -> io::Result<Self> {
+        let mut state = Self {
+            c2u,
+            worker_id,
+            route: Self::build_direction_send_route(c2u, handles, None),
+            session_control_reply_route: Self::maybe_build_session_control_reply_route(handles),
+            descriptor_cache: crate::net::managed_socket::WorkerDescriptorCache::for_worker(
+                descriptor_lane,
+            ),
+            log_handles,
+        };
+        state.reconcile_direction_cache(handles)?;
+        Ok(state)
     }
 
-    pub(crate) fn refresh_from_handles(&mut self, handles: &SocketHandles) {
-        if self.c2u {
-            self.route = Self::build_send_route(
-                self.c2u,
-                handles,
-                match handles.upstream.upstream_flow.outbound_destination() {
-                    Some(dest) => dest,
-                    None => handles.upstream.upstream_remote_filter,
-                },
-            );
-        } else {
-            self.route = Self::build_send_route(
-                self.c2u,
-                handles,
-                match handles.listener.listener_flow.outbound_destination() {
-                    Some(dest) => dest,
-                    None => self.route.dest,
-                },
-            );
-        }
+    fn install_route_snapshot(&mut self, handles: &SocketHandles) {
+        self.route = Self::build_direction_send_route(self.c2u, handles, Some(self.route.dest));
         self.session_control_reply_route = Self::maybe_build_session_control_reply_route(handles);
     }
 
+    /// Consumes one manager publication and installs its worker-visible
+    /// handles, descriptor caches, and route facts as one local transaction.
+    /// Callers cannot refresh any one of those resources independently.
+    pub(crate) fn install_manager_publication(
+        &mut self,
+        handles: &mut SocketHandles,
+        auxiliary_cache: Option<&mut Self>,
+        publication: PublishedUpdate,
+    ) -> Result<(), crate::net::sock_mgr::ManagerError> {
+        let mut auxiliary_cache = auxiliary_cache;
+        let staged = publication.handles;
+        self.reconcile_direction_cache(&staged).map_err(|source| {
+            crate::net::sock_mgr::ManagerError::io(
+                "reconcile primary published descriptor cache",
+                source,
+            )
+        })?;
+        if let Some(auxiliary) = auxiliary_cache.as_mut() {
+            (*auxiliary)
+                .reconcile_direction_cache(&staged)
+                .map_err(|source| {
+                    crate::net::sock_mgr::ManagerError::io(
+                        "reconcile auxiliary published descriptor cache",
+                        source,
+                    )
+                })?;
+        }
+        self.install_route_snapshot(&staged);
+        if let Some(auxiliary) = auxiliary_cache.as_mut() {
+            (*auxiliary).install_route_snapshot(&staged);
+        }
+        *handles = staged;
+        Ok(())
+    }
+
     #[inline]
-    pub(crate) fn refresh_handles_and_cache(
+    pub(crate) fn ensure_worker_state<'flow>(
         &mut self,
         sock_mgr: &SocketManager,
         handles: &mut SocketHandles,
-    ) {
-        if handles.version != sock_mgr.current_version() {
-            let previous_version = handles.version;
-            *handles = sock_mgr.refresh_handles();
-            self.refresh_from_handles(handles);
-            log_debug_dir!(
-                self.log_handles,
-                self.worker_id,
-                self.c2u,
-                "refresh_handles_and_cache: stale={}, new_ver={}, listener_flow={:?}, listen_kernel_addr={}, listener_connected={}, upstream_remote_filter={}, upstream_connected={}",
-                previous_version,
-                handles.version,
-                handles.listener.listener_flow,
-                handles.listener.listen_local_kernel_addr,
-                handles.listener_connected(),
-                handles.upstream.upstream_remote_filter,
-                handles.upstream_connected()
-            );
+        flow_read: crate::flow_state::FlowTopologyReadLease<'flow>,
+        auxiliary_cache: Option<&mut Self>,
+    ) -> Result<WorkerStateOutcome<'flow>, crate::net::sock_mgr::ManagerError> {
+        let capture = match sock_mgr.begin_worker_state_transaction(handles.version) {
+            crate::net::sock_mgr::WorkerStateTransactionStart::Current => {
+                return Ok(WorkerStateOutcome::Current(flow_read));
+            }
+            crate::net::sock_mgr::WorkerStateTransactionStart::Required(capture) => capture,
+        };
+        let previous_version = handles.version;
+        let mut auxiliary_cache = auxiliary_cache;
+        let log_handles = self.log_handles;
+        let worker_id = self.worker_id;
+        let c2u = self.c2u;
+        let (flow_read, installed_version) = flow_read
+                .run_released(|| {
+                    WorkerStateTransaction::run(|| {
+                        let staged = capture.capture()?;
+                        if staged.version == previous_version {
+                            return Err(crate::net::sock_mgr::ManagerError::FlowTopology {
+                                operation: "capture changed worker state",
+                                cause: crate::flow_state::FlowTopologyError::Busy,
+                            });
+                        }
+                        Ok(staged)
+                    }, |staged| {
+                        self.reconcile_direction_cache(&staged).map_err(|source| {
+                                crate::net::sock_mgr::ManagerError::io(
+                                    "reconcile primary worker descriptor cache",
+                                    source,
+                                )
+                            })?;
+                            if let Some(auxiliary) = auxiliary_cache.as_mut() {
+                                (*auxiliary)
+                                    .reconcile_direction_cache(&staged)
+                                    .map_err(|source| {
+                                        crate::net::sock_mgr::ManagerError::io(
+                                            "reconcile auxiliary worker descriptor cache",
+                                            source,
+                                        )
+                                    })?;
+                            }
+                            self.install_route_snapshot(&staged);
+                            if let Some(auxiliary) = auxiliary_cache.as_mut() {
+                                (*auxiliary).install_route_snapshot(&staged);
+                            }
+                            log_debug_dir!(
+                                log_handles,
+                                worker_id,
+                                c2u,
+                                "ensure_worker_state: stale={}, new_ver={}, listener_key={:?}, listener_flow={:?}, listener_connected={}, upstream_key={:?}, upstream_connected={}",
+                                previous_version,
+                                staged.version,
+                                staged.listener.evidence_key,
+                                staged.listener.listener_flow,
+                                staged.listener_connected(),
+                                staged.upstream.evidence_key,
+                                staged.upstream_connected()
+                            );
+                            let installed_version = staged.version;
+                            let retired = std::mem::replace(handles, staged);
+                            drop(retired);
+                            Ok(installed_version)
+                    })
+                })
+                .map_err(|error| match error {
+                    crate::flow_state::ReleasedFlowOperationError::Operation(error) => error,
+                    crate::flow_state::ReleasedFlowOperationError::Reacquire(cause) => {
+                        crate::net::sock_mgr::ManagerError::FlowTopology {
+                            operation: "reacquire flow authority after worker state transaction",
+                            cause,
+                        }
+                    }
+                })?;
+        if !flow_read.is_current() {
+            return Err(crate::net::sock_mgr::ManagerError::FlowTopology {
+                operation: "validate coherent worker state transaction",
+                cause: crate::flow_state::FlowTopologyError::Busy,
+            });
         }
+        if installed_version != handles.version {
+            return Err(crate::net::sock_mgr::ManagerError::FlowTopology {
+                operation: "validate installed worker-state resource version",
+                cause: crate::flow_state::FlowTopologyError::OwnershipLost,
+            });
+        }
+        Ok(WorkerStateOutcome::Reconciled(flow_read))
     }
 }
 
 #[cfg(all(test, not(miri)))]
-mod tests {
-    use super::{CachedClientState, SocketHandles};
-    use crate::cli::{
-        DebugBehavior, DebugLogs, IcmpReplyIdRequest, ListenMode, ReresolveMode, RuntimeConfig,
-        RuntimeOptions, SupportedProtocol, TimeoutAction, WorkerFlowMode,
-    };
-    use crate::endpoint::LogicalEndpoint;
-    use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
-    use crate::net::sock_mgr::{ListenerMetadata, StateVersion, UpstreamMetadata};
-    use crate::worker_support::test_support::udp_socket;
-    use pkthere_socket_policy::{
-        IcmpPolicyIntent, SocketRole, resolve_socket_policy_with_icmp_intent,
-    };
-    use socket2::{Domain, Type};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-    use std::sync::Arc;
+pub(crate) mod tests;
 
-    fn test_config(lp: SupportedProtocol, up: SupportedProtocol) -> RuntimeConfig {
-        RuntimeConfig {
-            listen: LogicalEndpoint::from_socket_addr_with_id(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
-                8888,
-            ),
-            listener_source_id_request: IcmpReplyIdRequest::Default,
-            listener_reply_id_request: IcmpReplyIdRequest::Default,
-            listen_proto: lp,
-            listen_mode: ListenMode::Fixed,
-            listen_str: String::from("127.0.0.1:8888"),
-            upstream: LogicalEndpoint::from_socket_addr_with_id(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
-                9999,
-            ),
-            upstream_source_id_request: IcmpReplyIdRequest::Default,
-            upstream_reply_id_request: IcmpReplyIdRequest::Default,
-            upstream_proto: up,
-            upstream_str: String::from("127.0.0.1:9999"),
-            options: RuntimeOptions {
-                workers: 1,
-                worker_flow_mode: WorkerFlowMode::SharedFlow,
-                timeout_secs: 10,
-                icmp_handshake_timeout_secs: 10,
-                on_timeout: TimeoutAction::Drop,
-                stats_interval_mins: 0,
-                max_payload: 1500,
-                icmp_sync_pps: 0,
-                reresolve_secs: 0,
-                reresolve_mode: ReresolveMode::Upstream,
-                debug_reresolve_address_file: None,
-                #[cfg(unix)]
-                run_as_user: None,
-                #[cfg(unix)]
-                run_as_group: None,
-                debug_behavior: DebugBehavior::default(),
-                debug_logs: DebugLogs::default(),
-            },
-        }
-    }
-
-    fn test_handles() -> SocketHandles {
-        let upstream_local = LogicalEndpoint::from_socket_addr_with_id(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7777),
-            7777,
-        );
-        let upstream_remote = LogicalEndpoint::from_socket_addr_with_id(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999),
-            9999,
-        );
-        let upstream_flow = SocketLegFlow::new(
-            Some(FlowTuple::new(upstream_remote, upstream_local)),
-            Some(FlowTuple::new(upstream_local, upstream_remote)),
-        );
-        let listen_policy = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Listener,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Drop,
-            false,
-            Domain::IPV4,
-            IcmpPolicyIntent::default(),
-        );
-        let upstream_policy = resolve_socket_policy_with_icmp_intent(
-            SocketRole::Upstream,
-            SupportedProtocol::UDP,
-            Type::DGRAM,
-            TimeoutAction::Drop,
-            false,
-            Domain::IPV4,
-            IcmpPolicyIntent::default(),
-        );
-        SocketHandles::new(
-            ListenerMetadata {
-                flow: None,
-                listener_flow: SocketLegFlow::empty(),
-                listen_local_filter: LogicalEndpoint::from_socket_addr_with_id(
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
-                    8888,
-                ),
-                listen_local_kernel_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
-                evidence_key: crate::net::sock_mgr::SocketEvidenceKey::initial(
-                    SocketRole::Listener,
-                    0,
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888),
-                ),
-                sock_type: Type::DGRAM,
-                policy: listen_policy,
-                parser: crate::net::packet_headers::select_packet_parser(
-                    SupportedProtocol::UDP,
-                    Domain::IPV4,
-                    listen_policy,
-                )
-                .expect("listener parser"),
-            },
-            udp_socket(),
-            UpstreamMetadata {
-                upstream_remote_filter: upstream_remote,
-                upstream_local_filter: upstream_local,
-                upstream_local_kernel_addr: upstream_local.to_socket_addr(),
-                evidence_key: crate::net::sock_mgr::SocketEvidenceKey::initial(
-                    SocketRole::Upstream,
-                    0,
-                    upstream_local.to_socket_addr(),
-                ),
-                upstream_flow,
-                sock_type: Type::DGRAM,
-                policy: upstream_policy,
-                parser: crate::net::packet_headers::select_packet_parser(
-                    SupportedProtocol::UDP,
-                    Domain::IPV4,
-                    upstream_policy,
-                )
-                .expect("upstream parser"),
-            },
-            udp_socket(),
-            StateVersion::INITIAL,
-        )
-    }
-
-    #[test]
-    fn client_flow_key_compares_udp_and_icmp_explicitly() {
-        let udp_a = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8888),
-        )));
-        let udp_b = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(SocketAddr::V4(
-            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9999),
-        )));
-        let icmp_a = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 11));
-        let icmp_b = ClientFlowKey::Icmp(LogicalEndpoint::from_v4(Ipv4Addr::LOCALHOST, 22));
-        let icmp_c = ClientFlowKey::Icmp(LogicalEndpoint::from_v6(Ipv6Addr::LOCALHOST, 11, 0, 0));
-        assert_ne!(udp_a, udp_b);
-        assert_ne!(icmp_a, icmp_b);
-        assert_ne!(icmp_a, icmp_c);
-    }
-
-    #[test]
-    fn cached_session_control_reply_route_is_built_from_listener_outbound_tuple() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
-        let mut handles = test_handles();
-        let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
-        let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
-        let listener = Arc::make_mut(&mut handles.listener);
-        listener.listener_flow = SocketLegFlow::new(
-            Some(FlowTuple::new(remote, local)),
-            Some(FlowTuple::new(local, remote)),
-        );
-        listener.flow = Some(ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(
-            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5555)),
-        )));
-
-        let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
-        let reply_route = cache
-            .session_control_reply_route
-            .expect("reply route exists");
-        assert_eq!(reply_route.dest.id(), 5555);
-        assert_eq!(reply_route.icmp_source_id(), 8888);
-        assert_eq!(reply_route.icmp_advertised_reply_id(), 8888);
-    }
-
-    #[test]
-    fn pending_session_control_reply_route_keeps_source_and_reply_ids_distinct() {
-        let route = CachedClientState::build_pending_session_control_reply_route(
-            LogicalEndpoint::from_socket_addr_with_id(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40001),
-                40001,
-            ),
-            7777,
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            9999,
-        );
-
-        assert_eq!(route.icmp_header_id, 40001);
-        assert_eq!(route.icmp_source_id(), 7777);
-        assert_eq!(route.icmp_advertised_reply_id(), 9999);
-    }
-
-    #[test]
-    fn client_udp_route_uses_no_icmp_header_id() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
-        let handles = test_handles();
-        let cache = CachedClientState::new(false, 0, &cfg, &handles, false);
-        assert_eq!(cache.route.icmp_header_id, 0);
-    }
-
-    #[test]
-    fn client_dgram_icmp_uses_realized_listen_id() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let handles = test_handles();
-        let cache = CachedClientState::new(false, 0, &cfg, &handles, false);
-        assert_eq!(cache.route.icmp_header_id, 0);
-    }
-
-    #[test]
-    fn client_raw_icmp_uses_locked_peer_id() {
-        let cfg = test_config(SupportedProtocol::ICMP, SupportedProtocol::UDP);
-        let mut handles = test_handles();
-        let listener = Arc::make_mut(&mut handles.listener);
-        listener.sock_type = Type::RAW;
-        let local = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8888);
-        let remote = LogicalEndpoint::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
-        listener.listener_flow = SocketLegFlow::new(
-            Some(FlowTuple::new(remote, local)),
-            Some(FlowTuple::new(local, remote)),
-        );
-        let cache = CachedClientState::new(false, 0, &cfg, &handles, false);
-        assert_eq!(cache.route.icmp_header_id, 12345);
-    }
-
-    #[test]
-    fn upstream_udp_route_uses_no_icmp_header_id() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::UDP);
-        let handles = test_handles();
-        let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
-        assert_eq!(cache.route.icmp_header_id, 9999);
-    }
-
-    #[test]
-    fn upstream_raw_icmp_supports_independent_local_and_remote_ids() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
-        let mut handles = test_handles();
-        let upstream = Arc::make_mut(&mut handles.upstream);
-        upstream.sock_type = Type::RAW;
-        // Our "Source Port" (local ID) is 7777
-        upstream.upstream_local_filter = LogicalEndpoint::from_socket_addr_with_id(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            7777,
-        );
-        // Our "Destination Port" (remote ID) is 9999
-        upstream.upstream_remote_filter = LogicalEndpoint::from_socket_addr_with_id(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            9999,
-        );
-
-        let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
-
-        // Outgoing packets must use the remote/destination ID (9999)
-        assert_eq!(cache.route.icmp_header_id, 9999);
-    }
-
-    #[test]
-    fn upstream_dgram_icmp_uses_realized_local_id() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
-        let handles = test_handles();
-        let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
-        assert_eq!(cache.route.icmp_header_id, 9999);
-    }
-
-    #[test]
-    fn upstream_raw_icmp_uses_logical_remote_id() {
-        let cfg = test_config(SupportedProtocol::UDP, SupportedProtocol::ICMP);
-        let mut handles = test_handles();
-        Arc::make_mut(&mut handles.upstream).sock_type = Type::RAW;
-        let cache = CachedClientState::new(true, 0, &cfg, &handles, false);
-        assert_eq!(cache.route.icmp_header_id, 9999);
-    }
-}
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod transaction_loom;

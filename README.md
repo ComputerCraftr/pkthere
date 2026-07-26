@@ -27,8 +27,9 @@ Notable CLI options:
 - `--debug-upstream-unconnected` – leave the upstream socket unconnected and always send via `send_to`.
 - `--debug-fast-stats` – shorten the stats cadence for tests or debugging.
 - `--debug-force-raw-icmp-wildcard-upstream` – test-only override that forces RAW for wildcard `--there ICMP:host:0` while keeping DGRAM-like collapsed/no-disjoint ID semantics.
-- `--debug-log WHAT` – enable one debug category per flag; repeat for multiple categories. `handshake` emits structured reply-ID lifecycle transitions. `packet-dump` emits correlated receive/admission/disposition JSON with bounded hex bytes. Structured diagnostics use schema `2`; order records across stdout/stderr by `diagnostic_sequence`.
+- `--debug-log WHAT` – enable one debug category per flag; repeat for multiple categories. `handshake` emits structured reply-ID lifecycle transitions. `packet-dump` is bounded diagnostic sampling: it emits correlated receive/admission/disposition JSON from separate accepted, filtered, and noise budgets, with bounded retained traces and hex bytes. Structured diagnostics use schema `3`; order records across stdout/stderr by `diagnostic_sequence`.
 - `--icmp-handshake-timeout-secs N` – expire a pending reply-ID handshake after `N` seconds; defaults to `--timeout-secs`.
+- `--icmp-session-pool-size N` – keep `N` ACKed reserve sessions per ICMP transmit leg (`1..=32`, default `4`) so sequence rollover does not interrupt valid traffic.
 - `--stats-interval-mins N` – periodic JSON stats interval (0 disables stats thread).
 - `--icmp-sync-pps N` – global total best-effort ICMP sync request target in packets/s.
 - `--reresolve-secs N` / `--reresolve-mode WHAT` – periodically re-resolve upstream, listener, both, or neither.
@@ -51,7 +52,8 @@ Dynamic `:0` semantics:
 - For upstreams, `--there ICMP:host:9999 --there-source-id 40000 --there-reply-id 40001` sends as logical `40000 -> 9999` and negotiates replies back to `40001`.
 - For listeners, `--here ICMP:host:9999 --here-source-id 7777` listens on `9999` and sends replies from logical source `7777`; the advertised reply destination defaults to the listen ID unless `--here-reply-id` is supplied.
 - Explicit `0` for source or reply requests wildcard negotiation/generation. Omitted source/reply uses the normal realized local endpoint ID.
-- The ICMP shim negotiates reply destination IDs only in session-control frames. User payload packets carry the sender source ID after the reply route is negotiated. The Echo identifier remains the hop-local destination ID. RAW/wildcard-capable sockets can preserve disjoint IDs; fixed DGRAM sockets may use the compact source-equals-Echo-ID form and reject unsupported disjoint reply negotiation with a clear error.
+- The ICMP tunnel uses mandatory v2 session-control establishment and a nonzero session ID on every frame. v1 tunnel frames are rejected rather than accepted through a compatibility fallback. Reply destination IDs are negotiated only in session-control frames. User payload packets carry the sender source ID after the reply route is negotiated. The Echo identifier remains the hop-local destination ID. RAW/wildcard-capable sockets can preserve disjoint IDs; fixed DGRAM sockets may use the compact source-equals-Echo-ID form and reject unsupported disjoint reply negotiation with a clear error.
+- Each ICMP transmit leg maintains a bounded pool of pre-negotiated sessions. Traffic begins after the first ACK; reserve negotiation continues in the background, and sequence exhaustion switches to the oldest ready session without throttling valid data or cadence packets.
 - On Linux, `--there ICMP:host:0` normally uses an ICMP DGRAM socket when no disjoint reply route is required; the kernel-assigned ICMP ID is the concrete local reply endpoint used in negotiation.
 - `--debug-force-raw-icmp-wildcard-upstream` is reserved for raw integration topologies where DGRAM self-echo behavior is not equivalent to talking to a pkthere RAW wildcard listener; it uses RAW transport but one concrete local/remote ICMP ID like a no-disjoint DGRAM wildcard socket.
 - Nonzero ICMP listen/remote IDs remain fixed listener/peer IDs (on Linux/Android, requesting a fixed nonzero ICMP ID forces the use of privileged raw sockets).
@@ -199,6 +201,23 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 - Do not use it for portable or distributable artifacts.
 - Inside Docker, Cross, Colima, or another virtual machine, `native` means the CPU features exposed to that guest, not the full host CPU.
 
+### macOS Time Profiler build
+
+On macOS, build a release-optimized executable with frame pointers and a
+matching packed `.dSYM`:
+
+```bash
+python -m ci.pkthere_ci macos-profile \
+  --cpu-policy portable \
+  --log macos-profile.log
+```
+
+The runner selects the native Apple target explicitly, clears ambient compiler
+flags, verifies the executable and dSYM UUIDs, runs `dwarfdump --verify`, and
+records hashes and toolchain evidence in `macos-profile-artifacts`. Use
+`--cpu-policy native` only for local profiling on the same Mac; portable and
+native artifacts use separate target directories.
+
 Run examples:
 
 - `./target/release/pkthere --here UDP:0.0.0.0:5354 --there UDP:1.1.1.1:53`
@@ -222,7 +241,7 @@ sudo setcap cap_net_raw+ep target/release/pkthere-priv
 
 PKTHERE_ALLOW_RAW_ICMP=1 \
   TEST_APP_BIN=target/release/pkthere-priv \
-  python3 .github/scripts/ci_test_runner.py native \
+  python3 -m ci.pkthere_ci native \
     --log native_tests_linux.log
 ```
 
@@ -236,11 +255,11 @@ sudo chmod u+s target/release/pkthere-priv
 
 PKTHERE_ALLOW_RAW_ICMP=1 \
   TEST_APP_BIN=target/release/pkthere-priv \
-  python3 .github/scripts/ci_test_runner.py raw-reality \
+  python3 -m ci.pkthere_ci raw-reality \
     --log raw_reality_macos.log
 ```
 
-`PKTHERE_ALLOW_RAW_ICMP=1` is an explicit request to run privileged tests supported by the current platform. macOS supports privileged RAW sockets, but its loopback RAW input exposes reflected Echo Replies rather than locally emitted requests, so same-host pure-RAW forwarding topologies are not enabled there. The socket-reality test still exercises macOS RAW socket setup, receive layout, and policy.
+`PKTHERE_ALLOW_RAW_ICMP=1` is an explicit request to run privileged tests supported by the current platform. macOS supports privileged RAW socket creation, sending, reflected-reply receiving, and packet parsing, and socket reality tests those paths directly. macOS loopback does not deliver locally emitted Echo Requests to another bound RAW socket, so pure RAW-to-RAW and DGRAM-to-RAW forwarding topologies are gated independently from RAW socket support.
 
 ## Tests
 
@@ -272,3 +291,6 @@ Useful focused targets:
 - Stress tests: `cargo test --test stress`
 
 Privileged RAW ICMP tests require an isolated privileged executable as described above.
+
+The reusable test procedures and local-evidence handling rules are documented
+in [`docs/testing.md`](docs/testing.md).

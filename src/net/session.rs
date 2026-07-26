@@ -1,6 +1,6 @@
+use crate::diagnostics::PacketTraceId;
 use crate::net::managed_socket::ManagedSendResult;
 use crate::net::payload::PayloadEvent;
-use crate::packet_trace::PacketTraceId;
 use crate::worker_support::PacketContext;
 use crate::worker_support::{PacketDisposition, log_packet_send_disposition};
 use socket2::SockAddr;
@@ -10,6 +10,9 @@ use std::time::Instant;
 
 pub(crate) struct SendOutcome<'a> {
     pub(crate) result: &'a io::Result<ManagedSendResult>,
+    pub(crate) attempted_at: Instant,
+    pub(crate) completed_at: Instant,
+    pub(crate) account_success: bool,
     pub(crate) destination: &'a SockAddr,
     pub(crate) trace: Option<PacketTraceId>,
     pub(crate) trace_kind: SendTraceKind,
@@ -23,12 +26,16 @@ pub(crate) enum SendTraceKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandledSendOutcome {
-    Sent { retried_unconnected: bool },
+    Sent {
+        retried_unconnected: bool,
+        used_unconnected: bool,
+    },
+    Deferred,
     Failed,
 }
 
 pub(crate) fn handle_send_result(
-    context: PacketContext<'_>,
+    context: &mut PacketContext<'_, '_>,
     c2u: bool,
     event: &PayloadEvent<'_>,
     outcome: SendOutcome<'_>,
@@ -42,6 +49,9 @@ pub(crate) fn handle_send_result(
     } = context;
     let SendOutcome {
         result: send_res,
+        attempted_at,
+        completed_at,
+        account_success,
         destination: dest_sa,
         trace,
         trace_kind,
@@ -57,19 +67,26 @@ pub(crate) fn handle_send_result(
 
     match send_res {
         Ok(res) => {
-            if cfg.stats_interval_mins != 0 && event.is_user_payload() {
-                let t_send = Instant::now();
-                stats.send_add(c2u, event.payload_len() as u64, t_recv, t_send);
-            }
-
-            if res.association_changed() {
-                log_warn_dir!(
-                    worker_id,
+            log_debug!(
+                cfg.debug_logs.packets,
+                "[handle_send_result] worker {} c2u={} sent_len={} destination={:?} path={:?}",
+                worker_id,
+                c2u,
+                res.length,
+                dest_sa.as_socket(),
+                res.path
+            );
+            if account_success && cfg.stats_interval_mins != 0 && event.is_user_payload() {
+                stats.send_add(
                     c2u,
-                    "send_payload recovered from EDESTADDRREQ with an unconnected send"
+                    event.payload_len() as u64,
+                    *t_recv,
+                    attempted_at,
+                    completed_at,
                 );
             }
-            if let Some(trace) = trace {
+
+            if account_success && let Some(trace) = trace {
                 log_packet_send_disposition(
                     cfg,
                     trace,
@@ -83,7 +100,8 @@ pub(crate) fn handle_send_result(
                 );
             }
             HandledSendOutcome::Sent {
-                retried_unconnected: res.association_changed(),
+                retried_unconnected: false,
+                used_unconnected: res.used_unconnected_send(),
             }
         }
         Err(e) => {
@@ -95,7 +113,11 @@ pub(crate) fn handle_send_result(
                 dest_sa.as_socket(),
                 e
             );
-            stats.drop_err(c2u);
+            if event.is_user_payload() {
+                stats.user_send_error(c2u);
+            } else {
+                stats.control_send_error(c2u);
+            }
             if let Some(trace) = trace {
                 log_packet_send_disposition(
                     cfg,
@@ -113,53 +135,4 @@ pub(crate) fn handle_send_result(
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::cli::SupportedProtocol;
-    use crate::net::payload::PayloadEvent;
-
-    #[test]
-    fn test_handle_send_result_failed() {
-        use crate::flow_state::FlowRuntimeState;
-        use crate::net::session::{
-            HandledSendOutcome, PacketContext, SendOutcome, SendTraceKind, handle_send_result,
-        };
-        use crate::stats::Stats;
-        use crate::worker_support::PacketTraceId;
-        use socket2::SockAddr;
-        use std::io;
-        use std::net::SocketAddr;
-        use std::str::FromStr;
-        use std::time::Instant;
-
-        let cfg = crate::worker_support::admission_test_support::test_config(
-            crate::cli::IcmpReplyIdRequest::Default,
-        );
-        let stats = Stats::with_worker_shards(1);
-        let flow_state = FlowRuntimeState::new();
-        let context = PacketContext {
-            worker_id: 1,
-            t_start: Instant::now(),
-            t_event: Instant::now(),
-            cfg: &cfg,
-            stats: &stats,
-            flow_state: &flow_state,
-        };
-        let event = PayloadEvent::user_payload_plain(SupportedProtocol::UDP, &[]);
-        let err_res: io::Result<crate::net::managed_socket::ManagedSendResult> = Err(
-            io::Error::new(io::ErrorKind::PermissionDenied, "test error"),
-        );
-        let outcome = SendOutcome {
-            result: &err_res,
-            destination: &SockAddr::from(SocketAddr::from_str("127.0.0.1:0").unwrap()),
-            trace: Some(PacketTraceId {
-                worker_id: 1,
-                c2u: true,
-                packet_id: 100,
-            }),
-            trace_kind: SendTraceKind::Forward,
-        };
-
-        let res = handle_send_result(context, true, &event, outcome);
-        assert_eq!(res, HandledSendOutcome::Failed);
-    }
-}
+mod tests;

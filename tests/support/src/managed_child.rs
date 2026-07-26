@@ -2,7 +2,7 @@
 
 mod capture;
 
-use capture::{CaptureBuffer, StreamKind, spawn_capture};
+use capture::{CaptureBuffer, OutputStream, StreamKind, spawn_capture};
 pub use capture::{CapturedOutput, OutputCursor};
 
 use crate::timing::{
@@ -11,8 +11,6 @@ use crate::timing::{
 
 use std::fmt;
 use std::io;
-#[cfg(unix)]
-use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
@@ -283,10 +281,18 @@ impl ManagedChild {
         OutputCursor::default()
     }
 
+    pub fn stderr_cursor(&self) -> OutputCursor {
+        OutputCursor {
+            stream: OutputStream::Stderr,
+            ..OutputCursor::default()
+        }
+    }
+
     pub fn output_cursor_at_end(&self) -> OutputCursor {
         OutputCursor {
-            stdout_offset: self.capture.snapshot().stdout.len(),
-            partial_line: Vec::new(),
+            stream: OutputStream::Stdout,
+            byte_offset: self.capture.snapshot().stdout.len(),
+            ..OutputCursor::default()
         }
     }
 
@@ -330,7 +336,7 @@ impl ManagedChild {
         let mut observed_exit: Option<(ProcessExit, Instant)> = None;
         loop {
             let snapshot = self.capture.snapshot();
-            for line in cursor.take_lines(&snapshot) {
+            while let Some(line) = cursor.next_line(&snapshot) {
                 if let Some(value) = parser(&line) {
                     return Ok(value);
                 }
@@ -381,6 +387,41 @@ impl ManagedChild {
             let record = serde_json::from_str(line.trim()).ok()?;
             parser(&record)
         })
+    }
+
+    pub fn wait_for_output_snapshot(
+        &mut self,
+        deadline: Instant,
+        event: &str,
+        mut predicate: impl FnMut(&CapturedOutput) -> bool,
+    ) -> Result<CapturedOutput, ChildHarnessError> {
+        loop {
+            let (snapshot, generation) = self.capture.snapshot_with_generation();
+            if predicate(&snapshot) {
+                return Ok(snapshot);
+            }
+            if !snapshot.capture_errors.is_empty() {
+                return Err(ChildHarnessError::CaptureIncomplete {
+                    context: format!("{} while waiting for {event}", self.identity.context),
+                    output: snapshot,
+                });
+            }
+            if let Some(exit) = self.try_status()? {
+                return Err(ChildHarnessError::UnexpectedExit {
+                    context: format!("{} while waiting for {event}", self.identity.context),
+                    exit,
+                    output: self.capture.snapshot(),
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(ChildHarnessError::DeadlineExpired {
+                    context: format!("{}: {event}", self.identity.context),
+                    output: self.capture.snapshot(),
+                });
+            }
+            self.capture
+                .wait_for_change(generation, deadline, self.limits.poll_interval);
+        }
     }
 
     pub fn wait_for_output_change(
@@ -555,14 +596,7 @@ impl ManagedChild {
         let Some(process_tree) = self.process_tree.as_ref() else {
             return Ok(());
         };
-        match process_tree.terminate(kind) {
-            Ok(()) => Ok(()),
-            #[cfg(unix)]
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                run_privileged_terminator(process_tree.process_group(), kind, _deadline)
-            }
-            Err(error) => Err(error),
-        }
+        process_tree.terminate(kind)
     }
 
     fn transfer_to_reaper(&mut self) {
@@ -732,84 +766,20 @@ impl ProcessTree {
             Err(error)
         }
     }
-
-    fn process_group(&self) -> i32 {
-        self.process_group
-    }
-}
-
-#[cfg(unix)]
-fn run_privileged_terminator(
-    process_group: i32,
-    kind: TerminationKind,
-    deadline: Instant,
-) -> io::Result<()> {
-    let signal = match kind {
-        TerminationKind::Graceful => "-TERM",
-        TerminationKind::Forced => "-KILL",
-    };
-    let mut command = Command::new("sudo");
-    command
-        .arg("-n")
-        .arg("/bin/kill")
-        .arg(signal)
-        .arg("--")
-        .arg(format!("-{process_group}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn()?;
-    loop {
-        match child.try_wait()? {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                return Err(io::Error::other(format!(
-                    "privileged terminator exited with {status}: {}",
-                    stderr.trim()
-                )));
-            }
-            None if Instant::now() < deadline => thread::sleep(
-                TEST_POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())),
-            ),
-            None => {
-                let kill_error = child.kill().err();
-                reaper().send(ReaperItem {
-                    child,
-                    _process_tree: None,
-                    context: "privileged process-tree terminator".to_string(),
-                });
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    match kill_error {
-                        Some(error) => format!(
-                            "privileged terminator exceeded its deadline and kill failed: {error}"
-                        ),
-                        None => "privileged terminator exceeded its deadline".to_string(),
-                    },
-                ));
-            }
-        }
-    }
 }
 
 #[cfg(windows)]
 struct ProcessTree {
-    job: isize,
+    job: std::os::windows::io::OwnedHandle,
 }
-
-#[cfg(windows)]
-unsafe impl Send for ProcessTree {}
 
 #[cfg(windows)]
 impl ProcessTree {
     fn new(child: &mut Child) -> io::Result<Self> {
         use std::mem::{size_of, zeroed};
-        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use std::ptr::null;
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -820,41 +790,41 @@ impl ProcessTree {
         if job.is_null() {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: CreateJobObjectW returned a non-null owned HANDLE. This is
+        // the sole conversion into an owning Rust value, and OwnedHandle
+        // closes it exactly once on every success and error path.
+        let job = unsafe { OwnedHandle::from_raw_handle(job.cast()) };
         let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
         information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         let configured = unsafe {
             SetInformationJobObject(
-                job,
+                job.as_raw_handle() as HANDLE,
                 JobObjectExtendedLimitInformation,
                 &information as *const _ as *const _,
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
         };
         let assigned = configured != 0
-            && unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) } != 0;
+            && unsafe {
+                AssignProcessToJobObject(
+                    job.as_raw_handle() as HANDLE,
+                    child.as_raw_handle() as HANDLE,
+                )
+            } != 0;
         if !assigned {
-            let error = io::Error::last_os_error();
-            unsafe { CloseHandle(job) };
-            return Err(error);
+            return Err(io::Error::last_os_error());
         }
-        Ok(Self { job: job as isize })
+        Ok(Self { job })
     }
 
     fn terminate(&self, _kind: TerminationKind) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
-        if unsafe { TerminateJobObject(self.job as _, 1) } != 0 {
+        if unsafe { TerminateJobObject(self.job.as_raw_handle() as _, 1) } != 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
         }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for ProcessTree {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        unsafe { CloseHandle(self.job as _) };
     }
 }
 

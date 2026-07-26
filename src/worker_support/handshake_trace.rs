@@ -1,11 +1,10 @@
 use crate::cli::RuntimeConfig;
+use crate::diagnostics::PacketTraceId;
 use crate::flow_state::{
     DroppedReplyIdHandshake, ExpiredReplyIdHandshake, ReplyIdHandshakeAckIgnored,
     ReplyIdHandshakeBegin,
 };
-use crate::packet_trace::PacketTraceId;
 use serde_json::Value;
-use serde_json::json;
 
 pub(crate) fn log_handshake_begin(
     cfg: &RuntimeConfig,
@@ -32,15 +31,17 @@ fn handshake_begin_json(
     let (mut value, buffered, trigger) = match outcome {
         ReplyIdHandshakeBegin::Started {
             expected_ack_destination_id,
+            instance,
             buffered_len,
             buffered_trace,
         } => (
-            json!({
+            audited_json!({
                 "event": "handshake-trace",
                 "transition": "begin",
                 "worker": worker_id,
                 "direction": "c2u",
                 "expected_ack_destination_id": expected_ack_destination_id,
+                "session_id": instance,
                 "buffered_len": buffered_len,
             }),
             *buffered_trace,
@@ -48,17 +49,19 @@ fn handshake_begin_json(
         ),
         ReplyIdHandshakeBegin::PendingReused {
             expected_ack_destination_id,
+            instance,
             started_s,
             buffered_len,
             buffered_trace,
             trigger_trace,
         } => (
-            json!({
+            audited_json!({
                 "event": "handshake-trace",
                 "transition": "pending-reused",
                 "worker": worker_id,
                 "direction": "c2u",
                 "expected_ack_destination_id": expected_ack_destination_id,
+                "session_id": instance,
                 "started_s": started_s,
                 "buffered_len": buffered_len,
                 "new_payload_len": new_payload_len,
@@ -79,7 +82,10 @@ fn handshake_begin_json(
     Some(value)
 }
 
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct HandshakeAckMatched {
+    pub(crate) session_id: u64,
+    pub(crate) sequence: u16,
     pub(crate) expected_ack_destination_id: u16,
     pub(crate) observed_ack_destination_id: u16,
     pub(crate) peer_source_id: u16,
@@ -101,7 +107,7 @@ pub(crate) fn log_handshake_ack_matched(
 }
 
 fn handshake_ack_matched_json(worker_id: usize, matched: HandshakeAckMatched) -> Value {
-    json!({
+    audited_json!({
         "event": "handshake-trace",
         "transition": "ack-matched",
         "worker": worker_id,
@@ -110,6 +116,8 @@ fn handshake_ack_matched_json(worker_id: usize, matched: HandshakeAckMatched) ->
         "observed_ack_destination_id": matched.observed_ack_destination_id,
         "peer_source_id": matched.peer_source_id,
         "peer_reply_id": matched.peer_reply_id,
+        "session_id": matched.session_id,
+        "sequence": matched.sequence,
         "buffered_len": matched.buffered_len,
         "buffered_packet_id": matched.buffered_trace.map(|t| t.packet_id),
         "buffered_direction": matched.buffered_trace.map(|t| if t.c2u { "c2u" } else { "u2c" }),
@@ -155,8 +163,48 @@ fn handshake_ack_ignored_json(
                 trigger_trace,
                 "ack-rejected",
             ),
+            ReplyIdHandshakeAckIgnored::WrongInstance {
+                expected_instance: _,
+                observed_instance: _,
+                buffered_trace,
+                trigger_trace,
+            } => (
+                "wrong-handshake-instance",
+                None,
+                buffered_trace,
+                trigger_trace,
+                "ack-rejected",
+            ),
+            ReplyIdHandshakeAckIgnored::UnsentSequence {
+                observed_sequence: _,
+                buffered_trace,
+                trigger_trace,
+            } => (
+                "unsent-negotiation-sequence",
+                None,
+                buffered_trace,
+                trigger_trace,
+                "ack-rejected",
+            ),
+            ReplyIdHandshakeAckIgnored::CommitInProgress { trigger_trace } => (
+                "commit-in-progress",
+                None,
+                None,
+                trigger_trace,
+                "ack-ignored",
+            ),
+            ReplyIdHandshakeAckIgnored::Expired {
+                buffered_trace,
+                trigger_trace,
+            } => (
+                "expired",
+                None,
+                buffered_trace,
+                trigger_trace,
+                "ack-rejected",
+            ),
         };
-    json!({
+    audited_json!({
         "event": "handshake-trace",
         "transition": transition,
         "worker": worker_id,
@@ -179,12 +227,13 @@ pub(crate) fn log_handshake_timeout(
     if !cfg.debug_logs.handshake {
         return;
     }
-    log_handshake_value(json!({
+    log_handshake_value(audited_json!({
         "event": "handshake-trace",
         "transition": "timeout",
         "worker": worker_id,
         "direction": "c2u",
         "expected_ack_destination_id": expired.expected_ack_destination_id,
+        "session_id": expired.instance,
         "started_s": expired.started_s,
         "buffered_len": expired.buffered_len,
         "buffered_packet_id": expired.buffered_trace.map(|t| t.packet_id),
@@ -204,7 +253,7 @@ pub(crate) fn log_handshake_reset(
     if !cfg.debug_logs.handshake {
         return;
     }
-    let mut value = json!({
+    let mut value = audited_json!({
         "event": "handshake-trace",
         "transition": "reset",
         "worker": worker_id,
@@ -215,6 +264,7 @@ pub(crate) fn log_handshake_reset(
     });
     if let Some(dropped) = dropped {
         value["expected_ack_destination_id"] = dropped.expected_ack_destination_id.into();
+        value["session_id"] = dropped.instance.into();
         value["buffered_len"] = dropped.buffered_len.into();
         value["buffered_packet_id"] = dropped.buffered_trace.map(|t| t.packet_id).into();
         value["buffered_direction"] = dropped
@@ -230,130 +280,4 @@ fn log_handshake_value(value: Value) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        HandshakeAckMatched, handshake_ack_ignored_json, handshake_ack_matched_json,
-        handshake_begin_json,
-    };
-    use crate::flow_state::{ReplyIdHandshakeAckIgnored, ReplyIdHandshakeBegin};
-
-    #[test]
-    fn begin_json_names_correlation_and_buffer_fields() {
-        let value = handshake_begin_json(
-            3,
-            None,
-            &ReplyIdHandshakeBegin::Started {
-                expected_ack_destination_id: 40001,
-                buffered_len: 17,
-                buffered_trace: None,
-            },
-            17,
-        )
-        .expect("started handshake trace");
-        assert_eq!(value["event"], "handshake-trace");
-        assert_eq!(value["transition"], "begin");
-        assert_eq!(value["worker"], 3);
-        assert_eq!(value["direction"], "c2u");
-        assert_eq!(value["expected_ack_destination_id"], 40001);
-        assert_eq!(value["buffered_len"], 17);
-    }
-
-    #[test]
-    fn pending_reused_json_documents_preserved_first_payload() {
-        let value = handshake_begin_json(
-            4,
-            None,
-            &ReplyIdHandshakeBegin::PendingReused {
-                expected_ack_destination_id: 40001,
-                started_s: 3,
-                buffered_len: 5,
-                buffered_trace: None,
-                trigger_trace: None,
-            },
-            6,
-        )
-        .expect("pending handshake trace");
-        assert_eq!(value["transition"], "pending-reused");
-        assert_eq!(value["buffer"], "preserved");
-        assert_eq!(value["new_payload"], "dropped");
-        assert_eq!(value["buffered_len"], 5);
-        assert_eq!(value["new_payload_len"], 6);
-        assert_eq!(value["started_s"], 3);
-    }
-
-    #[test]
-    fn ignored_ack_json_distinguishes_no_pending_and_completed() {
-        let dummy_trace_1 = Some(crate::worker_support::PacketTraceId {
-            worker_id: 5,
-            c2u: true,
-            packet_id: 100,
-        });
-        let dummy_trace_2 = Some(crate::worker_support::PacketTraceId {
-            worker_id: 5,
-            c2u: false,
-            packet_id: 101,
-        });
-
-        for (reason, expected) in [
-            (
-                ReplyIdHandshakeAckIgnored::NoPending {
-                    trigger_trace: None,
-                },
-                "no-pending",
-            ),
-            (
-                ReplyIdHandshakeAckIgnored::AlreadyAcked {
-                    trigger_trace: None,
-                },
-                "already-acked",
-            ),
-            (
-                ReplyIdHandshakeAckIgnored::WrongDestinationId {
-                    expected_ack_destination_id: 30001,
-                    buffered_trace: dummy_trace_1,
-                    trigger_trace: dummy_trace_2,
-                },
-                "wrong-ack-destination-id",
-            ),
-        ] {
-            let value = handshake_ack_ignored_json(5, reason, 40001);
-            assert_eq!(
-                value["transition"],
-                match expected {
-                    "wrong-ack-destination-id" => "ack-rejected",
-                    _ => "ack-ignored",
-                }
-            );
-            assert_eq!(value["worker"], 5);
-            assert_eq!(value["direction"], "u2c");
-            assert_eq!(value["reason"], expected);
-            assert_eq!(value["observed_ack_destination_id"], 40001);
-
-            if expected == "wrong-ack-destination-id" {
-                assert_eq!(value["expected_ack_destination_id"], 30001);
-                assert_eq!(value["buffered_packet_id"], 100);
-                assert_eq!(value["trigger_packet_id"], 101);
-            }
-        }
-    }
-
-    #[test]
-    fn matched_ack_json_keeps_destination_and_peer_ids_distinct() {
-        let value = handshake_ack_matched_json(
-            7,
-            HandshakeAckMatched {
-                expected_ack_destination_id: 40001,
-                observed_ack_destination_id: 40001,
-                peer_source_id: 7777,
-                peer_reply_id: 9999,
-                buffered_len: 4,
-                buffered_trace: None,
-                trigger_trace: None,
-            },
-        );
-        assert_eq!(value["expected_ack_destination_id"], 40001);
-        assert_eq!(value["observed_ack_destination_id"], 40001);
-        assert_eq!(value["peer_source_id"], 7777);
-        assert_eq!(value["peer_reply_id"], 9999);
-    }
-}
+mod tests;

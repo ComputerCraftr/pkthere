@@ -1,5 +1,13 @@
 include = ["**/*.toml"]
-exclude = ["target/**", ".artifacts/**", "cross-artifacts/**", "docker-artifacts/**"]
+exclude = [
+  "target/**",
+  "vendor/**",
+  "generated/**",
+  ".artifacts/**",
+  "cross-artifacts/**",
+  "docker-artifacts/**",
+  "macos-profile-artifacts/**",
+]
 
 [formatting]
 allowed_blank_lines = 1

@@ -1,78 +1,72 @@
-use crate::net::socket_errors::DEST_ADDR_REQUIRED;
 use pkthere_socket_policy::{PeerVerification, ReceiveSyscall};
 use socket2::{SockAddr, Socket};
 use std::fmt;
 use std::io::{self, IoSlice};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+const DATA_PLANE_POLL_FALLBACK: Duration = Duration::from_millis(50);
+const DATA_PLANE_POLL_MINIMUM: Duration = Duration::from_millis(1);
+const TOPOLOGY_IO_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const IO_GATE_CLOSED: u64 = 1_u64 << (u64::BITS - 1);
+#[cfg(unix)]
+pub(crate) const DEST_ADDR_REQUIRED: i32 = libc::EDESTADDRREQ;
+#[cfg(windows)]
+pub(crate) const DEST_ADDR_REQUIRED: i32 = 10039; // WSAEDESTADDRREQ
+pub(crate) const SOCKET_IO_LANE_BYTES: usize = size_of::<SocketIoLaneSlot>();
+
+pub(crate) fn descriptor_cache_reconcile_is_retryable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+}
+
+mod association;
+mod association_reservation;
+mod association_socket_ops;
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod association_state_loom;
 mod error;
 mod platform;
+pub(in crate::net) mod realization;
 mod receive;
-pub(crate) use error::ManagedSocketError;
+mod retirement_core;
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod retirement_core_loom;
+#[cfg(all(test, not(miri)))]
+pub(crate) mod test_support;
+mod types;
+mod wake;
+pub(crate) use error::{AssociationStale, ManagedSocketError};
 pub(crate) use receive::{ReceiveBuffer, ReceivedPacket};
+pub(crate) use wake::ManagedWakePair;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ManagedSendPath {
-    Connected,
-    Unconnected,
-    RetriedUnconnected,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ManagedSendResult {
-    pub(crate) length: usize,
-    pub(crate) path: ManagedSendPath,
-}
-
-impl ManagedSendResult {
-    pub(crate) const fn used_unconnected_send(self) -> bool {
-        !matches!(self.path, ManagedSendPath::Connected)
-    }
-
-    pub(crate) const fn association_changed(self) -> bool {
-        matches!(self.path, ManagedSendPath::RetriedUnconnected)
-    }
-}
-
-/// The tracked kernel association of one socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AssociationState {
-    Unconnected {
-        epoch: u64,
-    },
-    Connected {
-        peer: SocketAddr,
-        epoch: u64,
-    },
-    Poisoned {
-        operation: AssociationOperation,
-        previous_peer: Option<SocketAddr>,
-        epoch: u64,
-    },
-}
-
-impl AssociationState {
-    #[inline]
-    pub(crate) const fn is_connected(self) -> bool {
-        matches!(self, Self::Connected { .. })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AssociationOperation {
-    Connect,
-    Disconnect,
-    Reconnect,
-}
+pub(crate) use types::{
+    AssociationOperation, AssociationState, ClearTransitionPhase, DisconnectOutcome,
+    ManagedSendPath, ManagedSendResult,
+};
+use types::{
+    IoLeaseAcquireError, PublishedAssociation, PublishedAssociationMode, next_association_epoch,
+    peer_absent_error, peer_network_address_matches,
+};
 
 trait TransitionBackend: Send + Sync {
     fn connect(&self, socket: &Socket, peer: &SockAddr) -> io::Result<()>;
     fn disconnect(&self, socket: &Socket) -> io::Result<()>;
     fn peer_addr(&self, socket: &Socket) -> io::Result<Option<SocketAddr>>;
+    fn local_addr(&self, socket: &Socket) -> io::Result<SocketAddr> {
+        let _operation = crate::authority::audited_operation(
+            crate::authority::OperationId::SocketLocalInspection,
+        );
+        socket
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| io::Error::other("managed socket has a non-INET local address"))
+    }
 
     fn send_connected(&self, socket: &Socket, buffers: &[IoSlice<'_>]) -> io::Result<usize> {
+        let _operation =
+            crate::authority::audited_operation(crate::authority::OperationId::SocketSend);
         match buffers {
             [only] => socket.send(only),
             _ => socket.send_vectored(buffers),
@@ -85,6 +79,8 @@ trait TransitionBackend: Send + Sync {
         buffers: &[IoSlice<'_>],
         destination: &SockAddr,
     ) -> io::Result<usize> {
+        let _operation =
+            crate::authority::audited_operation(crate::authority::OperationId::SocketSend);
         match buffers {
             [only] => socket.send_to(only, destination),
             _ => socket.send_to_vectored(buffers, destination),
@@ -96,6 +92,8 @@ struct SystemTransitionBackend;
 
 impl TransitionBackend for SystemTransitionBackend {
     fn connect(&self, socket: &Socket, peer: &SockAddr) -> io::Result<()> {
+        let _operation =
+            crate::authority::audited_operation(crate::authority::OperationId::SocketConnect);
         socket.connect(peer)
     }
 
@@ -104,6 +102,9 @@ impl TransitionBackend for SystemTransitionBackend {
     }
 
     fn peer_addr(&self, socket: &Socket) -> io::Result<Option<SocketAddr>> {
+        let _operation = crate::authority::audited_operation(
+            crate::authority::OperationId::SocketPeerInspection,
+        );
         match socket.peer_addr() {
             Ok(peer) => Ok(peer.as_socket()),
             Err(error) if peer_absent_error(&error) => Ok(None),
@@ -112,21 +113,722 @@ impl TransitionBackend for SystemTransitionBackend {
     }
 }
 
+struct DescriptorOwner {
+    socket: crate::authority::AuthorityMutex<
+        crate::authority::tags::SocketDescriptor,
+        Option<Arc<Socket>>,
+    >,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AssociationAuthorityState {
+    association: AssociationState,
+    required_local_bind: SocketAddr,
+}
+
+impl AssociationAuthorityState {
+    const fn new(association: AssociationState, required_local_bind: SocketAddr) -> Self {
+        Self {
+            association,
+            required_local_bind,
+        }
+    }
+
+    const fn snapshot(&self) -> (AssociationState, SocketAddr) {
+        (self.association, self.required_local_bind)
+    }
+
+    fn publish(&mut self, association: AssociationState, required_local_bind: SocketAddr) {
+        self.association = association;
+        self.required_local_bind = required_local_bind;
+    }
+}
+
 struct ManagedSocketInner {
-    socket: Socket,
-    association: Mutex<AssociationState>,
+    descriptor: Weak<Socket>,
+    descriptor_owner: DescriptorOwner,
+    realization_evidence: Option<realization::SocketEvidenceId>,
+    association_state: crate::authority::AuthorityMutex<
+        crate::authority::tags::SocketAssociation,
+        AssociationAuthorityState,
+    >,
+    published_association:
+        crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicU64>,
+    io_gate: crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicU64>,
+    descriptor_revocation_generation:
+        crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicU64>,
+    worker_io_lanes: crate::authority::AuthorityOnceLock<
+        crate::authority::tags::SocketTopology,
+        Box<[SocketIoLaneSlot]>,
+    >,
+    control_io_lane: SocketIoLaneSlot,
+    io_drain_wait: crate::authority::AuthorityMutex<crate::authority::tags::WaitCoordination, ()>,
+    io_drained: crate::authority::AuthorityCondvar<crate::authority::tags::WaitCoordination>,
+    authority_identity: crate::authority::AuthorityOnceLock<
+        crate::authority::tags::SocketTopology,
+        SocketAuthorityIdentity,
+    >,
+    authority_phase:
+        crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicU8>,
     peer_verification: PeerVerification,
     backend: Arc<dyn TransitionBackend>,
 }
 
-/// Shared ownership of one descriptor and its kernel association state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SocketAuthorityIdentity {
+    flow: u64,
+    direction: u8,
+    generation: u64,
+}
+
+impl ManagedSocketInner {
+    fn descriptor_cache_evidence(&self, generation: u64) -> (usize, usize) {
+        self.worker_io_lanes.get().map_or((0, 0), |lanes| {
+            lanes
+                .iter()
+                .fold((0usize, 0usize), |(registered, pending), lane| {
+                    let is_registered = lane.cache_registered.load(Ordering::Acquire);
+                    let is_pending = is_registered
+                        && lane.revocation_acknowledged.load(Ordering::Acquire) < generation;
+                    (
+                        registered + usize::from(is_registered),
+                        pending + usize::from(is_pending),
+                    )
+                })
+        })
+    }
+
+    #[inline]
+    fn io_lane(&self, lane: SocketIoLane) -> Option<&SocketIoLaneSlot> {
+        match lane {
+            SocketIoLane::Worker(index) => self.worker_io_lanes.get()?.get(index),
+            SocketIoLane::Control => Some(&self.control_io_lane),
+        }
+    }
+
+    fn active_io_count(&self) -> usize {
+        let worker_count = self.worker_io_lanes.get().map_or(0, |lanes| {
+            lanes
+                .iter()
+                .filter(|lane| {
+                    crate::atomic_core::epoch_lane_is_active(
+                        lane.active_epoch.load(Ordering::Acquire),
+                    )
+                })
+                .count()
+        });
+        worker_count
+            + usize::from(crate::atomic_core::epoch_lane_is_active(
+                self.control_io_lane.active_epoch.load(Ordering::Acquire),
+            ))
+    }
+
+    fn reserve_idle_io_lanes(&self) -> bool {
+        let mut all_reserved = true;
+        if let Some(lanes) = self.worker_io_lanes.get() {
+            for lane in lanes {
+                all_reserved &=
+                    crate::atomic_core::reserve_epoch_lane_for_writer(&lane.active_epoch)
+                        .unwrap_or(false);
+            }
+        }
+        all_reserved
+            & crate::atomic_core::reserve_epoch_lane_for_writer(&self.control_io_lane.active_epoch)
+                .unwrap_or(false)
+    }
+
+    fn release_reserved_io_lanes(&self) -> Result<(), ()> {
+        if let Some(lanes) = self.worker_io_lanes.get() {
+            for lane in lanes {
+                if lane.active_epoch.load(Ordering::Acquire)
+                    == crate::atomic_core::WRITER_RESERVED_EPOCH_LANE
+                {
+                    crate::atomic_core::release_writer_epoch_lane(&lane.active_epoch)
+                        .map_err(|_| ())?;
+                }
+            }
+        }
+        if self.control_io_lane.active_epoch.load(Ordering::Acquire)
+            == crate::atomic_core::WRITER_RESERVED_EPOCH_LANE
+        {
+            crate::atomic_core::release_writer_epoch_lane(&self.control_io_lane.active_epoch)
+                .map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    fn request_descriptor_cache_revocation_after_io_drain(&self) -> Result<(), ManagedSocketError> {
+        let gate = self.io_gate.load(Ordering::Acquire);
+        if gate & IO_GATE_CLOSED == 0 {
+            return Err(ManagedSocketError::TopologyQuiescenceLost {
+                operation: AssociationOperation::Replace,
+                active_io: self.active_io_count(),
+                epoch: gate,
+            });
+        }
+        let active_io = self.active_io_count();
+        if active_io != 0 {
+            return Err(ManagedSocketError::TopologyQuiescenceLost {
+                operation: AssociationOperation::Replace,
+                active_io,
+                epoch: gate & !IO_GATE_CLOSED,
+            });
+        }
+        let revocation_generation = self
+            .descriptor_revocation_generation
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map_err(|_| ManagedSocketError::DescriptorRevocationExhausted)?
+            .checked_add(1)
+            .ok_or(ManagedSocketError::DescriptorRevocationExhausted)?;
+        if let Some(lanes) = self.worker_io_lanes.get() {
+            for lane in lanes {
+                crate::atomic_core::request_descriptor_cache_revocation(
+                    &lane.cache_registered,
+                    &lane.revocation_requested,
+                    revocation_generation,
+                );
+            }
+        }
+        let deadline = std::time::Instant::now() + TOPOLOGY_IO_DRAIN_TIMEOUT;
+        let mut wait = self.io_drain_wait.lock().map_err(|source| {
+            crate::runtime_support::publish_process_fatal(format_args!(
+                "descriptor-cache revocation wait authority failed: {source}"
+            ));
+            ManagedSocketError::DescriptorAuthorityLost { source }
+        })?;
+        loop {
+            let pending = self.worker_io_lanes.get().is_some_and(|lanes| {
+                lanes.iter().any(|lane| {
+                    crate::atomic_core::descriptor_cache_revocation_pending(
+                        &lane.cache_registered,
+                        &lane.revocation_acknowledged,
+                        revocation_generation,
+                    )
+                })
+            });
+            if !pending {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ManagedSocketError::DescriptorRevocationTimedOut {
+                    generation: revocation_generation,
+                });
+            }
+            let (next_wait, timed_out) = self
+                .io_drained
+                .wait_until_as(
+                    wait,
+                    deadline,
+                    crate::authority::WaitId::DescriptorRevocation,
+                )
+                .map_err(|source| {
+                    crate::runtime_support::publish_process_fatal(format_args!(
+                        "descriptor-cache revocation wait failed: {source}"
+                    ));
+                    ManagedSocketError::DescriptorAuthorityLost { source }
+                })?;
+            wait = next_wait;
+            if timed_out {
+                return Err(ManagedSocketError::DescriptorRevocationTimedOut {
+                    generation: revocation_generation,
+                });
+            }
+        }
+    }
+}
+
+pub(crate) struct TopologyAuthorityLease<'socket> {
+    descriptor: LeaseDescriptor<'socket>,
+    published: PublishedAssociation,
+    _kind: IoKind,
+    _authority: crate::authority::AuthorityScope<crate::authority::tags::SocketIo>,
+    _active_io: ActiveIoGuard<'socket>,
+}
+
+struct ActiveIoGuard<'socket> {
+    inner: &'socket ManagedSocketInner,
+    lane: SocketIoLane,
+    epoch: u64,
+}
+
+impl ActiveIoGuard<'_> {
+    #[inline]
+    fn inner(&self) -> &ManagedSocketInner {
+        self.inner
+    }
+}
+
+enum LeaseDescriptor<'socket> {
+    Worker(&'socket Socket),
+    Control(Arc<Socket>),
+}
+
+#[repr(align(128))]
+struct SocketIoLaneSlot {
+    active_epoch: crate::authority::AuthorityAtomic<crate::authority::tags::SocketIo, AtomicU64>,
+    cache_registered:
+        crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicBool>,
+    revocation_requested:
+        crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicU64>,
+    revocation_acknowledged:
+        crate::authority::AuthorityAtomic<crate::authority::tags::SocketTopology, AtomicU64>,
+    #[cfg(any(test, feature = "authority-audit"))]
+    descriptor_refreshes:
+        crate::authority::AuthorityAtomic<crate::authority::tags::DiagnosticCounter, AtomicU64>,
+}
+
+impl SocketIoLaneSlot {
+    const fn new() -> Self {
+        Self {
+            active_epoch: crate::authority::AuthorityAtomic::new_u64(
+                0,
+                crate::authority::AtomicProtocolId::SocketGateAssociation,
+            ),
+            cache_registered: crate::authority::AuthorityAtomic::new_bool(
+                false,
+                crate::authority::AtomicProtocolId::DescriptorCacheOwnership,
+            ),
+            revocation_requested: crate::authority::AuthorityAtomic::new_u64(
+                0,
+                crate::authority::AtomicProtocolId::DescriptorGeneration,
+            ),
+            revocation_acknowledged: crate::authority::AuthorityAtomic::new_u64(
+                0,
+                crate::authority::AtomicProtocolId::DescriptorGeneration,
+            ),
+            #[cfg(any(test, feature = "authority-audit"))]
+            descriptor_refreshes: crate::authority::AuthorityAtomic::new_u64(
+                0,
+                crate::authority::AtomicProtocolId::DiagnosticCounter,
+            ),
+        }
+    }
+
+    #[cfg(all(test, not(miri)))]
+    fn descriptor_reload_count(&self) -> u64 {
+        self.descriptor_refreshes.load(Ordering::Relaxed)
+    }
+}
+
+/// Strong descriptor cache structurally owned by one forwarding worker.
 ///
-/// Cloning this value never duplicates the OS descriptor. Socket policy
-/// decides which transition should occur; this type makes the completed
-/// kernel transition authoritative for current association state.
+/// Mutation requires `&mut self`; shared socket state contains only the
+/// revocation request and acknowledgement atomics. A cache may be reused for
+/// successive socket generations by the same non-reusable worker lane.
+pub(crate) struct WorkerDescriptorCache {
+    lane: SocketIoLane,
+    socket: Option<ManagedSocket>,
+    core: crate::atomic_core::DescriptorCacheCore<Arc<Socket>>,
+}
+
+impl WorkerDescriptorCache {
+    pub(crate) const fn for_worker(worker_id: usize) -> Self {
+        Self {
+            lane: SocketIoLane::Worker(worker_id),
+            socket: None,
+            core: crate::atomic_core::DescriptorCacheCore::new(),
+        }
+    }
+
+    fn same_socket(&self, socket: &ManagedSocket) -> bool {
+        self.socket
+            .as_ref()
+            .is_some_and(|cached| cached.same_descriptor(socket))
+    }
+
+    fn acknowledge_pending(&mut self) -> io::Result<bool> {
+        if !self.core.is_registered() {
+            return Ok(false);
+        }
+        let Some(socket) = self.socket.as_ref() else {
+            return Ok(false);
+        };
+        let slot = socket
+            .inner
+            .io_lane(self.lane)
+            .ok_or_else(|| io::Error::other(ManagedSocketError::ActiveIoExhausted))?;
+        if !self
+            .core
+            .acknowledge(&slot.revocation_requested, &slot.revocation_acknowledged)
+        {
+            return Ok(false);
+        }
+        let wait = socket.inner.io_drain_wait.lock().map_err(|source| {
+            crate::runtime_support::publish_process_fatal(format_args!(
+                "descriptor-cache acknowledgement authority failed: {source}"
+            ));
+            io::Error::other(ManagedSocketError::DescriptorAuthorityLost { source })
+        })?;
+        socket.inner.io_drained.notify_all();
+        drop(wait);
+        Ok(true)
+    }
+
+    /// Services only an already-published revocation request. This operation
+    /// can drop the worker's cached descriptor and acknowledge the writer, but
+    /// it never acquires or publishes a replacement descriptor.
+    pub(crate) fn service_revocation(&mut self) -> io::Result<bool> {
+        self.acknowledge_pending()
+    }
+
+    fn release_current(&mut self) -> io::Result<()> {
+        self.acknowledge_pending()?;
+        if self.core.is_registered()
+            && let Some(socket) = self.socket.as_ref()
+            && let Some(slot) = socket.inner.io_lane(self.lane)
+        {
+            self.core.unregister(&slot.cache_registered);
+            let wait = socket.inner.io_drain_wait.lock().map_err(|source| {
+                crate::runtime_support::publish_process_fatal(format_args!(
+                    "descriptor-cache unregister wait authority failed: {source}"
+                ));
+                io::Error::other(ManagedSocketError::DescriptorAuthorityLost { source })
+            })?;
+            socket.inner.io_drained.notify_all();
+            drop(wait);
+        } else {
+            if self.core.is_registered() {
+                return Err(io::Error::other(
+                    "descriptor cache registration has no owning socket lane",
+                ));
+            }
+        }
+        self.socket = None;
+        Ok(())
+    }
+
+    pub(crate) fn reconcile(&mut self, socket: &ManagedSocket) -> io::Result<()> {
+        let resource_generation = socket
+            .descriptor_resource_generation()
+            .map_err(io::Error::other)?;
+        if self.same_socket(socket) {
+            self.acknowledge_pending()?;
+        } else if self.socket.is_some() {
+            self.release_current()?;
+        }
+        if !self.same_socket(socket) {
+            self.socket = Some(socket.clone_for_descriptor_cache()?);
+        }
+        if !self.core.has_descriptor() {
+            // A worker may loop again after acknowledging revocation while the
+            // flow/topology transaction is still closed. Refreshing here would
+            // recreate a strong owner after the manager observed every cache
+            // acknowledgement and race descriptor retirement.
+            let slot = socket
+                .inner
+                .io_lane(self.lane)
+                .ok_or_else(|| io::Error::other(ManagedSocketError::ActiveIoExhausted))?;
+            match self.core.register_with(
+                &slot.cache_registered,
+                &socket.inner.io_gate,
+                IO_GATE_CLOSED,
+                resource_generation,
+                || socket.upgrade_for_descriptor_cache(),
+            )? {
+                crate::atomic_core::DescriptorCacheRegistration::Registered => {}
+                crate::atomic_core::DescriptorCacheRegistration::GateClosed => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "managed socket topology is transitioning",
+                    ));
+                }
+                crate::atomic_core::DescriptorCacheRegistration::SlotOccupied => {
+                    return Err(io::Error::other(
+                        "descriptor-cache lane already has a distinct registered owner",
+                    ));
+                }
+            }
+            #[cfg(any(test, feature = "authority-audit"))]
+            slot.descriptor_refreshes.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn descriptor<'cache>(
+        &'cache mut self,
+        socket: &ManagedSocket,
+        topology_epoch: u64,
+    ) -> Result<&'cache Socket, ManagedSocketError> {
+        if !self.same_socket(socket) || !self.core.has_descriptor() {
+            return Err(ManagedSocketError::DescriptorOwnershipLost {
+                stage: "worker descriptor cache must be reconciled before socket I/O",
+            });
+        }
+        let resource_generation = socket.descriptor_resource_generation()?;
+        self.core
+            .descriptor_for_io(resource_generation, topology_epoch)
+            .map(Arc::as_ref)
+            .ok_or(ManagedSocketError::DescriptorOwnershipLost {
+                stage: "worker descriptor-cache borrow",
+            })
+    }
+}
+
+impl Drop for WorkerDescriptorCache {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_current() {
+            crate::runtime_support::publish_process_fatal(format_args!(
+                "worker descriptor-cache teardown failed: {error}"
+            ));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SocketIoLane {
+    Worker(usize),
+    Control,
+}
+
+fn release_socket_io_epoch(
+    lane: SocketIoLane,
+    slot: &SocketIoLaneSlot,
+    epoch: u64,
+) -> Result<(), crate::atomic_core::LaneAdmissionError> {
+    match lane {
+        SocketIoLane::Worker(_) => {
+            crate::atomic_core::release_epoch_lane(&slot.active_epoch, epoch)
+        }
+        SocketIoLane::Control => {
+            crate::atomic_core::release_contended_epoch_lane(&slot.active_epoch, epoch)
+        }
+    }
+}
+
+pub(crate) struct ManagedReadiness<'socket> {
+    lease: TopologyAuthorityLease<'socket>,
+    packet_ready: bool,
+    wake_ready: bool,
+}
+
+impl ManagedReadiness<'_> {
+    pub(crate) fn connected(&self) -> bool {
+        self.lease.connected()
+    }
+
+    pub(crate) fn receive_observed<'a, const CAPACITY: usize>(
+        self,
+        buffer: &'a mut ReceiveBuffer<CAPACITY>,
+        syscall: ReceiveSyscall,
+    ) -> io::Result<Option<(ReceivedPacket<'a>, std::time::Instant, bool, u64)>> {
+        if !self.packet_ready {
+            return Ok(None);
+        }
+        let connected = self.lease.connected();
+        let topology_epoch = self.lease.epoch();
+        let packet = receive::receive(self.lease.descriptor(), syscall, buffer)?;
+        let received_at = std::time::Instant::now();
+        Ok(Some((packet, received_at, connected, topology_epoch)))
+    }
+}
+
+pub(crate) struct ManagedSendLease<'socket> {
+    authority: TopologyAuthorityLease<'socket>,
+}
+
+impl ManagedSendLease<'_> {
+    pub(crate) fn send_packet(
+        &self,
+        buffers: &[IoSlice<'_>],
+        destination: &SockAddr,
+    ) -> io::Result<ManagedSendResult> {
+        match self.authority.published.mode() {
+            PublishedAssociationMode::Connected => self
+                .authority
+                ._active_io
+                .inner()
+                .backend
+                .send_connected(self.authority.descriptor(), buffers)
+                .map(|length| ManagedSendResult {
+                    length,
+                    path: ManagedSendPath::Connected,
+                })
+                .map_err(|error| {
+                    if error.raw_os_error() == Some(DEST_ADDR_REQUIRED) {
+                        io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            AssociationStale::new(self.authority.epoch()),
+                        )
+                    } else {
+                        error
+                    }
+                }),
+            PublishedAssociationMode::Unconnected => self
+                .authority
+                ._active_io
+                .inner()
+                .backend
+                .send_unconnected(self.authority.descriptor(), buffers, destination)
+                .map(|length| ManagedSendResult {
+                    length,
+                    path: ManagedSendPath::Unconnected,
+                }),
+            PublishedAssociationMode::Poisoned => Err(io::Error::other(
+                "send rejected: managed socket is poisoned",
+            )),
+            PublishedAssociationMode::Retired => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "send rejected: managed socket is retired",
+            )),
+            PublishedAssociationMode::Transitioning => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "send rejected while managed socket topology is transitioning",
+            )),
+        }
+    }
+}
+
+impl ManagedReadiness<'_> {
+    #[inline]
+    pub(crate) const fn flags(&self) -> (bool, bool) {
+        (self.packet_ready, self.wake_ready)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IoKind {
+    Receive,
+    Send,
+}
+
+impl TopologyAuthorityLease<'_> {
+    #[inline]
+    fn descriptor(&self) -> &Socket {
+        match &self.descriptor {
+            LeaseDescriptor::Worker(descriptor) => descriptor,
+            LeaseDescriptor::Control(descriptor) => descriptor,
+        }
+    }
+
+    #[inline]
+    fn connected(&self) -> bool {
+        matches!(self.published.mode(), PublishedAssociationMode::Connected)
+    }
+
+    #[inline]
+    pub(crate) const fn epoch(&self) -> u64 {
+        self.published.epoch()
+    }
+}
+
+impl Drop for ActiveIoGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        let inner = self.inner();
+        let Some(lane) = inner.io_lane(self.lane) else {
+            crate::runtime_support::publish_process_fatal(format_args!(
+                "managed socket I/O lane disappeared during release"
+            ));
+            return;
+        };
+        if release_socket_io_epoch(self.lane, lane, self.epoch).is_err() {
+            crate::runtime_support::publish_process_fatal(format_args!(
+                "managed socket I/O lane ownership was lost during release"
+            ));
+            return;
+        }
+        if inner.io_gate.load(Ordering::Acquire) & IO_GATE_CLOSED != 0 {
+            let _wait = inner.io_drain_wait.lock().unwrap_or_else(|error| {
+                crate::runtime_support::fatal_invariant_or_shutdown(format_args!(
+                    "socket I/O drain authority failed during release: {error}"
+                ))
+            });
+            inner.io_drained.notify_all();
+        }
+    }
+}
+
+/// Shared logical authority for one descriptor and its kernel association.
+///
+/// Clones retain only a weak descriptor reference. The detachable owner slot
+/// is the sole persistent strong descriptor owner, so retiring the slot closes
+/// the kernel descriptor even while stale logical handles remain alive.
 #[derive(Clone)]
 pub(crate) struct ManagedSocket {
     inner: Arc<ManagedSocketInner>,
+}
+
+/// Unique worker-owned receive capability for one managed descriptor.
+///
+/// This type is intentionally not `Clone`. Senders may share `ManagedSocket`,
+/// while production receive ownership remains with exactly one worker loop.
+pub(crate) struct ManagedReceiver {
+    socket: ManagedSocket,
+}
+
+/// Exclusive topology reservation used while preparing a replacement.
+///
+/// The reservation closes I/O admission and drains existing bounded syscalls,
+/// but does not retire the descriptor until the replacement is ready. Dropping
+/// an uncommitted reservation reopens the original association at a new epoch,
+/// so stale authorities cannot become valid again through rollback.
+#[derive(Debug)]
+pub(crate) struct TopologyReservation {
+    socket: ManagedSocket,
+    previous: AssociationState,
+    previous_local_bind: SocketAddr,
+    epoch: u64,
+    operation: AssociationOperation,
+    staged: Option<AssociationState>,
+    staged_local_bind: Option<SocketAddr>,
+    phase: ClearTransitionPhase,
+    completed: bool,
+    _authority: Option<crate::authority::AuthorityScope<crate::authority::tags::SocketTopology>>,
+}
+
+/// Irreversible topology ownership after the persistent descriptor was taken
+/// and retired for replacement.
+///
+/// This typestate intentionally exposes no rollback operation. The only
+/// completion is publication of the retired old topology; replacement
+/// publication is owned separately by the new descriptor reservation.
+pub(crate) type RetiredTopologyReservation =
+    retirement_core::RetiredSocketTransaction<TopologyReservation>;
+
+pub(crate) type ReplacementBoundTopologyReservation =
+    retirement_core::ReplacementBoundSocketTransaction<TopologyReservation>;
+
+/// Releases audit co-hold scopes for a complete sorted topology batch in the
+/// only valid LIFO order. The closed socket gates remain the actual exclusive
+/// transaction authority after this operation.
+pub(crate) fn park_topology_reservation_batch(
+    reservations: &mut [Option<TopologyReservation>],
+) -> Result<(), ManagedSocketError> {
+    TopologyBatchOrder::try_finish_reverse(
+        reservations.iter_mut().filter_map(Option::as_mut),
+        |step, reservation| reservation.park_authority(step),
+    )
+}
+
+impl ManagedReceiver {
+    pub(crate) fn new(socket: &ManagedSocket) -> Self {
+        Self {
+            socket: socket.clone(),
+        }
+    }
+
+    pub(crate) fn topology_epoch(&self) -> u64 {
+        self.socket.topology_epoch()
+    }
+
+    pub(crate) fn reconcile_descriptor_cache(
+        &self,
+        cache: &mut WorkerDescriptorCache,
+    ) -> io::Result<()> {
+        cache.reconcile(&self.socket)
+    }
+
+    pub(crate) fn wait_until_readable_or_wake<'socket>(
+        &'socket self,
+        cache: &'socket mut WorkerDescriptorCache,
+        wake: &std::net::UdpSocket,
+        timeout: Duration,
+    ) -> io::Result<ManagedReadiness<'socket>> {
+        self.socket
+            .wait_until_readable_or_wake(cache, wake, timeout)
+    }
 }
 
 impl fmt::Debug for ManagedSocket {
@@ -138,846 +840,30 @@ impl fmt::Debug for ManagedSocket {
     }
 }
 
-impl ManagedSocket {
-    pub(crate) fn from_unconnected(
-        socket: Socket,
-        peer_verification: PeerVerification,
-    ) -> Result<Self, ManagedSocketError> {
-        Self::with_backend_checked(
-            socket,
-            Arc::new(SystemTransitionBackend),
-            peer_verification,
-            None,
-        )
-    }
+mod api;
+mod topology_batch;
 
-    #[cfg(all(test, not(miri)))]
-    pub(crate) fn from_connected(
-        socket: Socket,
-        expected_peer: SocketAddr,
-    ) -> Result<Self, ManagedSocketError> {
-        Self::with_backend_checked(
-            socket,
-            Arc::new(SystemTransitionBackend),
-            PeerVerification::RequirePeerAddr,
-            Some(expected_peer),
-        )
-    }
+pub(in crate::net) use topology_batch::{
+    TopologyBatchOrder, TopologyBatchStep, TopologyReservationBatch,
+};
 
-    fn with_backend_checked(
-        socket: Socket,
-        backend: Arc<dyn TransitionBackend>,
-        peer_verification: PeerVerification,
-        expected_peer: Option<SocketAddr>,
-    ) -> Result<Self, ManagedSocketError> {
-        let observed_peer = backend
-            .peer_addr(&socket)
-            .map_err(ManagedSocketError::PeerInspection)?;
-        if observed_peer != expected_peer {
-            return Err(ManagedSocketError::UnexpectedInitialAssociation {
-                expected_peer,
-                observed_peer,
-            });
-        }
-        let association = match expected_peer {
-            Some(peer) => AssociationState::Connected { peer, epoch: 0 },
-            None => AssociationState::Unconnected { epoch: 0 },
-        };
-        Ok(Self {
-            inner: Arc::new(ManagedSocketInner {
-                socket,
-                association: Mutex::new(association),
-                peer_verification,
-                backend,
-            }),
-        })
-    }
-
-    #[cfg(all(test, not(miri)))]
-    fn with_backend(
-        socket: Socket,
-        backend: Arc<dyn TransitionBackend>,
-        peer_verification: PeerVerification,
-    ) -> Self {
-        Self::with_backend_checked(socket, backend, peer_verification, None)
-            .expect("fake socket starts unconnected")
-    }
-
-    #[inline]
-    pub(crate) fn association(&self) -> AssociationState {
-        *self.lock_association()
-    }
-
-    #[inline]
-    pub(crate) fn is_connected(&self) -> bool {
-        self.association().is_connected()
-    }
-
-    #[cfg(all(test, not(miri)))]
-    pub(crate) fn poison_association_for_test(&self, operation: AssociationOperation) {
-        let mut state = self.lock_association();
-        let (previous_peer, epoch) = match *state {
-            AssociationState::Unconnected { epoch } => (None, epoch + 1),
-            AssociationState::Connected { peer, epoch } => (Some(peer), epoch + 1),
-            AssociationState::Poisoned { .. } => {
-                panic!("test socket association is already poisoned")
-            }
-        };
-        *state = AssociationState::Poisoned {
-            operation,
-            previous_peer,
-            epoch,
-        };
-    }
-
-    pub(crate) fn connect_unconnected(&self, peer: SocketAddr) -> Result<(), ManagedSocketError> {
-        let mut state = self.lock_association();
-        let epoch = match *state {
-            AssociationState::Unconnected { epoch } => epoch + 1,
-            AssociationState::Connected { .. } => {
-                return Err(ManagedSocketError::InvalidTransition {
-                    operation: AssociationOperation::Connect,
-                    current: *state,
-                });
-            }
-            AssociationState::Poisoned {
-                operation, epoch, ..
-            } => {
-                return Err(ManagedSocketError::Poisoned {
-                    operation: AssociationOperation::Connect,
-                    poisoned_by: operation,
-                    epoch,
-                });
-            }
-        };
-        let peer_address = SockAddr::from(peer);
-        let transition = self
-            .inner
-            .backend
-            .connect(&self.inner.socket, &peer_address)
-            .and_then(|()| self.verify_connected_peer(peer));
-        match transition {
-            Ok(()) => {
-                *state = AssociationState::Connected { peer, epoch };
-                Ok(())
-            }
-            Err(source) => {
-                *state = AssociationState::Poisoned {
-                    operation: AssociationOperation::Connect,
-                    previous_peer: None,
-                    epoch,
-                };
-                Err(ManagedSocketError::Syscall {
-                    operation: AssociationOperation::Connect,
-                    source,
-                })
-            }
-        }
-    }
-
-    pub(crate) fn disconnect_connected(&self) -> Result<(), ManagedSocketError> {
-        let mut state = self.lock_association();
-        let (previous_peer, epoch) = match *state {
-            AssociationState::Connected { peer, epoch } => (peer, epoch + 1),
-            AssociationState::Unconnected { .. } => {
-                return Err(ManagedSocketError::InvalidTransition {
-                    operation: AssociationOperation::Disconnect,
-                    current: *state,
-                });
-            }
-            AssociationState::Poisoned {
-                operation, epoch, ..
-            } => {
-                return Err(ManagedSocketError::Poisoned {
-                    operation: AssociationOperation::Disconnect,
-                    poisoned_by: operation,
-                    epoch,
-                });
-            }
-        };
-        match self.inner.backend.disconnect(&self.inner.socket) {
-            Ok(()) => {
-                *state = AssociationState::Unconnected { epoch };
-                Ok(())
-            }
-            Err(source) => {
-                *state = AssociationState::Poisoned {
-                    operation: AssociationOperation::Disconnect,
-                    previous_peer: Some(previous_peer),
-                    epoch,
-                };
-                Err(ManagedSocketError::Syscall {
-                    operation: AssociationOperation::Disconnect,
-                    source,
-                })
-            }
-        }
-    }
-
-    pub(crate) fn reconnect_connected(
-        &self,
-        new_peer: SocketAddr,
-    ) -> Result<(), ManagedSocketError> {
-        let mut state = self.lock_association();
-        let (previous_peer, epoch) = match *state {
-            AssociationState::Connected { peer, epoch } => (peer, epoch + 1),
-            AssociationState::Unconnected { .. } => {
-                return Err(ManagedSocketError::InvalidTransition {
-                    operation: AssociationOperation::Reconnect,
-                    current: *state,
-                });
-            }
-            AssociationState::Poisoned {
-                operation, epoch, ..
-            } => {
-                return Err(ManagedSocketError::Poisoned {
-                    operation: AssociationOperation::Reconnect,
-                    poisoned_by: operation,
-                    epoch,
-                });
-            }
-        };
-        let transition = self
-            .inner
-            .backend
-            .disconnect(&self.inner.socket)
-            .and_then(|()| {
-                self.inner
-                    .backend
-                    .connect(&self.inner.socket, &SockAddr::from(new_peer))
-            })
-            .and_then(|()| self.verify_connected_peer(new_peer));
-        match transition {
-            Ok(()) => {
-                *state = AssociationState::Connected {
-                    peer: new_peer,
-                    epoch,
-                };
-                Ok(())
-            }
-            Err(source) => {
-                *state = AssociationState::Poisoned {
-                    operation: AssociationOperation::Reconnect,
-                    previous_peer: Some(previous_peer),
-                    epoch,
-                };
-                Err(ManagedSocketError::Syscall {
-                    operation: AssociationOperation::Reconnect,
-                    source,
-                })
-            }
-        }
-    }
-
-    #[inline]
-    pub(crate) fn local_addr(&self) -> io::Result<SockAddr> {
-        self.inner.socket.local_addr()
-    }
-
-    #[inline]
-    #[cfg(any(debug_assertions, test))]
-    pub(crate) fn peer_addr(&self) -> io::Result<SockAddr> {
-        self.inner.socket.peer_addr()
-    }
-
-    #[cfg(debug_assertions)]
-    pub(crate) fn assert_kernel_association(&self) {
-        match self.association() {
-            AssociationState::Connected { peer, .. } => {
-                if self.inner.peer_verification == PeerVerification::ConnectSuccess {
-                    return;
-                }
-                let kernel_peer = self
-                    .peer_addr()
-                    .expect("tracked connected socket must have a kernel peer")
-                    .as_socket()
-                    .expect("managed production sockets must use IP peers");
-                debug_assert_eq!(kernel_peer, peer);
-            }
-            AssociationState::Unconnected { .. } => {
-                if self.inner.peer_verification == PeerVerification::RequirePeerAddr {
-                    debug_assert!(self.peer_addr().is_err());
-                }
-            }
-            AssociationState::Poisoned { .. } => {}
-        }
-    }
-
-    pub(crate) fn receive<'a, const CAPACITY: usize>(
-        &self,
-        syscall: ReceiveSyscall,
-        buffer: &'a mut ReceiveBuffer<CAPACITY>,
-    ) -> io::Result<ReceivedPacket<'a>> {
-        receive::receive(&self.inner.socket, syscall, buffer)
-    }
-
-    pub(crate) fn send_packet(
-        &self,
-        buffers: &[IoSlice<'_>],
-        destination: &SockAddr,
-    ) -> io::Result<ManagedSendResult> {
-        let state = self.lock_association();
-        match *state {
-            AssociationState::Connected { epoch, .. } => {
-                match self
-                    .inner
-                    .backend
-                    .send_connected(&self.inner.socket, buffers)
-                {
-                    Ok(length) => Ok(ManagedSendResult {
-                        length,
-                        path: ManagedSendPath::Connected,
-                    }),
-                    Err(error) if error.raw_os_error() == Some(DEST_ADDR_REQUIRED) => {
-                        let mut state = state;
-                        *state = AssociationState::Unconnected { epoch: epoch + 1 };
-                        let length = self.inner.backend.send_unconnected(
-                            &self.inner.socket,
-                            buffers,
-                            destination,
-                        )?;
-                        Ok(ManagedSendResult {
-                            length,
-                            path: ManagedSendPath::RetriedUnconnected,
-                        })
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            AssociationState::Unconnected { .. } => {
-                let length = self.inner.backend.send_unconnected(
-                    &self.inner.socket,
-                    buffers,
-                    destination,
-                )?;
-                Ok(ManagedSendResult {
-                    length,
-                    path: ManagedSendPath::Unconnected,
-                })
-            }
-            AssociationState::Poisoned {
-                operation, epoch, ..
-            } => Err(io::Error::other(format!(
-                "send rejected: socket was poisoned by {operation:?} at epoch {epoch}"
-            ))),
-        }
-    }
-
-    pub(crate) fn wait_until_readable(&self, timeout: Duration) -> io::Result<bool> {
-        platform::wait_until_readable(&self.inner.socket, timeout)
-    }
-
-    fn lock_association(&self) -> MutexGuard<'_, AssociationState> {
-        self.inner
-            .association
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn verify_connected_peer(&self, requested_peer: SocketAddr) -> io::Result<()> {
-        if self.inner.peer_verification == PeerVerification::ConnectSuccess {
-            return Ok(());
-        }
-        let observed_peer = self
-            .inner
-            .backend
-            .peer_addr(&self.inner.socket)?
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "connect succeeded without a kernel peer association",
-                )
-            })?;
-        if observed_peer == requested_peer {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!(
-                "connect requested peer {requested_peer}, but kernel reports {observed_peer}"
-            )))
-        }
-    }
-}
-
-fn peer_absent_error(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::NotConnected | io::ErrorKind::InvalidInput | io::ErrorKind::AddrNotAvailable
-    )
-}
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod topology_batch_loom;
 
 #[cfg(all(test, not(miri)))]
-mod tests {
-    use super::{
-        AssociationOperation, AssociationState, ManagedSendPath, ManagedSocket, ManagedSocketError,
-        ReceiveBuffer, SockAddr, Socket, TransitionBackend,
-    };
-    use pkthere_socket_policy::{PeerVerification, ReceiveSyscall};
-    use socket2::{Domain, Protocol, Type};
-    use std::io::{self, IoSlice};
-    use std::net::Ipv4Addr;
-    use std::net::SocketAddr;
-    use std::sync::Barrier;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-
-    struct FakeState {
-        calls: Vec<&'static str>,
-        peer: Option<SocketAddr>,
-        fail_connect: bool,
-        fail_disconnect: bool,
-        destination_required_on_send: bool,
-        report_peer: bool,
-    }
-
-    impl Default for FakeState {
-        fn default() -> Self {
-            Self {
-                calls: Vec::new(),
-                peer: None,
-                fail_connect: false,
-                fail_disconnect: false,
-                destination_required_on_send: false,
-                report_peer: true,
-            }
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeBackend {
-        state: Mutex<FakeState>,
-    }
-
-    impl TransitionBackend for FakeBackend {
-        fn connect(&self, _socket: &Socket, peer: &SockAddr) -> io::Result<()> {
-            let mut state = self.state.lock().expect("fake state");
-            state.calls.push("connect");
-            if state.fail_connect {
-                return Err(io::Error::other("injected connect failure"));
-            }
-            state.peer = peer.as_socket();
-            Ok(())
-        }
-
-        fn disconnect(&self, _socket: &Socket) -> io::Result<()> {
-            let mut state = self.state.lock().expect("fake state");
-            state.calls.push("disconnect");
-            if state.fail_disconnect {
-                return Err(io::Error::other("injected disconnect failure"));
-            }
-            state.peer = None;
-            Ok(())
-        }
-
-        fn peer_addr(&self, _socket: &Socket) -> io::Result<Option<SocketAddr>> {
-            let state = self.state.lock().expect("fake state");
-            Ok(state.report_peer.then_some(state.peer).flatten())
-        }
-
-        fn send_connected(&self, _socket: &Socket, buffers: &[IoSlice<'_>]) -> io::Result<usize> {
-            let mut state = self.state.lock().expect("fake state");
-            state.calls.push("send");
-            if state.destination_required_on_send {
-                return Err(io::Error::from_raw_os_error(
-                    crate::net::socket_errors::DEST_ADDR_REQUIRED,
-                ));
-            }
-            Ok(buffers.iter().map(|buffer| buffer.len()).sum())
-        }
-
-        fn send_unconnected(
-            &self,
-            _socket: &Socket,
-            buffers: &[IoSlice<'_>],
-            _destination: &SockAddr,
-        ) -> io::Result<usize> {
-            self.state.lock().expect("fake state").calls.push("send_to");
-            Ok(buffers.iter().map(|buffer| buffer.len()).sum())
-        }
-    }
-
-    fn fake_socket(backend: Arc<FakeBackend>) -> ManagedSocket {
-        fake_socket_with_verification(backend, PeerVerification::RequirePeerAddr)
-    }
-
-    fn fake_socket_with_verification(
-        backend: Arc<FakeBackend>,
-        peer_verification: PeerVerification,
-    ) -> ManagedSocket {
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-            .expect("create test socket");
-        ManagedSocket::with_backend(socket, backend, peer_verification)
-    }
-
-    #[test]
-    fn connect_disconnect_and_reconnect_have_authoritative_ordering() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let first = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        let second = SocketAddr::from((Ipv4Addr::LOCALHOST, 2002));
-
-        socket.connect_unconnected(first).expect("connect");
-        assert_eq!(
-            socket.association(),
-            AssociationState::Connected {
-                peer: first,
-                epoch: 1
-            }
-        );
-        socket.reconnect_connected(second).expect("reconnect");
-        assert_eq!(
-            socket.association(),
-            AssociationState::Connected {
-                peer: second,
-                epoch: 2
-            }
-        );
-        socket.disconnect_connected().expect("disconnect");
-        assert_eq!(
-            socket.association(),
-            AssociationState::Unconnected { epoch: 3 }
-        );
-        assert_eq!(
-            backend.state.lock().expect("fake state").calls,
-            ["connect", "disconnect", "connect", "disconnect"]
-        );
-    }
-
-    #[test]
-    fn clones_share_one_association_state() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(backend);
-        let clone = socket.clone();
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        socket.connect_unconnected(peer).expect("connect");
-        assert_eq!(clone.association(), socket.association());
-    }
-
-    #[test]
-    fn failed_transition_poisons_socket_and_rejects_later_transitions() {
-        let backend = Arc::new(FakeBackend::default());
-        backend.state.lock().expect("fake state").fail_connect = true;
-        let socket = fake_socket(backend);
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        assert!(matches!(
-            socket.connect_unconnected(peer),
-            Err(ManagedSocketError::Syscall { .. })
-        ));
-        assert!(matches!(
-            socket.connect_unconnected(peer),
-            Err(ManagedSocketError::Poisoned { .. })
-        ));
-    }
-
-    #[test]
-    fn double_connect_returns_typed_error_before_a_second_syscall() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        socket.connect_unconnected(peer).expect("first connect");
-        assert!(matches!(
-            socket.connect_unconnected(peer),
-            Err(ManagedSocketError::InvalidTransition {
-                operation: AssociationOperation::Connect,
-                ..
-            })
-        ));
-        assert_eq!(backend.state.lock().expect("fake state").calls, ["connect"]);
-    }
-
-    #[test]
-    fn double_disconnect_returns_typed_error_before_a_second_syscall() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        socket.connect_unconnected(peer).expect("connect");
-        socket.disconnect_connected().expect("first disconnect");
-        assert!(matches!(
-            socket.disconnect_connected(),
-            Err(ManagedSocketError::InvalidTransition {
-                operation: AssociationOperation::Disconnect,
-                ..
-            })
-        ));
-        assert_eq!(
-            backend.state.lock().expect("fake state").calls,
-            ["connect", "disconnect"]
-        );
-    }
-
-    #[test]
-    fn reconnect_failure_records_one_poison_epoch_and_call_order() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let first = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        let second = SocketAddr::from((Ipv4Addr::LOCALHOST, 2002));
-        socket.connect_unconnected(first).expect("connect");
-        backend.state.lock().expect("fake state").fail_connect = true;
-
-        assert!(matches!(
-            socket.reconnect_connected(second),
-            Err(ManagedSocketError::Syscall {
-                operation: AssociationOperation::Reconnect,
-                ..
-            })
-        ));
-        assert_eq!(
-            socket.association(),
-            AssociationState::Poisoned {
-                operation: AssociationOperation::Reconnect,
-                previous_peer: Some(first),
-                epoch: 2,
-            }
-        );
-        assert_eq!(
-            backend.state.lock().expect("fake state").calls,
-            ["connect", "disconnect", "connect"]
-        );
-        assert!(matches!(
-            socket.disconnect_connected(),
-            Err(ManagedSocketError::Poisoned {
-                poisoned_by: AssociationOperation::Reconnect,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn disconnect_failure_poisons_socket_and_preserves_previous_peer() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        socket.connect_unconnected(peer).expect("connect");
-        backend.state.lock().expect("fake state").fail_disconnect = true;
-
-        assert!(matches!(
-            socket.disconnect_connected(),
-            Err(ManagedSocketError::Syscall {
-                operation: AssociationOperation::Disconnect,
-                ..
-            })
-        ));
-        assert_eq!(
-            socket.association(),
-            AssociationState::Poisoned {
-                operation: AssociationOperation::Disconnect,
-                previous_peer: Some(peer),
-                epoch: 2,
-            }
-        );
-        assert!(matches!(
-            socket.reconnect_connected(peer),
-            Err(ManagedSocketError::Poisoned {
-                poisoned_by: AssociationOperation::Disconnect,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn concurrent_connect_attempts_execute_one_syscall() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let barrier = Arc::new(Barrier::new(3));
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        let threads = (0..2)
-            .map(|_| {
-                let socket = socket.clone();
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    barrier.wait();
-                    socket.connect_unconnected(peer)
-                })
-            })
-            .collect::<Vec<_>>();
-        barrier.wait();
-        let outcomes = threads
-            .into_iter()
-            .map(|thread| thread.join().expect("join connect contender"))
-            .collect::<Vec<_>>();
-        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(
-                    outcome,
-                    Err(ManagedSocketError::InvalidTransition {
-                        operation: AssociationOperation::Connect,
-                        ..
-                    })
-                ))
-                .count(),
-            1
-        );
-        assert_eq!(backend.state.lock().expect("fake state").calls, ["connect"]);
-    }
-
-    #[test]
-    fn connect_success_verification_accepts_missing_peer_addr_evidence() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket =
-            fake_socket_with_verification(Arc::clone(&backend), PeerVerification::ConnectSuccess);
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        backend.state.lock().expect("fake state").report_peer = false;
-
-        socket.connect_unconnected(peer).expect("opaque connect");
-        assert_eq!(
-            socket.association(),
-            AssociationState::Connected { peer, epoch: 1 }
-        );
-    }
-
-    #[test]
-    fn destination_required_retry_changes_association_before_returning() {
-        let backend = Arc::new(FakeBackend::default());
-        let socket = fake_socket(Arc::clone(&backend));
-        let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 1001));
-        socket.connect_unconnected(peer).expect("connect");
-        backend
-            .state
-            .lock()
-            .expect("fake state")
-            .destination_required_on_send = true;
-
-        let result = socket
-            .send_packet(
-                &[IoSlice::new(b"retry")],
-                &SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 2002))),
-            )
-            .expect("retry with destination");
-
-        assert_eq!(result.path, ManagedSendPath::RetriedUnconnected);
-        assert!(result.association_changed());
-        assert_eq!(
-            socket.association(),
-            AssociationState::Unconnected { epoch: 2 }
-        );
-        assert_eq!(
-            backend.state.lock().expect("fake state").calls,
-            ["connect", "send", "send_to"]
-        );
-    }
-
-    #[test]
-    fn delegated_peer_addr_matches_tracked_kernel_association() {
-        let receiver =
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP receiver");
-        let peer = receiver.local_addr().expect("receiver address");
-        let socket =
-            Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("create UDP sender");
-        socket
-            .bind(&SockAddr::from(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))))
-            .expect("bind UDP sender");
-        let managed = ManagedSocket::from_unconnected(socket, PeerVerification::RequirePeerAddr)
-            .expect("wrap unconnected sender");
-        managed.connect_unconnected(peer).expect("connect sender");
-        assert_eq!(
-            managed
-                .peer_addr()
-                .expect("kernel peer")
-                .as_socket()
-                .expect("IP peer"),
-            peer
-        );
-        assert_eq!(
-            managed.association(),
-            AssociationState::Connected { peer, epoch: 1 }
-        );
-    }
-
-    #[test]
-    fn checked_constructors_reject_mismatched_kernel_association() {
-        let receiver =
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP receiver");
-        let peer = receiver.local_addr().expect("receiver address");
-        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP sender");
-        sender.connect(peer).expect("connect sender");
-
-        assert!(matches!(
-            ManagedSocket::from_unconnected(
-                Socket::from(sender),
-                PeerVerification::RequirePeerAddr,
-            ),
-            Err(ManagedSocketError::UnexpectedInitialAssociation {
-                expected_peer: None,
-                observed_peer: Some(observed),
-            }) if observed == peer
-        ));
-    }
-
-    #[test]
-    fn checked_connected_constructor_requires_the_exact_kernel_peer() {
-        let receiver =
-            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP receiver");
-        let peer = receiver.local_addr().expect("receiver address");
-        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind UDP sender");
-        sender.connect(peer).expect("connect sender");
-
-        let managed =
-            ManagedSocket::from_connected(Socket::from(sender), peer).expect("adopt connection");
-        assert_eq!(
-            managed.association(),
-            AssociationState::Connected { peer, epoch: 0 }
-        );
-    }
-
-    #[test]
-    fn managed_receive_exposes_only_the_successful_datagram_prefix_and_source() {
-        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind receiver");
-        let receiver_address = receiver.local_addr().expect("receiver address");
-        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind sender");
-        let sender_address = sender.local_addr().expect("sender address");
-        sender
-            .send_to(b"managed-receive", receiver_address)
-            .expect("send datagram");
-        let receiver = ManagedSocket::from_unconnected(
-            Socket::from(receiver),
-            PeerVerification::RequirePeerAddr,
-        )
-        .expect("wrap receiver");
-        let mut buffer = ReceiveBuffer::<64>::new();
-
-        let packet = receiver
-            .receive(ReceiveSyscall::RecvFrom, &mut buffer)
-            .expect("receive datagram");
-        assert_eq!(packet.bytes(), b"managed-receive");
-        assert_eq!(
-            packet.source().and_then(SockAddr::as_socket),
-            Some(sender_address)
-        );
-    }
-
-    #[test]
-    fn managed_unconnected_send_preserves_zero_length_datagrams() {
-        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind receiver");
-        receiver
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .expect("set receiver timeout");
-        let receiver_address = receiver.local_addr().expect("receiver address");
-        let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind sender");
-        let sender = ManagedSocket::from_unconnected(
-            Socket::from(sender),
-            PeerVerification::RequirePeerAddr,
-        )
-        .expect("wrap sender");
-
-        let result = sender
-            .send_packet(&[IoSlice::new(&[])], &SockAddr::from(receiver_address))
-            .expect("send zero-length datagram");
-        assert_eq!(result.path, ManagedSendPath::Unconnected);
-        assert_eq!(result.length, 0);
-        let mut byte = [0u8; 1];
-        assert_eq!(receiver.recv(&mut byte).expect("receive datagram"), 0);
-    }
-}
+mod tests;
 
 #[cfg(all(test, not(miri)))]
-#[path = "managed_socket/send_tests.rs"]
 mod send_tests;
 
 #[cfg(all(test, not(miri)))]
-#[path = "managed_socket/receive_tests.rs"]
+mod constructor_tests;
+#[cfg(all(test, not(miri)))]
 mod receive_tests;
 
 #[cfg(all(test, not(miri)))]
-#[path = "managed_socket/concurrency_tests.rs"]
 mod concurrency_tests;
+#[cfg(test)]
+mod receive_unit_tests;
+#[cfg(test)]
+mod wake_unit_tests;

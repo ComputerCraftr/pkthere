@@ -1,173 +1,558 @@
+use crate::diagnostics::PacketTraceId;
 use crate::flow_key::{ClientFlowKey, SocketLegFlow};
+use crate::net::framing_shim::{
+    ChallengeControl, PoolGeneration, RejectedFrameEvidence, ResetRequired, SessionId, SessionKey,
+};
+use crate::net::managed_socket::ManagedWakePair;
 use crate::net::payload::BufferedPayload;
-use crate::packet_trace::PacketTraceId;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomOrdering};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
+
+const HANDSHAKE_RETRY_BASE: Duration = Duration::from_millis(10);
+const HANDSHAKE_RETRY_MAX: Duration = Duration::from_millis(500);
+const MAX_HANDSHAKE_RETRY_ATTEMPTS: u32 =
+    maximum_handshake_retry_attempts(crate::cli::MAX_ICMP_HANDSHAKE_TIMEOUT_SECS);
+pub(crate) const MAX_CONCURRENT_SESSION_CANDIDATES: usize = 2;
+const CONTROL_SEND_POOL_CAPACITY: usize = MAX_CONCURRENT_SESSION_CANDIDATES + 1;
+const MAX_STATELESS_RESET_CHALLENGES: usize = 64;
+const ORDINAL_RETIREMENT_WINDOW_BITS: u32 = MAX_RECEIVE_SESSION_CANDIDATES as u32;
+pub(crate) const MAX_RECEIVE_SESSION_CANDIDATES: usize =
+    crate::cli::MAX_ICMP_SESSION_POOL_SIZE + MAX_CONCURRENT_SESSION_CANDIDATES;
+pub(crate) const MAX_DRAINING_SESSIONS: usize = crate::cli::MAX_ICMP_SESSION_POOL_SIZE;
+pub(crate) const ACTIVITY_LANE_BYTES: usize = size_of::<ActivityLane>();
+const OBSERVATION_PHASE_MASK: u64 = 0b11;
+const OBSERVATION_POLLING: u64 = 0b01;
+const OBSERVATION_OBSERVED: u64 = 0b10;
+const MAX_OBSERVATION_GENERATION: u64 = u64::MAX >> 2;
+const CONTROL_OBSERVATION_WORDS: usize = 16;
+pub(crate) const CONTROL_OBSERVATION_LANE_BYTES: usize = size_of::<ControlObservationLane>();
+const NO_MAINTENANCE_DEADLINE: u64 = u64::MAX;
+pub(crate) const SESSION_MAINTENANCE_FALLBACK: Duration = Duration::from_millis(50);
+const _: () = assert!(MAX_HANDSHAKE_RETRY_ATTEMPTS < u16::MAX as u32 + 1);
+
+const fn maximum_handshake_retry_attempts(timeout_seconds: u64) -> u32 {
+    let deadline_ms = timeout_seconds.saturating_mul(1_000);
+    let mut elapsed_ms = 0_u64;
+    let mut attempts = 0_u32;
+    while elapsed_ms <= deadline_ms {
+        attempts += 1;
+        let uncapped_exponent = attempts.saturating_sub(1);
+        let exponent = if uncapped_exponent < 6 {
+            uncapped_exponent
+        } else {
+            6
+        };
+        let uncapped_delay_ms = 10_u64 << exponent;
+        let delay_ms = if uncapped_delay_ms < 500 {
+            uncapped_delay_ms
+        } else {
+            500
+        };
+        elapsed_ms = elapsed_ms.saturating_add(delay_ms);
+    }
+    attempts
+}
 
 pub(crate) struct FlowRuntimeState {
-    locked: AtomicBool,
-    last_seen_s: AtomicU64,
-    upstream_reply_id_acked: AtomicBool,
-    upstream_reply_id_handshake: Mutex<ReplyIdHandshake>,
-    pending_icmp_client_lock: Mutex<Option<PendingIcmpClientLock>>,
-    client_lock_transaction: Mutex<()>,
+    /// Monotonic watchdog activity only. `FlowSessionState::flow` is the sole
+    /// lock-state authority.
+    activity_lanes: Box<[ActivityLane]>,
+    /// Logical-flow generation for watchdog activity. Routine topology
+    /// publication advances the flow gate epoch but must not erase the idle
+    /// clock. Reset advances this generation so old-flow activity is excluded.
+    activity_generation:
+        crate::authority::AuthorityAtomic<crate::authority::tags::Activity, AtomicU64>,
+    sessions:
+        crate::authority::AuthorityMutex<crate::authority::tags::SessionControl, FlowSessionState>,
+    published_admission: crate::authority::AuthorityMutex<
+        crate::authority::tags::SessionControl,
+        PublishedFlowSnapshot,
+    >,
+    control_observations: ControlObservationLanes,
+    client_flow_reservation: crate::net::sock_mgr::transaction_lock::ManagerTransaction<
+        crate::authority::tags::FlowReservation,
+    >,
+    topology: topology::FlowTopologyCoordinator,
+    maintenance_epoch:
+        crate::authority::AuthorityAtomic<crate::authority::tags::Maintenance, AtomicU64>,
+    maintenance_epoch_exhausted:
+        crate::authority::AuthorityAtomic<crate::authority::tags::Maintenance, AtomicBool>,
+    maintenance_published_epoch:
+        crate::authority::AuthorityAtomic<crate::authority::tags::Maintenance, AtomicU64>,
+    maintenance_deadline_hint:
+        crate::authority::AuthorityAtomic<crate::authority::tags::Maintenance, AtomicU64>,
+    maintenance_repair_owner:
+        crate::authority::AuthorityAtomic<crate::authority::tags::Maintenance, AtomicBool>,
+    maintenance_publish: crate::authority::AuthorityMutex<crate::authority::tags::Maintenance, ()>,
+    maintenance_origin: Instant,
+    maintenance_wakes: Box<
+        [crate::authority::AuthorityOnceLock<
+            crate::authority::tags::Maintenance,
+            Weak<MaintenanceWakeInner>,
+        >],
+    >,
+    maintenance_wake_failures:
+        crate::authority::AuthorityAtomic<crate::authority::tags::DiagnosticCounter, AtomicU64>,
 }
 
-pub(crate) struct ClientLockTransactionGuard<'a> {
+mod observation_core;
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod observation_core_loom;
+#[cfg(test)]
+mod observation_tests;
+mod observations;
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod receive_candidate_ack_loom;
+mod recovery_core;
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod recovery_core_loom;
+mod session_lifecycles;
+use observations::{ActivityLane, ControlObservationLane, ControlObservationLanes};
+pub(crate) use observations::{
+    ControlObservationGuard, ControlObservationReservation, ControlTransactionKey,
+};
+
+#[repr(align(128))]
+struct MaintenanceWakeInner {
+    pair: ManagedWakePair,
+}
+
+pub(crate) struct MaintenanceWakeRegistration {
+    inner: Arc<MaintenanceWakeInner>,
+}
+
+impl MaintenanceWakeRegistration {
+    pub(crate) fn receiver(&self) -> &std::net::UdpSocket {
+        self.inner.pair.receiver()
+    }
+
+    pub(crate) fn drain(&self) -> std::io::Result<()> {
+        self.inner.pair.drain()
+    }
+}
+
+pub(crate) struct ClientFlowReservation<'a> {
     state: &'a FlowRuntimeState,
-    _guard: MutexGuard<'a, ()>,
+    topology: Option<FlowTopologyWriteReservation<'a>>,
+    reservation: Option<
+        crate::net::sock_mgr::transaction_lock::ManagerTransactionGuard<
+            'a,
+            crate::authority::tags::FlowReservation,
+        >,
+    >,
+    expected_epoch: u64,
+    publication_epoch: u64,
 }
 
-impl ClientLockTransactionGuard<'_> {
-    #[inline]
-    pub(crate) fn is_locked(&self) -> bool {
-        self.state.is_locked()
-    }
+/// A topology phase borrowed from one live client-flow reservation.
+///
+/// Keeping the outer reservation borrowed prevents its FIFO token and topology
+/// token from being completed, dropped, or transferred independently.
+pub(crate) struct ClientFlowTopologyReservation<'reservation, 'state> {
+    owner: &'reservation mut ClientFlowReservation<'state>,
+    topology: topology::FlowTopologyWriteReservation<'state>,
+}
 
-    #[inline]
-    pub(crate) fn publish_locked(&self) {
-        self.state.set_locked(true);
-    }
+mod reservation;
+pub(crate) use reservation::{
+    ClientFlowSocketTransitionsApplied, CommittedClientFlowTopology, PreparedClientFlowTopology,
+};
+mod topology;
+mod topology_typestate;
+#[cfg(all(test, loom, not(miri), not(target_env = "musl")))]
+mod topology_typestate_loom;
+#[cfg(test)]
+pub(crate) use topology::FlowTopologyCoordinator;
+pub(crate) use topology::{
+    FLOW_READER_LANE_BYTES, FlowReaderLane, FlowTopologyError, FlowTopologyReadLease,
+    FlowTopologyWriteReservation, ReleasedFlowOperationError,
+};
 
-    #[inline]
-    pub(crate) fn reset(&self) -> Option<DroppedReplyIdHandshake> {
-        self.state.reset()
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowAuthorityError {
+    Reservation(crate::net::sock_mgr::transaction_lock::ReservationError),
+    Topology(FlowTopologyError),
+}
+
+impl FlowAuthorityError {
+    pub(crate) const fn class(self) -> crate::runtime_support::FailureClass {
+        match self {
+            Self::Reservation(error) => error.class(),
+            Self::Topology(error) => error.class(),
+        }
     }
 }
 
-impl FlowRuntimeState {
-    pub fn new() -> Self {
-        Self {
-            locked: AtomicBool::new(false),
-            last_seen_s: AtomicU64::new(0),
-            upstream_reply_id_acked: AtomicBool::new(false),
-            upstream_reply_id_handshake: Mutex::new(ReplyIdHandshake::NotRequired),
-            pending_icmp_client_lock: Mutex::new(None),
-            client_lock_transaction: Mutex::new(()),
+impl std::fmt::Display for FlowAuthorityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reservation(error) => {
+                write!(
+                    formatter,
+                    "client-flow reservation validation failed: {error}"
+                )
+            }
+            Self::Topology(error) => write!(formatter, "flow-topology completion failed: {error}"),
         }
     }
+}
 
-    #[inline]
-    pub fn is_locked(&self) -> bool {
-        self.locked.load(AtomOrdering::Acquire)
+impl std::error::Error for FlowAuthorityError {}
+
+impl From<crate::net::sock_mgr::transaction_lock::ReservationError> for FlowAuthorityError {
+    fn from(error: crate::net::sock_mgr::transaction_lock::ReservationError) -> Self {
+        Self::Reservation(error)
     }
+}
 
-    #[inline]
-    pub fn set_locked(&self, locked: bool) {
-        self.locked.store(locked, AtomOrdering::Release);
-        if !locked {
-            self.last_seen_s.store(0, AtomOrdering::Relaxed);
-            self.upstream_reply_id_acked
-                .store(false, AtomOrdering::Relaxed);
-            *self.upstream_reply_id_handshake.lock().unwrap() = ReplyIdHandshake::NotRequired;
-            *self.pending_icmp_client_lock.lock().unwrap() = None;
-        }
+impl From<FlowTopologyError> for FlowAuthorityError {
+    fn from(error: FlowTopologyError) -> Self {
+        Self::Topology(error)
     }
+}
 
-    /// Serialize client-flow socket transitions and global lock publication.
-    ///
-    /// Shared-flow worker pairs use the same `FlowRuntimeState`, so this guard
-    /// prevents two workers from interleaving their manager transactions.
-    #[inline]
-    pub(crate) fn client_lock_transaction(&self) -> ClientLockTransactionGuard<'_> {
-        ClientLockTransactionGuard {
-            state: self,
-            _guard: self.client_lock_transaction.lock().unwrap(),
-        }
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FlowMutationError<E> {
+    Operation(E),
+    Authority(FlowAuthorityError),
+}
 
-    #[inline]
-    pub fn record_activity(&self, t_start: Instant, t_recv: Instant) {
-        let last_seen = t_recv.saturating_duration_since(t_start).as_secs().max(1);
-        self.last_seen_s.store(last_seen, AtomOrdering::Relaxed);
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecoveryPayloadRetention {
+    Retained,
+    AlreadyRetained,
+    ActivationConfirmed,
+    StaleSession,
+    Occupied,
+}
 
-    #[inline]
-    pub fn last_seen_s(&self) -> u64 {
-        self.last_seen_s.load(AtomOrdering::Relaxed)
-    }
-
-    #[inline]
-    pub fn upstream_reply_id_acked(&self) -> bool {
-        self.upstream_reply_id_acked.load(AtomOrdering::Relaxed)
-    }
-
-    #[inline]
-    pub fn ack_upstream_reply_id(&self) {
-        self.upstream_reply_id_acked
-            .store(true, AtomOrdering::Relaxed);
-    }
-
-    #[inline]
-    pub fn begin_upstream_reply_id_handshake(
-        &self,
-        expected_ack_destination_id: u16,
-        started_s: u64,
-        payload: BufferedPayload,
-    ) -> ReplyIdHandshakeBegin {
-        begin_handshake(
-            &self.upstream_reply_id_handshake,
-            self.upstream_reply_id_acked(),
-            expected_ack_destination_id,
-            started_s,
-            payload,
+impl RecoveryPayloadRetention {
+    pub(crate) const fn owns_recovery(self) -> bool {
+        matches!(
+            self,
+            Self::Retained | Self::AlreadyRetained | Self::ActivationConfirmed
         )
     }
+}
 
-    #[inline]
-    pub fn ack_upstream_reply_id_handshake(
-        &self,
-        observed_ack_destination_id: u16,
-        trigger_trace: Option<PacketTraceId>,
-    ) -> ReplyIdHandshakeAck {
-        ack_handshake(
-            &self.upstream_reply_id_handshake,
-            observed_ack_destination_id,
-            trigger_trace,
-            || self.ack_upstream_reply_id(),
-        )
+impl<E: std::fmt::Debug> std::fmt::Display for FlowMutationError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operation(error) => write!(formatter, "flow operation rejected: {error:?}"),
+            Self::Authority(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E: std::fmt::Debug> std::error::Error for FlowMutationError<E> {}
+
+impl<E> From<E> for FlowMutationError<E> {
+    fn from(error: E) -> Self {
+        Self::Operation(error)
+    }
+}
+
+mod runtime;
+pub(crate) use runtime::UpstreamRecoveryRequest;
+mod session_authority;
+use session_authority::{FlowPhase, FlowSessionState, LegSessions};
+
+fn advance_nonwrapping_epoch(epoch: &mut u64, exhausted: &mut bool) {
+    match epoch.checked_add(1) {
+        Some(next) => *epoch = next,
+        None => *exhausted = true,
+    }
+}
+
+impl FlowSessionState {
+    fn publish_upstream_pool_change(&mut self) {
+        advance_nonwrapping_epoch(
+            &mut self.upstream_pool.upstream_pool_epoch,
+            &mut self.upstream_pool.upstream_pool_epoch_exhausted,
+        );
     }
 
-    #[inline]
-    pub fn expire_reply_id_handshake(
-        &self,
-        now_s: u64,
-        timeout_s: u64,
-    ) -> Option<ExpiredReplyIdHandshake> {
-        expire_handshake(&self.upstream_reply_id_handshake, now_s, timeout_s)
+    fn has_flow_authority(&self) -> bool {
+        self.authority.flow != FlowPhase::Unlocked
+            || self.authority.client_flow.is_some()
+            || self.authority.pending_icmp_client_lock.is_some()
+            || self.client_pool.client_active_key.is_some()
+            || self.upstream_pool.upstream_active_key.is_some()
+            || self.authority.client_leg != LegSessions::default()
+            || self.authority.upstream_leg != LegSessions::default()
     }
 
-    #[inline]
-    pub fn reset(&self) -> Option<DroppedReplyIdHandshake> {
-        let dropped = take_pending_handshake(&self.upstream_reply_id_handshake);
-        self.set_locked(false);
+    fn invalidate_control_leases(&mut self) {
+        advance_nonwrapping_epoch(
+            &mut self.control.control_lease_epoch,
+            &mut self.control.control_lease_epoch_exhausted,
+        );
+    }
+
+    fn defer_peer_control(&mut self, control: DeferredPeerControl) -> bool {
+        if let Some(existing) = self
+            .upstream_recovery
+            .upstream_deferred_peer_controls
+            .iter_mut()
+            .find(|existing| existing.same_control(control))
+        {
+            existing.retain_earliest_observation(control);
+            return true;
+        }
+        if self
+            .upstream_recovery
+            .upstream_deferred_peer_controls
+            .iter()
+            .any(|existing| existing.same_data_identity(control))
+        {
+            return false;
+        }
+        if self.upstream_recovery.upstream_deferred_peer_controls.len()
+            >= MAX_RECEIVE_SESSION_CANDIDATES
+        {
+            return false;
+        }
+        self.upstream_recovery
+            .upstream_deferred_peer_controls
+            .push_back(control);
+        true
+    }
+
+    fn reset(&mut self) -> Option<DroppedReplyIdHandshake> {
+        self.invalidate_control_leases();
+        let previous = std::mem::replace(
+            &mut self.control.upstream_reply_id_handshake,
+            ReplyIdHandshake::NotRequired,
+        );
+        let dropped = match previous {
+            ReplyIdHandshake::Sending {
+                mut commit,
+                expected_ack_destination_id,
+                instance,
+                started_s,
+                absolute_deadline,
+                attempts,
+                ..
+            } => {
+                commit.request_reset();
+                self.control.upstream_reply_id_handshake = ReplyIdHandshake::Sending {
+                    commit,
+                    expected_ack_destination_id,
+                    instance,
+                    started_s,
+                    absolute_deadline,
+                    attempts,
+                };
+                None
+            }
+            ReplyIdHandshake::Committing {
+                mut commit,
+                control,
+                expected_ack_destination_id,
+                instance,
+                started_s,
+                absolute_deadline,
+                ..
+            } => {
+                let payload = commit.payload().unwrap_or_else(|| {
+                    crate::runtime_support::fatal_invariant_or_shutdown(format_args!(
+                        "committing reply-ID handshake lost buffered payload ownership"
+                    ))
+                });
+                let dropped = DroppedReplyIdHandshake {
+                    expected_ack_destination_id,
+                    instance,
+                    buffered_len: payload.payload_len(),
+                    buffered_trace: payload.trace(),
+                };
+                commit.request_reset();
+                self.control.upstream_reply_id_handshake = ReplyIdHandshake::Committing {
+                    commit,
+                    control,
+                    expected_ack_destination_id,
+                    instance,
+                    started_s,
+                    absolute_deadline,
+                };
+                Some(dropped)
+            }
+            other => {
+                self.control.upstream_reply_id_handshake = other;
+                take_pending_handshake_locked(&mut self.control.upstream_reply_id_handshake)
+            }
+        };
+        self.authority.flow = FlowPhase::Unlocked;
+        self.authority.client_leg = LegSessions::default();
+        self.authority.upstream_leg = LegSessions::default();
+        if !self.upstream_pool.upstream_ready_sessions.is_empty() {
+            self.upstream_pool.upstream_ready_sessions.clear();
+            self.publish_upstream_pool_change();
+        }
+        self.upstream_pool.clear_reserve_handshakes();
+        self.upstream_pool.clear_generation_advance();
+        self.control.upstream_pending_key = None;
+        self.control.upstream_pending_challenge = None;
+        self.client_pool.client_active_key = None;
+        self.client_pool.client_staged_generation = None;
+        self.upstream_pool.upstream_active_key = None;
+        self.upstream_pool.upstream_pool_generation = None;
+        self.client_pool.client_retired_ordinals = OrdinalRetirementWindow::default();
+        self.upstream_pool.next_session_ordinal = 1;
+        self.client_pool.client_ready_sessions.clear();
+        self.client_pool.next_receive_installation_order = 0;
+        self.client_pool.client_generation_authorization = None;
+        self.client_pool.client_draining_sessions.clear();
+        self.upstream_pool.upstream_draining_sessions.clear();
+        self.authority.pending_icmp_client_lock = None;
+        if let Some(recovery) = self.upstream_recovery.upstream_recovery_payload.as_mut()
+            && matches!(
+                recovery.send.request_timeout(),
+                recovery_core::RecoveryTimeoutDecision::Remove
+            )
+        {
+            self.upstream_recovery.upstream_recovery_payload = None;
+        }
+        self.upstream_recovery.upstream_same_generation_fallback = None;
+        self.upstream_recovery
+            .upstream_deferred_peer_controls
+            .clear();
+        self.upstream_recovery.upstream_activation_confirmed = false;
+        self.authority.client_flow = None;
+        self.authority.flow_claim_generation = None;
+        self.reset_recovery.client_reset_challenge = None;
+        self.reset_recovery
+            .stateless_client_reset_challenges
+            .clear();
+        self.reset_recovery.stateless_reset_response_budgets.clear();
+        self.authority.sync_payload.reset();
         dropped
     }
 
-    #[inline]
-    pub(crate) fn pending_icmp_client_lock(&self) -> Option<PendingIcmpClientLock> {
-        *self.pending_icmp_client_lock.lock().unwrap()
-    }
-
-    #[inline]
-    pub(crate) fn set_pending_icmp_client_lock(
-        &self,
-        pending: PendingIcmpClientLock,
-    ) -> Result<(), PendingIcmpClientLockMismatch> {
-        let mut guard = self.pending_icmp_client_lock.lock().unwrap();
-        match *guard {
-            Some(existing) if existing != pending => Err(PendingIcmpClientLockMismatch),
-            _ => {
-                *guard = Some(pending);
-                Ok(())
+    fn earliest_maintenance_deadline(&self) -> Option<Instant> {
+        let mut earliest = None;
+        let mut include = |candidate: Instant| {
+            earliest = Some(earliest.map_or(candidate, |current: Instant| current.min(candidate)));
+        };
+        match &self.control.upstream_reply_id_handshake {
+            ReplyIdHandshake::Pending {
+                absolute_deadline,
+                control,
+                ..
+            } => {
+                include(*absolute_deadline);
+                include(control.next_attempt());
+            }
+            ReplyIdHandshake::Committing {
+                absolute_deadline, ..
+            }
+            | ReplyIdHandshake::Sending {
+                absolute_deadline, ..
+            } => include(*absolute_deadline),
+            ReplyIdHandshake::AckedRetryable {
+                absolute_deadline,
+                next_attempt,
+                ..
+            } => {
+                include(*absolute_deadline);
+                include(*next_attempt);
+            }
+            ReplyIdHandshake::NotRequired | ReplyIdHandshake::Acked { .. } => {}
+        }
+        for candidate in &self.upstream_pool.upstream_reserve_handshakes {
+            include(candidate.control.deadline());
+            include(candidate.control.next_attempt());
+        }
+        if let Some(advance) = &self.upstream_pool.upstream_generation_advance {
+            include(advance.control.deadline());
+            include(advance.control.next_attempt());
+        }
+        for candidate in &self.client_pool.client_ready_sessions {
+            if candidate.ready_installation_order().is_none() {
+                include(candidate.absolute_deadline());
             }
         }
+        if let Some(authorization) = self.client_pool.client_generation_authorization {
+            include(authorization.expires_at);
+        }
+        for draining in self
+            .client_pool
+            .client_draining_sessions
+            .iter()
+            .chain(self.upstream_pool.upstream_draining_sessions.iter())
+        {
+            include(draining.expires_at);
+        }
+        if let Some(recovery) = &self.upstream_recovery.upstream_recovery_payload {
+            include(recovery.deadline);
+            if let Some(when) = recovery.send.retry_deadline() {
+                include(when);
+            }
+        }
+        if let Some(challenge) = self.reset_recovery.client_reset_challenge {
+            include(challenge.expires_at);
+        }
+        for challenge in &self.reset_recovery.stateless_client_reset_challenges {
+            include(challenge.expires_at);
+        }
+        if let Some(pending) = self.authority.pending_icmp_client_lock {
+            include(pending.deadline);
+        }
+        earliest
     }
+}
+mod session_state;
+#[cfg(test)]
+use session_state::fresh_nonzero_challenge_with;
+use session_state::{
+    DrainingSession, GenerationAdvanceHandshake, GenerationAuthorization, OrdinalRetirementWindow,
+    ReadySession, ReceiveCandidate, RecoveryPayload, ReserveReplyIdHandshake, ResetResponseBudget,
+    SameGenerationFallback, StatelessResetResponseBudget, active_session_count,
+    expire_draining_sessions, fresh_nonzero_challenge, global_reset_response_budget,
+    inspect_existing_reset_challenge, inspect_stateless_reset_challenge, push_draining_session,
+    session_admission_snapshot, upstream_data_evidence, upstream_reset_matches,
+};
+pub(crate) use session_state::{
+    FlowAdmissionSnapshot, FlowSnapshotCache, PacketFlowSnapshot, PacketSessionAdmission,
+    PublishedFlowSnapshot, RecoveryPayloadSendCompletion, RecoveryPayloadSendLease,
+    RecoveryPayloadSendToken, ResetChallenge, ResetChallengeIssue, ResetRecoveryMetricsSnapshot,
+    SessionAdmissionSnapshot, SessionPoolMetricsSnapshot, SessionPoolSnapshot,
+    SessionPoolStateSnapshot,
+};
+mod sync_slot;
+use sync_slot::SyncPayloadSlot;
+pub(crate) use sync_slot::{SyncSendCompletion, SyncSendLease};
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingClientControl {
+    Negotiate {
+        reply_id: u16,
+    },
+    ChallengeNegotiate {
+        reply_id: u16,
+        receiver_generation: Option<PoolGeneration>,
+    },
+}
 
-    #[inline]
-    pub(crate) fn clear_pending_icmp_client_lock(&self) {
-        *self.pending_icmp_client_lock.lock().unwrap() = None;
+impl PendingClientControl {
+    pub(crate) const fn from_control(
+        control: crate::net::framing_shim::IcmpTunnelControl,
+    ) -> Option<Self> {
+        match control {
+            crate::net::framing_shim::IcmpTunnelControl::Negotiate(negotiation) => {
+                Some(Self::Negotiate {
+                    reply_id: negotiation.reply_id(),
+                })
+            }
+            crate::net::framing_shim::IcmpTunnelControl::ChallengeNegotiate(challenge) => {
+                Some(Self::ChallengeNegotiate {
+                    reply_id: challenge.reply_id(),
+                    receiver_generation: challenge.receiver_generation(),
+                })
+            }
+            _ => None,
+        }
     }
 }
 
@@ -175,30 +560,332 @@ impl FlowRuntimeState {
 pub(crate) struct PendingIcmpClientLock {
     pub(crate) flow_key: ClientFlowKey,
     pub(crate) listener_flow: SocketLegFlow,
+    pub(crate) session_key: Option<SessionKey>,
+    pub(crate) observed_control: Option<PendingClientControl>,
+    pub(crate) reset_challenge: u64,
+    pub(crate) reset_evidence: Option<RejectedFrameEvidence>,
+}
+
+impl PendingIcmpClientLock {
+    #[inline]
+    pub(crate) const fn session_id(self) -> Option<SessionId> {
+        match self.session_key {
+            Some(key) => Some(key.session_id()),
+            None => None,
+        }
+    }
+
+    pub(crate) fn full_observed_control(
+        self,
+    ) -> Option<crate::net::framing_shim::IcmpTunnelControl> {
+        let session_key = self.session_key?;
+        match self.observed_control? {
+            PendingClientControl::Negotiate { reply_id } => {
+                crate::net::framing_shim::ReplyIdNegotiation::negotiate_with_key_and_challenge(
+                    reply_id,
+                    session_key,
+                    self.reset_challenge,
+                )
+                .map(crate::net::framing_shim::IcmpTunnelControl::Negotiate)
+            }
+            PendingClientControl::ChallengeNegotiate {
+                reply_id,
+                receiver_generation,
+            } => crate::net::framing_shim::ChallengeControl::new(
+                reply_id,
+                NonZeroU64::new(self.reset_challenge)?,
+                receiver_generation,
+                self.reset_evidence?,
+                session_key,
+            )
+            .map(crate::net::framing_shim::IcmpTunnelControl::ChallengeNegotiate),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TimedPendingIcmpClientLock {
+    candidate: PendingIcmpClientLock,
+    transaction_key: ControlTransactionKey,
+    started_s: u64,
+    trace: PacketTraceId,
+    deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpiredPendingIcmpClientLock {
+    pub(crate) candidate: PendingIcmpClientLock,
+    pub(crate) started_s: u64,
+    pub(crate) trace: PacketTraceId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PendingIcmpClientLockMismatch;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingIcmpClientLockSet {
+    Started,
+    Reused,
+}
+
 enum ReplyIdHandshake {
     NotRequired,
     Pending {
         expected_ack_destination_id: u16,
+        instance: u64,
         started_s: u64,
+        absolute_deadline: Instant,
         payload: BufferedPayload,
+        control: session_lifecycles::ControlSendCore,
     },
-    Acked,
+    Committing {
+        commit: handshake::commit_core::HandshakeCommitCore<BufferedPayload>,
+        control: session_lifecycles::ControlSendCore,
+        expected_ack_destination_id: u16,
+        instance: u64,
+        started_s: u64,
+        absolute_deadline: Instant,
+    },
+    Sending {
+        commit: handshake::commit_core::HandshakeCommitCore<BufferedPayload>,
+        expected_ack_destination_id: u16,
+        instance: u64,
+        started_s: u64,
+        absolute_deadline: Instant,
+        attempts: u32,
+    },
+    AckedRetryable {
+        commit: handshake::commit_core::HandshakeCommitCore<BufferedPayload>,
+        expected_ack_destination_id: u16,
+        instance: u64,
+        started_s: u64,
+        absolute_deadline: Instant,
+        next_attempt: Instant,
+        attempts: u32,
+    },
+    Acked {
+        instance: u64,
+    },
+}
+
+#[derive(Clone)]
+struct SentControlSequences {
+    bitmap: Box<[u64; Self::WORD_COUNT]>,
+}
+
+impl SentControlSequences {
+    const WORD_COUNT: usize = (u16::MAX as usize + 1) / u64::BITS as usize;
+
+    fn insert(&mut self, sequence: u16) -> Result<(), ReplyIdHandshakeInvariantError> {
+        let index = usize::from(sequence);
+        let bit = 1_u64 << (index % u64::BITS as usize);
+        let Some(word) = self.bitmap.get_mut(index / u64::BITS as usize) else {
+            return Err(ReplyIdHandshakeInvariantError);
+        };
+        if *word & bit != 0 {
+            return Err(ReplyIdHandshakeInvariantError);
+        }
+        *word |= bit;
+        Ok(())
+    }
+
+    fn contains(&self, sequence: u16) -> bool {
+        let index = usize::from(sequence);
+        self.bitmap
+            .get(index / u64::BITS as usize)
+            .is_some_and(|word| *word & (1_u64 << (index % u64::BITS as usize)) != 0)
+    }
+
+    fn remove(&mut self, sequence: u16) -> bool {
+        let index = usize::from(sequence);
+        let bit = 1_u64 << (index % u64::BITS as usize);
+        let Some(word) = self.bitmap.get_mut(index / u64::BITS as usize) else {
+            return false;
+        };
+        let existed = *word & bit != 0;
+        *word &= !bit;
+        existed
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bitmap.iter().all(|word| *word == 0)
+    }
+
+    fn clear(&mut self) {
+        self.bitmap.fill(0);
+    }
+}
+
+impl Default for SentControlSequences {
+    fn default() -> Self {
+        Self {
+            bitmap: Box::new([0; Self::WORD_COUNT]),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ClientCandidateAckLease {
+    session_key: SessionKey,
+    permit: session_lifecycles::ReceiveCandidateAckPermit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeferredPeerControl {
+    ResetRequired {
+        control: ResetRequired,
+        observed_at: Instant,
+    },
+    SessionActivated {
+        control: crate::net::framing_shim::SessionActivated,
+        observed_at: Instant,
+    },
+}
+
+impl DeferredPeerControl {
+    pub(crate) fn same_control(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::ResetRequired { control: left, .. },
+                Self::ResetRequired { control: right, .. },
+            ) => left == right,
+            (
+                Self::SessionActivated { control: left, .. },
+                Self::SessionActivated { control: right, .. },
+            ) => left == right,
+            _ => false,
+        }
+    }
+
+    fn same_data_identity(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::ResetRequired { control: left, .. },
+                Self::ResetRequired { control: right, .. },
+            ) => {
+                left.rejected_session() == right.rejected_session()
+                    && left.rejected_sequence() == right.rejected_sequence()
+            }
+            (
+                Self::SessionActivated { control: left, .. },
+                Self::SessionActivated { control: right, .. },
+            ) => {
+                left.session_key().session_id() == right.session_key().session_id()
+                    && left.accepted_sequence() == right.accepted_sequence()
+            }
+            (left, right) => {
+                let (left_session, left_sequence) = left.data_identity();
+                let (right_session, right_sequence) = right.data_identity();
+                left_session == right_session && left_sequence == right_sequence
+            }
+        }
+    }
+
+    fn data_identity(self) -> (SessionId, u16) {
+        match self {
+            Self::ResetRequired { control, .. } => {
+                (control.rejected_session(), control.rejected_sequence())
+            }
+            Self::SessionActivated { control, .. } => (
+                control.session_key().session_id(),
+                control.accepted_sequence(),
+            ),
+        }
+    }
+
+    pub(crate) fn retain_earliest_observation(&mut self, other: Self) {
+        let other_observed_at = other.observed_at();
+        match self {
+            Self::ResetRequired { observed_at, .. }
+            | Self::SessionActivated { observed_at, .. } => {
+                *observed_at = (*observed_at).min(other_observed_at);
+            }
+        }
+    }
+
+    fn observed_at(self) -> Instant {
+        match self {
+            Self::ResetRequired { observed_at, .. }
+            | Self::SessionActivated { observed_at, .. } => observed_at,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReplyIdHandshakeCommitToken {
+    instance: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReplyIdHandshakeInvariantError;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UpstreamSessionRecovery {
+    Deferred,
+    Ignored,
+    Recovered {
+        handshake: ReplyIdHandshakeBegin,
+        retired_sessions: Vec<SessionId>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyIdHandshakeTransitionError {
+    StaleToken,
+    InvalidPhase,
+}
+
+#[derive(Debug)]
+pub(crate) enum HandshakeRollbackOutcome {
+    Retryable,
+    TimedOut { payload: BufferedPayload },
+    ResetApplied { payload: BufferedPayload },
+}
+
+pub(crate) type ReplyIdPayloadSendLease =
+    handshake::commit_core::HandshakePayloadLease<BufferedPayload>;
+pub(crate) type ReplyIdHandshakeManagerReceipt = handshake::commit_core::HandshakeManagerReceipt;
+pub(crate) type ReplyIdHandshakeActivationLease = handshake::commit_core::HandshakeActivationLease;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReplyIdControlSendLease {
+    pub(crate) expected_ack_destination_id: u16,
+    pub(crate) session_key: SessionKey,
+    pub(crate) session_id: SessionId,
+    pub(crate) reset_challenge: u64,
+    pub(crate) control: crate::net::framing_shim::IcmpTunnelControl,
+    control_lease_epoch: u64,
+    attempt: session_lifecycles::ControlSendAttempt,
+    reserve: bool,
+    generation_advance: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyIdControlSendCompletion {
+    RetryScheduled,
+    HandshakeAdvanced,
+    ResetWon,
+    Stale,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplyIdControlSequenceRecord {
+    Recorded,
+    HandshakeAdvanced,
+    ResetWon,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReplyIdHandshakeBegin {
     Started {
         expected_ack_destination_id: u16,
+        instance: u64,
         buffered_len: usize,
         buffered_trace: Option<PacketTraceId>,
     },
     PendingReused {
         expected_ack_destination_id: u16,
+        instance: u64,
         started_s: u64,
         buffered_len: usize,
         buffered_trace: Option<PacketTraceId>,
@@ -227,13 +914,39 @@ pub(crate) enum ReplyIdHandshakeAckIgnored {
         buffered_trace: Option<PacketTraceId>,
         trigger_trace: Option<PacketTraceId>,
     },
+    WrongInstance {
+        expected_instance: u64,
+        observed_instance: u64,
+        buffered_trace: Option<PacketTraceId>,
+        trigger_trace: Option<PacketTraceId>,
+    },
+    UnsentSequence {
+        observed_sequence: u16,
+        buffered_trace: Option<PacketTraceId>,
+        trigger_trace: Option<PacketTraceId>,
+    },
+    CommitInProgress {
+        trigger_trace: Option<PacketTraceId>,
+    },
+    Expired {
+        buffered_trace: Option<PacketTraceId>,
+        trigger_trace: Option<PacketTraceId>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReplyIdHandshakeAck {
     Matched {
+        token: ReplyIdHandshakeCommitToken,
+        instance: u64,
         expected_ack_destination_id: u16,
-        payload: BufferedPayload,
+        buffered_len: usize,
+        buffered_trace: Option<PacketTraceId>,
+        trigger_trace: Option<PacketTraceId>,
+    },
+    ReserveReady {
+        instance: u64,
+        expected_ack_destination_id: u16,
         trigger_trace: Option<PacketTraceId>,
     },
     Ignored(ReplyIdHandshakeAckIgnored),
@@ -242,6 +955,7 @@ pub(crate) enum ReplyIdHandshakeAck {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExpiredReplyIdHandshake {
     pub(crate) expected_ack_destination_id: u16,
+    pub(crate) instance: u64,
     pub(crate) started_s: u64,
     pub(crate) buffered_len: usize,
     pub(crate) buffered_trace: Option<PacketTraceId>,
@@ -250,405 +964,31 @@ pub(crate) struct ExpiredReplyIdHandshake {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DroppedReplyIdHandshake {
     pub(crate) expected_ack_destination_id: u16,
+    pub(crate) instance: u64,
     pub(crate) buffered_len: usize,
     pub(crate) buffered_trace: Option<PacketTraceId>,
 }
 
-fn begin_handshake(
-    state: &Mutex<ReplyIdHandshake>,
-    already_acked: bool,
-    expected_ack_destination_id: u16,
-    started_s: u64,
-    payload: BufferedPayload,
-) -> ReplyIdHandshakeBegin {
-    if already_acked || expected_ack_destination_id == 0 {
-        return ReplyIdHandshakeBegin::Ignored;
-    }
-    let mut guard = state.lock().unwrap();
-    if matches!(*guard, ReplyIdHandshake::Acked) {
-        return ReplyIdHandshakeBegin::Ignored;
-    }
-    match *guard {
-        ReplyIdHandshake::Pending {
-            expected_ack_destination_id: old_expected_ack_destination_id,
-            started_s: old_started_s,
-            payload: ref old_payload,
-        } => ReplyIdHandshakeBegin::PendingReused {
-            expected_ack_destination_id: old_expected_ack_destination_id,
-            started_s: old_started_s,
-            buffered_len: old_payload.payload_len(),
-            buffered_trace: old_payload.trace(),
-            trigger_trace: payload.trace(),
-        },
-        ReplyIdHandshake::NotRequired => {
-            let buffered_len = payload.payload_len();
-            let buffered_trace = payload.trace();
-            *guard = ReplyIdHandshake::Pending {
-                expected_ack_destination_id,
-                started_s,
-                payload,
-            };
-            ReplyIdHandshakeBegin::Started {
-                expected_ack_destination_id,
-                buffered_len,
-                buffered_trace,
-            }
-        }
-        ReplyIdHandshake::Acked => ReplyIdHandshakeBegin::Ignored,
-    }
-}
+mod handshake;
+pub(crate) use handshake::{PreparedControlSend, PreparedReplyIdHandshake};
+use handshake::{
+    ack_handshake, begin_handshake, commit_handshake_session, complete_handshake_activation,
+    complete_handshake_control_send, complete_handshake_send, expire_handshake,
+    lease_due_handshake_control, lease_due_handshake_payload, mark_handshake_manager_published,
+    poison_handshake_activation, release_handshake_send, release_unsequenced_handshake_control,
+    rollback_handshake, take_pending_handshake_locked,
+};
 
-fn ack_handshake(
-    state: &Mutex<ReplyIdHandshake>,
-    observed_ack_destination_id: u16,
-    trigger_trace: Option<PacketTraceId>,
-    mark_acked: impl FnOnce(),
-) -> ReplyIdHandshakeAck {
-    let mut guard = state.lock().unwrap();
-    match std::mem::replace(&mut *guard, ReplyIdHandshake::NotRequired) {
-        ReplyIdHandshake::Pending {
-            expected_ack_destination_id,
-            payload,
-            ..
-        } if expected_ack_destination_id == observed_ack_destination_id => {
-            *guard = ReplyIdHandshake::Acked;
-            mark_acked();
-            ReplyIdHandshakeAck::Matched {
-                expected_ack_destination_id,
-                payload,
-                trigger_trace,
-            }
-        }
-        ReplyIdHandshake::Pending {
-            expected_ack_destination_id,
-            payload,
-            started_s,
-        } => {
-            let buffered_trace = payload.trace();
-            *guard = ReplyIdHandshake::Pending {
-                expected_ack_destination_id,
-                payload,
-                started_s,
-            };
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::WrongDestinationId {
-                expected_ack_destination_id,
-                buffered_trace,
-                trigger_trace,
-            })
-        }
-        ReplyIdHandshake::Acked => {
-            *guard = ReplyIdHandshake::Acked;
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::AlreadyAcked { trigger_trace })
-        }
-        ReplyIdHandshake::NotRequired => {
-            *guard = ReplyIdHandshake::NotRequired;
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::NoPending { trigger_trace })
-        }
-    }
-}
-
-fn expire_handshake(
-    state: &Mutex<ReplyIdHandshake>,
-    now_s: u64,
-    timeout_s: u64,
-) -> Option<ExpiredReplyIdHandshake> {
-    let mut guard = state.lock().unwrap();
-    let expired = match &*guard {
-        ReplyIdHandshake::Pending {
-            expected_ack_destination_id,
-            started_s,
-            payload,
-        } if now_s.saturating_sub(*started_s) >= timeout_s => Some(ExpiredReplyIdHandshake {
-            expected_ack_destination_id: *expected_ack_destination_id,
-            started_s: *started_s,
-            buffered_len: payload.payload_len(),
-            buffered_trace: payload.trace(),
-        }),
-        ReplyIdHandshake::Pending { .. }
-        | ReplyIdHandshake::NotRequired
-        | ReplyIdHandshake::Acked => None,
-    };
-    if expired.is_some() {
-        *guard = ReplyIdHandshake::NotRequired;
-    }
-    expired
-}
-
-fn take_pending_handshake(state: &Mutex<ReplyIdHandshake>) -> Option<DroppedReplyIdHandshake> {
-    let mut guard = state.lock().unwrap();
-    let previous = std::mem::replace(&mut *guard, ReplyIdHandshake::NotRequired);
-    match previous {
-        ReplyIdHandshake::Pending {
-            expected_ack_destination_id,
-            payload,
-            ..
-        } => Some(DroppedReplyIdHandshake {
-            expected_ack_destination_id,
-            buffered_len: payload.payload_len(),
-            buffered_trace: payload.trace(),
-        }),
-        ReplyIdHandshake::NotRequired | ReplyIdHandshake::Acked => None,
-    }
-}
+mod session_pool;
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        BufferedPayload, FlowRuntimeState, ReplyIdHandshakeAck, ReplyIdHandshakeAckIgnored,
-        ReplyIdHandshakeBegin,
-    };
-    use crate::cli::SupportedProtocol;
-    use crate::net::payload::PayloadEvent;
-    use crate::packet_trace::PacketTraceId;
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+mod tests;
 
-    fn buffered_payload(bytes: &'static [u8]) -> BufferedPayload {
-        let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, bytes);
-        BufferedPayload::from_event(&event, None)
-    }
+#[cfg(test)]
+mod test_support;
 
-    fn traced_payload(bytes: &'static [u8], packet_id: u64) -> BufferedPayload {
-        let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, bytes);
-        BufferedPayload::from_event(
-            &event,
-            Some(PacketTraceId {
-                worker_id: 2,
-                c2u: true,
-                packet_id,
-            }),
-        )
-    }
+#[cfg(test)]
+mod session_pool_tests;
 
-    #[test]
-    fn reply_id_handshake_buffers_until_matching_ack() {
-        let state = FlowRuntimeState::new();
-        assert_eq!(
-            state.begin_upstream_reply_id_handshake(2002, 1, buffered_payload(b"first")),
-            ReplyIdHandshakeBegin::Started {
-                expected_ack_destination_id: 2002,
-                buffered_len: 5,
-                buffered_trace: None,
-            }
-        );
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(3003, None),
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::WrongDestinationId {
-                expected_ack_destination_id: 2002,
-                ..
-            })
-        ));
-        assert!(!state.upstream_reply_id_acked());
-        assert!(!state.is_locked());
-
-        let ReplyIdHandshakeAck::Matched {
-            payload: flushed, ..
-        } = state.ack_upstream_reply_id_handshake(2002, None)
-        else {
-            panic!("matching ack must flush buffered payload");
-        };
-        assert!(state.upstream_reply_id_acked());
-        assert!(matches!(
-            flushed.as_event(),
-            PayloadEvent::UserPayload { bytes, .. } if bytes == b"first"
-        ));
-    }
-
-    #[test]
-    fn reply_id_handshake_preserves_zero_length_first_payload_until_ack() {
-        let state = FlowRuntimeState::new();
-        assert!(matches!(
-            state.begin_upstream_reply_id_handshake(2002, 1, buffered_payload(b"")),
-            ReplyIdHandshakeBegin::Started {
-                buffered_len: 0,
-                ..
-            }
-        ));
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(3003, None),
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::WrongDestinationId { .. })
-        ));
-        assert!(!state.upstream_reply_id_acked());
-
-        let ReplyIdHandshakeAck::Matched {
-            payload: flushed, ..
-        } = state.ack_upstream_reply_id_handshake(2002, None)
-        else {
-            panic!("matching ack must flush zero-length buffered payload");
-        };
-        assert!(matches!(
-            flushed.as_event(),
-            PayloadEvent::UserPayload { bytes, .. } if bytes.is_empty()
-        ));
-    }
-
-    #[test]
-    fn reply_id_handshake_timeout_drops_buffered_payload() {
-        let state = FlowRuntimeState::new();
-        assert!(matches!(
-            state.begin_upstream_reply_id_handshake(3003, 2, buffered_payload(b"first")),
-            ReplyIdHandshakeBegin::Started { .. }
-        ));
-        assert_eq!(state.expire_reply_id_handshake(11, 10), None);
-        assert_eq!(
-            state.expire_reply_id_handshake(12, 10),
-            Some(super::ExpiredReplyIdHandshake {
-                expected_ack_destination_id: 3003,
-                started_s: 2,
-                buffered_len: 5,
-                buffered_trace: None,
-            })
-        );
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(3003, None),
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::NoPending { .. })
-        ));
-        assert!(!state.upstream_reply_id_acked());
-    }
-
-    #[test]
-    fn handshake_preserves_origin_trace_through_ack_and_timeout() {
-        let state = FlowRuntimeState::new();
-        state.begin_upstream_reply_id_handshake(3003, 2, traced_payload(b"ack", 41));
-        let ReplyIdHandshakeAck::Matched { payload, .. } =
-            state.ack_upstream_reply_id_handshake(3003, None)
-        else {
-            panic!("matching ACK must release payload");
-        };
-        assert_eq!(payload.trace().map(|trace| trace.packet_id), Some(41));
-
-        let state = FlowRuntimeState::new();
-        state.begin_upstream_reply_id_handshake(3003, 2, traced_payload(b"timeout", 42));
-        let expired = state
-            .expire_reply_id_handshake(12, 10)
-            .expect("handshake expires");
-        assert_eq!(
-            expired.buffered_trace.map(|trace| trace.packet_id),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn reply_id_handshake_preserves_first_payload_while_pending() {
-        let state = FlowRuntimeState::new();
-        let started = state.begin_upstream_reply_id_handshake(2002, 1, buffered_payload(b"first"));
-        assert!(matches!(started, ReplyIdHandshakeBegin::Started { .. }));
-        assert!(started.should_send_control());
-
-        let reused = state.begin_upstream_reply_id_handshake(2002, 2, buffered_payload(b"second"));
-        assert!(matches!(
-            reused,
-            ReplyIdHandshakeBegin::PendingReused {
-                expected_ack_destination_id: 2002,
-                started_s: 1,
-                buffered_len: 5,
-                ..
-            }
-        ));
-        assert!(!reused.should_send_control());
-
-        let ReplyIdHandshakeAck::Matched { payload, .. } =
-            state.ack_upstream_reply_id_handshake(2002, None)
-        else {
-            panic!("matching ack must flush the first payload");
-        };
-        assert!(matches!(
-            payload.as_event(),
-            PayloadEvent::UserPayload { bytes, .. } if bytes == b"first"
-        ));
-    }
-
-    #[test]
-    fn concurrent_handshake_burst_emits_one_control_and_flushes_once() {
-        const BURST_SIZE: usize = 16;
-        const EXPECTED_ACK_ID: u16 = 2002;
-
-        let state = Arc::new(FlowRuntimeState::new());
-        let barrier = Arc::new(Barrier::new(BURST_SIZE));
-        let workers = (0..BURST_SIZE)
-            .map(|index| {
-                let state = Arc::clone(&state);
-                let barrier = Arc::clone(&barrier);
-                thread::spawn(move || {
-                    let bytes = format!("burst-payload-{index}").into_bytes();
-                    let event = PayloadEvent::user_payload_plain(SupportedProtocol::ICMP, &bytes);
-                    let payload = BufferedPayload::from_event(&event, None);
-                    barrier.wait();
-                    state.begin_upstream_reply_id_handshake(
-                        EXPECTED_ACK_ID,
-                        index as u64 + 1,
-                        payload,
-                    )
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let outcomes = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("join handshake burst worker"))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, ReplyIdHandshakeBegin::Started { .. }))
-                .count(),
-            1,
-            "exactly one burst payload must own the pending handshake"
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| outcome.should_send_control())
-                .count(),
-            1,
-            "a pending burst must emit exactly one negotiation control frame"
-        );
-        assert_eq!(
-            outcomes
-                .iter()
-                .filter(|outcome| matches!(outcome, ReplyIdHandshakeBegin::PendingReused { .. }))
-                .count(),
-            BURST_SIZE - 1
-        );
-
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(EXPECTED_ACK_ID + 1, None),
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::WrongDestinationId { .. })
-        ));
-        assert!(!state.upstream_reply_id_acked());
-
-        let ReplyIdHandshakeAck::Matched { payload, .. } =
-            state.ack_upstream_reply_id_handshake(EXPECTED_ACK_ID, None)
-        else {
-            panic!("matching ACK must flush the one preserved burst payload");
-        };
-        let PayloadEvent::UserPayload { bytes, .. } = payload.as_event() else {
-            panic!("buffered burst payload must remain user data");
-        };
-        assert!(
-            (0..BURST_SIZE).any(|index| bytes == format!("burst-payload-{index}").as_bytes()),
-            "flushed payload must be the exact bytes from one burst sender"
-        );
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(EXPECTED_ACK_ID, None),
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::AlreadyAcked { .. })
-        ));
-    }
-
-    #[test]
-    fn reply_id_handshake_reports_ack_after_completion_as_already_acked() {
-        let state = FlowRuntimeState::new();
-        assert!(matches!(
-            state.begin_upstream_reply_id_handshake(2002, 1, buffered_payload(b"first")),
-            ReplyIdHandshakeBegin::Started { .. }
-        ));
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(2002, None),
-            ReplyIdHandshakeAck::Matched { .. }
-        ));
-        assert!(matches!(
-            state.ack_upstream_reply_id_handshake(2002, None),
-            ReplyIdHandshakeAck::Ignored(ReplyIdHandshakeAckIgnored::AlreadyAcked { .. })
-        ));
-    }
-}
+#[cfg(test)]
+mod recovery_tests;

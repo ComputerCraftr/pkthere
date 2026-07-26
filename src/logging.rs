@@ -2,15 +2,23 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering as AtomOrdering};
 
+static STDOUT_BROKEN: crate::authority::AuthorityAtomic<
+    crate::authority::tags::DiagnosticCounter,
+    AtomicBool,
+> = crate::authority::AuthorityAtomic::new_bool(
+    false,
+    crate::authority::AtomicProtocolId::DiagnosticCounter,
+);
+
 #[doc(hidden)]
 pub(crate) const fn log_dir_label(c2u: bool) -> &'static str {
     if c2u { "c2u" } else { "u2c" }
 }
 
-static STDOUT_BROKEN: AtomicBool = AtomicBool::new(false);
-
 #[doc(hidden)]
 pub(crate) fn emit_stdout(args: fmt::Arguments<'_>) {
+    // Independent sticky hint: this flag publishes no associated output data;
+    // a stale false can only cause one extra best-effort write.
     if STDOUT_BROKEN.load(AtomOrdering::Relaxed) {
         return;
     }
@@ -30,27 +38,44 @@ pub(crate) fn emit_stderr(args: fmt::Arguments<'_>) {
     }
 }
 
+#[doc(hidden)]
+pub(crate) fn enter_logging_scope(
+    source_file: &'static str,
+    source_line: u32,
+) -> crate::authority::AuditedOperationScope {
+    crate::authority::AuditedOperationScope::enter(crate::authority::OperationId::Logging)
+        .unwrap_or_else(|error| {
+            crate::runtime_support::fatal_invariant_or_shutdown(format_args!(
+                "logging conflict {error} at {}:{}",
+                source_file, source_line,
+            ))
+        })
+}
+
 #[macro_export]
 macro_rules! __log_emit_plain {
-    (stdout, $level:literal, $($arg:tt)*) => {
+    (stdout, $level:literal, $($arg:tt)*) => {{
+        let _logging_scope = $crate::logging::enter_logging_scope(file!(), line!());
         $crate::logging::emit_stdout(::std::format_args!(
             "[{}] {}",
             $level,
             ::std::format_args!($($arg)*)
         ));
-    };
-    (stderr, $level:literal, $($arg:tt)*) => {
+    }};
+    (stderr, $level:literal, $($arg:tt)*) => {{
+        let _logging_scope = $crate::logging::enter_logging_scope(file!(), line!());
         $crate::logging::emit_stderr(::std::format_args!(
             "[{}] {}",
             $level,
             ::std::format_args!($($arg)*)
         ));
-    };
+    }};
 }
 
 #[macro_export]
 macro_rules! __log_emit_dir {
-    (stdout, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {
+    (stdout, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {{
+        let _logging_scope = $crate::logging::enter_logging_scope(file!(), line!());
         $crate::logging::emit_stdout(::std::format_args!(
             "[{}][worker {}][{}] {}",
             $level,
@@ -58,8 +83,9 @@ macro_rules! __log_emit_dir {
             $crate::logging::log_dir_label($c2u),
             ::std::format_args!($($arg)*)
         ));
-    };
-    (stderr, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {
+    }};
+    (stderr, $level:literal, $worker:expr, $c2u:expr, $($arg:tt)*) => {{
+        let _logging_scope = $crate::logging::enter_logging_scope(file!(), line!());
         $crate::logging::emit_stderr(::std::format_args!(
             "[{}][worker {}][{}] {}",
             $level,
@@ -67,7 +93,7 @@ macro_rules! __log_emit_dir {
             $crate::logging::log_dir_label($c2u),
             ::std::format_args!($($arg)*)
         ));
-    };
+    }};
 }
 
 #[macro_export]

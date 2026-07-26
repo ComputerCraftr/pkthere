@@ -1,6 +1,3 @@
-use socket2::Domain;
-use std::time::Instant;
-
 use pkthere_test_support::fixtures::{
     FORWARD_ERROR_PAYLOAD_A, FORWARD_ERROR_PAYLOAD_B, LEGIT_PAYLOAD_1, LEGIT_PAYLOAD_2,
     QUICK_STATS_TIMEOUT_SECS, RELOCK_PAYLOAD_A, RELOCK_PAYLOAD_B, SINGLE_CLIENT_PAYLOAD_V4,
@@ -13,8 +10,8 @@ use pkthere_test_support::forwarder::{
     snapshot_forwarder_output_tail,
 };
 use pkthere_test_support::matrix::{
-    ALL_CONNECT_MODES, MatrixCase, bind_client_or_skip, run_matrix_cases, spawn_echo_or_skip,
-    spawn_upstream_echo_or_skip,
+    FORCED_UNCONNECTED_DEBUG_SCENARIOS, MatrixCase, PRODUCTION_CONNECTION_SCENARIOS,
+    bind_client_or_skip, run_matrix_cases, spawn_echo_or_skip, spawn_upstream_echo_or_skip,
 };
 use pkthere_test_support::network::{
     bind_udp_client, bind_udp_client_with_port, localhost_addr, random_unprivileged_port,
@@ -23,9 +20,10 @@ use pkthere_test_support::network::{
 use pkthere_test_support::packet_diagnostics::{DiagnosticLogIndex, trace_key};
 use pkthere_test_support::raw_icmp::acquire_icmp_dgram_session_lock;
 use pkthere_test_support::runtime_asserts::{
-    expect_no_echo, expect_session_stats_matching, json_addr, recv_legitimate_echo_with_retry,
-    send_until_session_locked, wait_for_locked_client, wait_for_session_stats_json,
-    wait_for_session_stats_matching,
+    assert_recv_payload, exercise_max_payload_boundary, expect_no_echo,
+    expect_session_stats_matching, json_addr, recv_legitimate_echo_with_retry,
+    send_until_session_locked, send_until_session_stats_matching, wait_for_locked_client,
+    wait_for_session_stats_json, wait_for_session_stats_matching,
 };
 use pkthere_test_support::socket_matrix::assert_socket_matrix_state;
 use pkthere_test_support::timing::{
@@ -33,135 +31,22 @@ use pkthere_test_support::timing::{
     STATS_WAIT_MS, TIMEOUT_SECS,
 };
 use pkthere_test_support::worker_flow;
+use socket2::Domain;
+use std::time::Instant;
 
-use std::io::ErrorKind;
-use std::net::SocketAddr;
-
-#[derive(Clone, Copy, Debug)]
-enum UnconnectedWrongPeerRole {
-    ClientSide,
-    UpstreamSide,
-}
-
-fn panic_with_session_context(context: &str, session: &ForwarderSession) -> ! {
-    let (stdout, stderr) = snapshot_forwarder_output_tail(session, 20)
-        .unwrap_or_else(|_| (String::new(), String::new()));
-    let mut details = String::new();
-    if !stdout.trim().is_empty() {
-        details.push_str("\nrecent stdout tail:\n");
-        details.push_str(&stdout);
-    }
-    if !stderr.trim().is_empty() {
-        details.push_str("\nrecent stderr tail:\n");
-        details.push_str(&stderr);
-    }
-    panic!("{context}{details}");
-}
-
-fn routable_loopback_for_wildcard_bind(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V4(addr) if addr.ip().is_unspecified() => SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            addr.port(),
-        ),
-        SocketAddr::V6(addr) if addr.ip().is_unspecified() => SocketAddr::new(
-            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-            addr.port(),
-        ),
-        _ => addr,
-    }
-}
-
-fn describe_unconnected_wrong_peer_case(
-    role: UnconnectedWrongPeerRole,
-    case: MatrixCase,
-) -> String {
-    let role = match role {
-        UnconnectedWrongPeerRole::ClientSide => "client",
-        UnconnectedWrongPeerRole::UpstreamSide => "upstream",
-    };
-    format!(
-        "role={role} family={:?} proto={} client_unconnected={} upstream_unconnected={}",
-        case.family, case.proto, case.debug_client_unconnected, case.debug_upstream_unconnected
-    )
-}
-
-fn uses_kernel_echo_debug(case: MatrixCase) -> bool {
-    case.proto == pkthere_wire::SupportedProtocol::ICMP
-}
-
-#[test]
-fn udp_upstream_explicit_source_port_is_bound_from_cli() {
-    let family = Domain::IPV4;
-    let client = bind_udp_client(family).expect("client bind");
-    let Some((up_addr, _upstream_echo)) = spawn_echo_or_skip(family) else {
-        return;
-    };
-    let source_port = random_unprivileged_port(family).expect("source port");
-    let there = format!("UDP:{up_addr}");
-
-    let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: false,
-        debug_upstream_unconnected: false,
-        debug_icmp_kernel_echo_self_handshake: false,
-        debug_force_raw_icmp_wildcard_upstream: false,
-        here: udp_listen_arg(localhost_addr(family, 0)),
-        there,
-        here_source_id: None,
-        here_reply_id: None,
-        there_source_id: Some(source_port),
-        there_reply_id: None,
-        timeout_action: "exit",
-        timeout_secs: Some(QUICK_STATS_TIMEOUT_SECS),
-        max_payload: None,
-        fast_stats: true,
-        stats_interval_mins: None,
-        icmp_sync_pps: None,
-        debug_logs: &[],
-        diagnostic_label: None,
-        icmp_handshake_timeout_secs: None,
-    });
-
-    client.connect(session.listen_addr).expect("connect client");
-    client
-        .set_read_timeout(Some(CLIENT_WAIT_MS))
-        .expect("set client timeout");
-    client.send(LEGIT_PAYLOAD_1).expect("send payload");
-    let mut buf = [0; 2048];
-    let n = recv_legitimate_echo_with_retry(
-        &client,
-        LEGIT_PAYLOAD_1,
-        &mut buf,
-        "explicit UDP upstream source port",
-        "source-port echo",
-    )
-    .expect("receive payload");
-    assert_eq!(&buf[..n], LEGIT_PAYLOAD_1);
-
-    let stats = expect_session_stats_matching(
-        &mut session,
-        STATS_WAIT_MS,
-        "did not see explicit UDP upstream source port",
-        |stats| {
-            worker_flow::locked_worker_flow(stats)["upstream_local_filter_canonical"]
-                .as_str()
-                .is_some_and(|addr| addr == render_canonical_ip_id(up_addr.ip(), source_port))
-        },
-    );
-    let worker = worker_flow::locked_worker_flow(&stats);
-    assert_eq!(
-        worker_flow::worker_str(worker, "upstream_local_filter_canonical"),
-        render_canonical_ip_id(up_addr.ip(), source_port)
-    );
-}
+mod integration_support;
+use integration_support::{
+    UnconnectedWrongPeerRole, assert_only_retry_duplicates_remain,
+    describe_unconnected_wrong_peer_case, panic_with_session_context,
+    routable_loopback_for_wildcard_bind, uses_kernel_echo_debug,
+};
 
 #[test]
 fn packet_dump_debug_log_emits_structured_udp_evidence() {
     let family = Domain::IPV4;
     let client = bind_udp_client(family).expect("client bind");
-    let Some((up_addr, _upstream_echo)) = spawn_echo_or_skip(family) else {
-        return;
-    };
+    let (up_addr, _upstream_echo) =
+        spawn_echo_or_skip(family).expect("IPv4 UDP echo server is required");
 
     let mut session = launch_forwarder(ForwarderConfig {
         debug_client_unconnected: false,
@@ -199,9 +84,8 @@ fn packet_dump_debug_log_emits_structured_udp_evidence() {
             Instant::now() + STATS_WAIT_MS,
             "structured packet-dump disposition",
             |output| {
-                output
-                    .stderr_lossy()
-                    .contains("\"disposition\":\"forwarded\"")
+                DiagnosticLogIndex::parse(&output.stdout_lossy(), &output.stderr_lossy())
+                    .is_ok_and(|index| index.has_complete_accepted_forwarded_trace("c2u"))
             },
         )
         .unwrap_or_else(|error| {
@@ -218,7 +102,7 @@ fn packet_dump_debug_log_emits_structured_udp_evidence() {
     assert!(stderr.contains("\"udp\""), "{stderr}");
     assert!(stderr.contains("\"result\":\"accepted\""), "{stderr}");
 
-    let diagnostics = DiagnosticLogIndex::parse("", &stderr).expect("schema-2 diagnostics");
+    let diagnostics = DiagnosticLogIndex::parse("", &stderr).expect("schema-3 diagnostics");
     let accepted = diagnostics
         .packets()
         .find(|record| {
@@ -281,8 +165,8 @@ fn enforce_max_payload() {
         run_matrix_cases(
             &[family],
             pkthere_test_support::runtime_capability::enabled_forward_protocols(),
-            &[false],
-            &[false],
+            &PRODUCTION_CONNECTION_SCENARIOS,
+            &PRODUCTION_CONNECTION_SCENARIOS,
             |case| {
                 enforce_max_payload_case(case, max_payload, recv_buf_len);
             },
@@ -308,8 +192,8 @@ fn enforce_max_payload_case(case: MatrixCase, max_payload: usize, recv_buf_len: 
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: case.debug_client_unconnected,
-        debug_upstream_unconnected: case.debug_upstream_unconnected,
+        debug_client_unconnected: case.client_connection.debug_force_unconnected(),
+        debug_upstream_unconnected: case.upstream_connection.debug_force_unconnected(),
         debug_icmp_kernel_echo_self_handshake: uses_kernel_echo_debug(case),
         debug_force_raw_icmp_wildcard_upstream: false,
         here: udp_listen_arg(localhost_addr(case.family, 0)),
@@ -319,9 +203,9 @@ fn enforce_max_payload_case(case: MatrixCase, max_payload: usize, recv_buf_len: 
         there_source_id: None,
         there_reply_id: None,
         timeout_action: "exit",
-        timeout_secs: Some(QUICK_STATS_TIMEOUT_SECS),
+        timeout_secs: None,
         max_payload: Some(max_payload),
-        fast_stats: false,
+        fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
         debug_logs: &["packets", "drops", "handles"],
@@ -333,46 +217,25 @@ fn enforce_max_payload_case(case: MatrixCase, max_payload: usize, recv_buf_len: 
         .connect(session.listen_addr)
         .unwrap_or_else(|_| panic!("connect to {} forwarder (max payload)", case.proto));
 
-    let ok = vec![255u8; max_payload];
-    client_sock.send(&ok).expect("send max payload");
-    let mut buf = vec![0u8; recv_buf_len];
     let case_desc = format!("{case:?} max_payload={max_payload}");
-    recv_legitimate_echo_with_retry(&client_sock, &ok, &mut buf, &case_desc, "max payload echo")
-        .unwrap_or_else(|error| panic!("{error}\n{}", session.diagnostic_snapshot(80)));
-
-    // Drain any delayed packets before testing the drop, especially for empty payloads
-    client_sock
-        .set_read_timeout(Some(DRAIN_WAIT_MS))
-        .expect("set drain timeout");
-    while client_sock.recv(&mut buf).is_ok() {}
-
-    let over = vec![255u8; max_payload + 1];
-    client_sock.send(&over).expect("send oversize payload");
-    expect_no_echo(&client_sock, &mut buf);
-
-    session
-        .wait_for_exit_success(MAX_WAIT_SECS)
-        .expect("forwarder exit after oversize timeout");
-
-    let stats = wait_for_session_stats_json(&mut session, STATS_WAIT_MS)
-        .unwrap_or_else(|| panic!("did not see stats JSON line within {:?}", STATS_WAIT_MS));
-    assert_eq!(
-        stats["c2u_drops_oversize"]
-            .as_u64()
-            .expect("missing c2u_drops_oversize"),
-        1,
-        "one controlled oversize datagram must produce one oversize drop"
-    );
-    assert!(
-        stats["locked"].as_bool().expect("missing locked field"),
-        "max-payload case should remain locked after successful in-range payload"
+    let stats = exercise_max_payload_boundary(
+        &mut session,
+        &client_sock,
+        max_payload,
+        &mut vec![0u8; recv_buf_len],
+        &case_desc,
     );
     let worker = worker_flow::locked_worker_flow(&stats);
-    assert_socket_matrix_state(worker, case, "exit", &case_desc);
+    assert_socket_matrix_state(
+        worker,
+        case,
+        pkthere_socket_policy::TimeoutAction::Exit,
+        &case_desc,
+    );
 }
 
 #[test]
-fn single_client_forwarding() {
+fn single_client_forwarding_uses_production_socket_policy() {
     for (family, payload) in [
         (Domain::IPV4, SINGLE_CLIENT_PAYLOAD_V4),
         (Domain::IPV6, SINGLE_CLIENT_PAYLOAD_V6),
@@ -380,12 +243,42 @@ fn single_client_forwarding() {
         run_matrix_cases(
             &[family],
             pkthere_test_support::runtime_capability::enabled_forward_protocols(),
-            &ALL_CONNECT_MODES,
-            &ALL_CONNECT_MODES,
+            &PRODUCTION_CONNECTION_SCENARIOS,
+            &PRODUCTION_CONNECTION_SCENARIOS,
             |case| {
                 single_client_forwarding_case(case, payload);
             },
         );
+    }
+}
+
+#[test]
+fn single_client_forwarding_forced_unconnected_debug_scenarios() {
+    for (family, payload) in [
+        (Domain::IPV4, SINGLE_CLIENT_PAYLOAD_V4),
+        (Domain::IPV6, SINGLE_CLIENT_PAYLOAD_V6),
+    ] {
+        for (client_options, upstream_options) in [
+            (
+                &FORCED_UNCONNECTED_DEBUG_SCENARIOS[..],
+                &[
+                    pkthere_test_support::matrix::MatrixConnectionScenario::ProductionPolicy,
+                    pkthere_test_support::matrix::MatrixConnectionScenario::ForcedUnconnectedDebug,
+                ][..],
+            ),
+            (
+                &PRODUCTION_CONNECTION_SCENARIOS[..],
+                &FORCED_UNCONNECTED_DEBUG_SCENARIOS[..],
+            ),
+        ] {
+            run_matrix_cases(
+                &[family],
+                pkthere_test_support::runtime_capability::enabled_forward_protocols(),
+                client_options,
+                upstream_options,
+                |case| single_client_forwarding_case(case, payload),
+            );
+        }
     }
 }
 
@@ -411,8 +304,8 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: case.debug_client_unconnected,
-        debug_upstream_unconnected: case.debug_upstream_unconnected,
+        debug_client_unconnected: case.client_connection.debug_force_unconnected(),
+        debug_upstream_unconnected: case.upstream_connection.debug_force_unconnected(),
         debug_icmp_kernel_echo_self_handshake: uses_kernel_echo_debug(case),
         debug_force_raw_icmp_wildcard_upstream: false,
         here: udp_listen_arg(localhost_addr(case.family, 0)),
@@ -422,9 +315,9 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
         there_source_id: None,
         there_reply_id: None,
         timeout_action: "exit",
-        timeout_secs: Some(QUICK_STATS_TIMEOUT_SECS),
+        timeout_secs: None,
         max_payload: None,
-        fast_stats: false,
+        fast_stats: true,
         stats_interval_mins: None,
         icmp_sync_pps: None,
         debug_logs: &[],
@@ -435,6 +328,9 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
     client_sock
         .connect(session.listen_addr)
         .unwrap_or_else(|_| panic!("connect to {} forwarder (single client)", case.proto));
+    client_sock
+        .set_read_timeout(Some(CLIENT_WAIT_MS))
+        .expect("set single-client receive timeout");
 
     for _ in 0..COUNT {
         client_sock
@@ -442,42 +338,40 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
             .unwrap_or_else(|_| panic!("send to {} forwarder (single client)", case.proto));
         let mut buf = [0u8; 2048];
         let case_desc = format!("{case:?}");
-        let n = recv_legitimate_echo_with_retry(
-            &client_sock,
-            payload,
-            &mut buf,
-            &case_desc,
-            "single-client echo",
-        )
-        .unwrap_or_else(|error| panic!("{error}\n{}", session.diagnostic_snapshot(80)));
+        let n = assert_recv_payload(&session, &client_sock, payload, &mut buf, &case_desc);
         assert_eq!(&buf[..n], payload, "echo payload mismatch");
     }
 
+    let stats = expect_session_stats_matching(
+        &mut session,
+        STATS_WAIT_MS,
+        "single-client packet accounting was not published before the stats deadline",
+        |stats| {
+            stats["c2u_pkts"].as_u64().expect("missing c2u_pkts") >= COUNT as u64
+                && stats["u2c_pkts"].as_u64().expect("missing u2c_pkts") >= COUNT as u64
+        },
+    );
     session
-        .wait_for_exit_success(MAX_WAIT_SECS)
-        .expect("forwarder exit after single-client forwarding");
-
-    let stats = wait_for_session_stats_json(&mut session, STATS_WAIT_MS)
-        .unwrap_or_else(|| panic!("did not see stats JSON line within {:?}", STATS_WAIT_MS));
+        .terminate(Instant::now() + MAX_WAIT_SECS)
+        .expect("terminate single-client forwarder");
     assert!(stats["uptime_s"].is_number());
     assert!(stats["locked"].as_bool().expect("missing locked field"));
     let worker = worker_flow::locked_worker_flow(&stats);
 
     let case_desc = format!("{case:?}");
-    assert_socket_matrix_state(worker, case, "exit", &case_desc);
+    assert_socket_matrix_state(
+        worker,
+        case,
+        pkthere_socket_policy::TimeoutAction::Exit,
+        &case_desc,
+    );
 
     let c2u_packets = stats["c2u_pkts"].as_u64().expect("missing c2u_pkts");
     let u2c_packets = stats["u2c_pkts"].as_u64().expect("missing u2c_pkts");
-    assert!(
-        c2u_packets >= COUNT as u64,
-        "retry-capable client forwarded fewer than {COUNT} requests"
-    );
-    assert!(
-        u2c_packets >= COUNT as u64,
-        "retry-capable client received fewer than {COUNT} upstream replies"
-    );
+    assert_eq!(c2u_packets, COUNT as u64);
+    assert_eq!(u2c_packets, COUNT as u64);
 
-    let listener_local = worker_flow::worker_str(worker, "listen_local_filter_canonical");
+    let listener_local = worker_flow::worker_str(worker, "listener_local_filter");
     let stats_client_endpoint = client_local.to_string();
     worker_flow::assert_flow_tuple(
         worker,
@@ -487,18 +381,17 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
     );
     let stats_client = worker_flow::flow_tuple(worker, "listener_flow_outbound")
         .1
-        .parse::<SocketAddr>()
+        .parse::<std::net::SocketAddr>()
         .expect("parse stats listener_flow_outbound remote");
     assert_eq!(stats_client, client_local, "stats client_remote mismatch");
-    let actual_upstream = worker["upstream_remote_filter_canonical"]
+    let actual_upstream = worker["upstream_remote_filter"]
         .as_str()
-        .expect("missing upstream_remote_filter_canonical");
+        .expect("missing upstream_remote_filter");
     if case.proto == pkthere_wire::SupportedProtocol::ICMP {
-        // Accept either the requested :0 or the realized ID (now that we discover it)
         assert!(
             actual_upstream == render_canonical_ip_id(up_addr.ip(), 0)
                 || !actual_upstream.ends_with(":0"),
-            "stats upstream_remote_filter_canonical mismatch for ICMP: expected IP:0 or IP:real_id, got {}",
+            "stats upstream_remote_filter mismatch for ICMP: expected IP:0 or IP:real_id, got {}",
             actual_upstream
         );
         let expected_prefix = match up_addr.ip() {
@@ -510,7 +403,7 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
         assert_eq!(
             actual_upstream,
             render_canonical_ip_id(up_addr.ip(), up_addr.port()),
-            "stats upstream_remote_filter_canonical mismatch"
+            "stats upstream_remote_filter mismatch"
         );
     }
 
@@ -537,31 +430,59 @@ fn single_client_forwarding_case(case: MatrixCase, payload: &[u8]) {
         payload.len() as u64
     );
 
-    let c2u_us_max = stats["c2u_us_max"].as_u64().expect("missing c2u_us_max");
-    let u2c_us_max = stats["u2c_us_max"].as_u64().expect("missing u2c_us_max");
-    let c2u_us_avg = stats["c2u_us_avg"].as_u64().expect("missing c2u_us_avg");
-    let u2c_us_avg = stats["u2c_us_avg"].as_u64().expect("missing u2c_us_avg");
-    let c2u_us_ewma = stats["c2u_us_ewma"].as_u64().expect("missing c2u_us_ewma");
-    let u2c_us_ewma = stats["u2c_us_ewma"].as_u64().expect("missing u2c_us_ewma");
-
-    // Diagnostics intentionally quantize nanoseconds to whole microseconds.
-    // Fast loopback operations may therefore report zero without losing samples.
-    assert!(c2u_us_max >= c2u_us_avg);
-    assert!(u2c_us_max >= u2c_us_avg);
-    assert!(c2u_us_max >= c2u_us_ewma);
-    assert!(u2c_us_max >= u2c_us_ewma);
+    for direction in ["c2u", "u2c"] {
+        let required_metric = |suffix: &str| {
+            let key = format!("{direction}_{suffix}");
+            let Some(value) = stats.get(&key).and_then(serde_json::Value::as_u64) else {
+                panic!("missing required stats metric {key}");
+            };
+            value
+        };
+        let average = required_metric("latency_ns_avg");
+        let ewma = required_metric("interval_mean_latency_ns_ewma");
+        let maximum = required_metric("latency_ns_max");
+        let latency_sum = required_metric("latency_ns_sum");
+        let queue_sum = required_metric("queue_delay_ns_sum");
+        let service_sum = required_metric("send_service_ns_sum");
+        let packet_count = required_metric("pkts");
+        let zero_resolution_samples = required_metric("zero_resolution_samples");
+        assert!(average > 0, "{direction} latency average must be nonzero");
+        assert!(ewma > 0, "{direction} interval-mean EWMA must be nonzero");
+        assert_eq!(
+            latency_sum,
+            queue_sum + service_sum,
+            "{direction} end-to-end latency must equal queue plus send service time"
+        );
+        assert!(
+            zero_resolution_samples <= packet_count,
+            "{direction} zero-resolution samples cannot exceed sent user packets"
+        );
+        assert!(maximum >= average);
+        assert!(maximum >= ewma);
+    }
 }
 
 #[test]
-fn relock_after_timeout_drop() {
+fn relock_after_timeout_drop_uses_production_socket_policy() {
     run_matrix_cases(
         &[Domain::IPV4, Domain::IPV6],
         &["UDP"],
-        &ALL_CONNECT_MODES,
-        &[false],
+        &PRODUCTION_CONNECTION_SCENARIOS,
+        &PRODUCTION_CONNECTION_SCENARIOS,
         |case| {
             relock_after_timeout_drop_case(case);
         },
+    );
+}
+
+#[test]
+fn relock_after_timeout_drop_forced_unconnected_debug_scenario() {
+    run_matrix_cases(
+        &[Domain::IPV4, Domain::IPV6],
+        &["UDP"],
+        &FORCED_UNCONNECTED_DEBUG_SCENARIOS,
+        &PRODUCTION_CONNECTION_SCENARIOS,
+        relock_after_timeout_drop_case,
     );
 }
 
@@ -581,14 +502,12 @@ fn relock_after_timeout_drop_case(case: MatrixCase) {
     else {
         return;
     };
-    let here_port = random_unprivileged_port(case.family).expect("ephemeral listen port");
-
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: case.debug_client_unconnected,
-        debug_upstream_unconnected: case.debug_upstream_unconnected,
+        debug_client_unconnected: case.client_connection.debug_force_unconnected(),
+        debug_upstream_unconnected: case.upstream_connection.debug_force_unconnected(),
         debug_icmp_kernel_echo_self_handshake: uses_kernel_echo_debug(case),
         debug_force_raw_icmp_wildcard_upstream: false,
-        here: udp_loopback_arg(case.family, here_port),
+        here: udp_loopback_arg(case.family, 0),
         there: there_arg,
         here_source_id: None,
         here_reply_id: None,
@@ -656,7 +575,7 @@ fn relock_after_timeout_drop_case(case: MatrixCase) {
         "listener_flow_outbound",
     )
     .1
-    .parse::<SocketAddr>()
+    .parse::<std::net::SocketAddr>()
     .expect("parse stats listener_flow_outbound remote");
     assert_eq!(
         stats_client, client_b_local,
@@ -670,15 +589,26 @@ fn relock_after_timeout_drop_case(case: MatrixCase) {
 }
 
 #[test]
-fn timeout_drop_relocks_after_forward_errors_udp() {
+fn timeout_drop_relocks_after_forward_errors_udp_uses_production_socket_policy() {
     run_matrix_cases(
         &[Domain::IPV4, Domain::IPV6],
         &["UDP"],
-        &ALL_CONNECT_MODES,
-        &[false],
+        &PRODUCTION_CONNECTION_SCENARIOS,
+        &PRODUCTION_CONNECTION_SCENARIOS,
         |case| {
             timeout_drop_relocks_after_forward_errors_udp_case(case);
         },
+    );
+}
+
+#[test]
+fn timeout_drop_relocks_after_forward_errors_udp_forced_unconnected_debug_scenario() {
+    run_matrix_cases(
+        &[Domain::IPV4, Domain::IPV6],
+        &["UDP"],
+        &FORCED_UNCONNECTED_DEBUG_SCENARIOS,
+        &PRODUCTION_CONNECTION_SCENARIOS,
+        timeout_drop_relocks_after_forward_errors_udp_case,
     );
 }
 
@@ -686,14 +616,13 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase) {
     let client_a = bind_udp_client(case.family).expect("client_a loopback not available");
     let client_b = bind_udp_client(case.family).expect("client_b loopback not available");
     let dead_upstream_port = random_unprivileged_port(case.family).expect("dead upstream port");
-    let here_port = random_unprivileged_port(case.family).expect("ephemeral listen port");
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: case.debug_client_unconnected,
-        debug_upstream_unconnected: case.debug_upstream_unconnected,
+        debug_client_unconnected: case.client_connection.debug_force_unconnected(),
+        debug_upstream_unconnected: case.upstream_connection.debug_force_unconnected(),
         debug_icmp_kernel_echo_self_handshake: uses_kernel_echo_debug(case),
         debug_force_raw_icmp_wildcard_upstream: false,
-        here: udp_loopback_arg(case.family, here_port),
+        here: udp_loopback_arg(case.family, 0),
         there: udp_loopback_arg(case.family, dead_upstream_port),
         here_source_id: None,
         here_reply_id: None,
@@ -728,13 +657,22 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase) {
 
     expect_no_echo(&client_a, &mut [0u8; 256]);
 
-    let stats = expect_session_stats_matching(
+    let stats = send_until_session_stats_matching(
+        &client_a,
+        payload_a,
         &mut session,
         MAX_WAIT_SECS,
         "did not see forwarding errors in stats JSON",
         |candidate| {
             candidate["locked"].as_bool().expect("missing locked")
-                && candidate["u2c_errs"].as_u64().expect("missing u2c_errs") > 0
+                && (candidate["c2u_user_send_errors"]
+                    .as_u64()
+                    .expect("missing c2u_user_send_errors")
+                    > 0
+                    || candidate["u2c_receive_errors"]
+                        .as_u64()
+                        .expect("missing u2c_receive_errors")
+                        > 0)
         },
     );
     assert_eq!(
@@ -743,7 +681,7 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase) {
             "listener_flow_outbound",
         )
         .1
-        .parse::<SocketAddr>()
+        .parse::<std::net::SocketAddr>()
         .expect("stats listener outbound remote"),
         client_a.local_addr().expect("client A local addr")
     );
@@ -763,19 +701,25 @@ fn timeout_drop_relocks_after_forward_errors_udp_case(case: MatrixCase) {
 }
 
 #[test]
-fn unconnected_udp_rejects_wrong_peer_and_only_forwards_legitimate_traffic() {
+fn forced_unconnected_debug_udp_rejects_wrong_peer_and_forwards_legitimate_traffic() {
     run_matrix_cases(
         &[Domain::IPV4, Domain::IPV6],
         &["UDP"],
-        &[true],
-        &[false],
+        &FORCED_UNCONNECTED_DEBUG_SCENARIOS,
+        &PRODUCTION_CONNECTION_SCENARIOS,
         |case| {
             unconnected_udp_wrong_peer_case(UnconnectedWrongPeerRole::ClientSide, case);
         },
     );
-    run_matrix_cases(&[Domain::IPV4], &["UDP"], &[false], &[true], |case| {
-        unconnected_udp_wrong_peer_case(UnconnectedWrongPeerRole::UpstreamSide, case);
-    });
+    run_matrix_cases(
+        &[Domain::IPV4],
+        &["UDP"],
+        &PRODUCTION_CONNECTION_SCENARIOS,
+        &FORCED_UNCONNECTED_DEBUG_SCENARIOS,
+        |case| {
+            unconnected_udp_wrong_peer_case(UnconnectedWrongPeerRole::UpstreamSide, case);
+        },
+    );
 }
 
 fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixCase) {
@@ -805,8 +749,8 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
     };
 
     let mut session = launch_forwarder(ForwarderConfig {
-        debug_client_unconnected: case.debug_client_unconnected,
-        debug_upstream_unconnected: case.debug_upstream_unconnected,
+        debug_client_unconnected: case.client_connection.debug_force_unconnected(),
+        debug_upstream_unconnected: case.upstream_connection.debug_force_unconnected(),
         debug_icmp_kernel_echo_self_handshake: uses_kernel_echo_debug(case),
         debug_force_raw_icmp_wildcard_upstream: false,
         here,
@@ -858,7 +802,9 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
                 .set_read_timeout(Some(DRAIN_WAIT_MS))
                 .unwrap_or_else(|e| panic!("{case_desc}: set secondary client timeout: {e}"));
             match client_secondary.recv(&mut buf) {
-                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(e) => {
                     panic_with_session_context(
                         &format!(
@@ -892,14 +838,12 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
             );
             let worker = worker_flow::locked_worker_flow(&stats);
             let upstream_local = routable_loopback_for_wildcard_bind(
-                json_addr(&worker["upstream_local_filter_canonical"])
-                    .expect("parse stats upstream_local_filter_canonical"),
+                json_addr(&worker["upstream_local_filter"])
+                    .expect("parse stats upstream_local_filter"),
             );
             client_secondary
                 .send_to(WRONG_UPSTREAM_PEER_PAYLOAD, upstream_local)
                 .unwrap_or_else(|e| panic!("{case_desc}: send stray upstream packet: {e}"));
-
-            expect_no_echo(&client_primary, &mut buf);
 
             let stray_addr = localhost_addr(case.family, WRONG_PEER_STRAY_PORT_ID);
             let expected_drop = format!(
@@ -910,28 +854,7 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
         }
     }
 
-    client_primary
-        .set_read_timeout(Some(DRAIN_WAIT_MS))
-        .unwrap_or_else(|e| panic!("{case_desc}: set primary client timeout: {e}"));
-    match client_primary.recv(&mut buf) {
-        Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
-        Err(e) => {
-            panic_with_session_context(
-                &format!(
-                    "{case_desc}: unexpected recv error while verifying stray packet was filtered: {e}"
-                ),
-                &session,
-            );
-        }
-        Ok(n) => {
-            panic_with_session_context(
-                &format!(
-                    "{case_desc}: stray packet unexpectedly produced {n} client-visible bytes"
-                ),
-                &session,
-            );
-        }
-    }
+    assert_only_retry_duplicates_remain(&client_primary, payload_1, &mut buf, &case_desc, &session);
 
     let payload_2 = LEGIT_PAYLOAD_2;
     client_primary
@@ -962,7 +885,12 @@ fn unconnected_udp_wrong_peer_case(role: UnconnectedWrongPeerRole, case: MatrixC
     );
 
     let worker = worker_flow::locked_worker_flow(&stats);
-    assert_socket_matrix_state(worker, case, "exit", &case_desc);
+    assert_socket_matrix_state(
+        worker,
+        case,
+        pkthere_socket_policy::TimeoutAction::Exit,
+        &case_desc,
+    );
 }
 
 fn wait_for_drop_log(session: &mut ForwarderSession, expected: &str, case_desc: &str) {

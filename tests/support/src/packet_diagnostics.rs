@@ -27,6 +27,7 @@ pub enum DiagnosticKind {
     SocketEvidence,
     Handshake,
     Resolver,
+    Runtime,
     Stats,
 }
 
@@ -200,6 +201,19 @@ impl DiagnosticLogIndex {
         grouped
     }
 
+    pub fn has_complete_accepted_forwarded_trace(&self, direction: &str) -> bool {
+        self.trace_stages().iter().any(|(key, stages)| {
+            key.direction == direction
+                && stages.received.len() == 1
+                && stages.admission.len() == 1
+                && stages.disposition.len() == 1
+                && stages.admission[0].value["admission"]["result"] == "accepted"
+                && stages.disposition[0].value["disposition"] == "forwarded"
+                && stages.received[0].sequence < stages.admission[0].sequence
+                && stages.admission[0].sequence < stages.disposition[0].sequence
+        })
+    }
+
     pub fn received_trace_keys(&self) -> Vec<TraceKey> {
         self.packets()
             .filter(|record| record.value.get("stage").and_then(Value::as_str) == Some("received"))
@@ -208,43 +222,20 @@ impl DiagnosticLogIndex {
     }
 
     fn parse_stream(&mut self, stream: DiagnosticStream, text: &str) -> Result<(), String> {
-        let last_line_is_partial = !text.ends_with('\n');
-        let line_count = text.lines().count();
-        for (physical_line, line) in text.lines().enumerate() {
-            let is_unterminated_last_line = last_line_is_partial && physical_line + 1 == line_count;
-            let known = [
-                ("packet-dump ", DiagnosticKind::Packet),
-                ("socket-evidence ", DiagnosticKind::SocketEvidence),
-                ("handshake-trace ", DiagnosticKind::Handshake),
-                ("resolver-evidence ", DiagnosticKind::Resolver),
-            ]
-            .into_iter()
-            .find_map(|(marker, kind)| line.split_once(marker).map(|(_, json)| (kind, json)));
-
-            let (kind, value) = if let Some((kind, json)) = known {
-                let value = match serde_json::from_str(json) {
-                    Ok(value) => value,
-                    Err(_) if is_unterminated_last_line => break,
-                    Err(error) => {
-                        return Err(format!(
-                            "malformed known diagnostic on {:?} line {}: {error}",
-                            stream,
-                            physical_line + 1
-                        ));
-                    }
-                };
-                (kind, value)
-            } else {
-                let Some(start) = line.find('{') else {
-                    continue;
-                };
-                let Ok(value) = serde_json::from_str::<Value>(&line[start..]) else {
-                    continue;
-                };
-                if value.get("worker_flows").is_none() {
-                    continue;
+        for (physical_line, source_line) in text.split_inclusive('\n').enumerate() {
+            let terminated = source_line.ends_with('\n');
+            let line = source_line.trim_end_matches(['\r', '\n']);
+            let (kind, value) = match parse_diagnostic_line(line) {
+                Ok(Some(record)) => record,
+                Ok(None) => continue,
+                Err(_) if !terminated => break,
+                Err(error) => {
+                    return Err(format!(
+                        "malformed known diagnostic on {:?} line {}: {error}",
+                        stream,
+                        physical_line + 1
+                    ));
                 }
-                (DiagnosticKind::Stats, value)
             };
 
             let sequence = value
@@ -252,12 +243,12 @@ impl DiagnosticLogIndex {
                 .and_then(Value::as_u64)
                 .ok_or_else(|| {
                     format!(
-                        "schema-2 diagnostic lacks diagnostic_sequence on {:?} line {}",
+                        "schema-3 diagnostic lacks diagnostic_sequence on {:?} line {}",
                         stream,
                         physical_line + 1
                     )
                 })?;
-            if value.get("diagnostic_schema").and_then(Value::as_u64) != Some(2) {
+            if value.get("diagnostic_schema").and_then(Value::as_u64) != Some(3) {
                 return Err(format!(
                     "unsupported diagnostic schema on {:?} line {}",
                     stream,
@@ -310,11 +301,41 @@ impl DiagnosticLogIndex {
                 }
                 DiagnosticKind::Handshake => self.handshake_records.push(record_index),
                 DiagnosticKind::Resolver => self.resolver_records.push(record_index),
+                DiagnosticKind::Runtime => {}
                 DiagnosticKind::Stats => self.stats_records.push(record_index),
             }
         }
         Ok(())
     }
+}
+
+pub fn parse_diagnostic_line(line: &str) -> Result<Option<(DiagnosticKind, Value)>, String> {
+    let known = [
+        ("packet-dump ", DiagnosticKind::Packet),
+        ("socket-evidence ", DiagnosticKind::SocketEvidence),
+        ("handshake-trace ", DiagnosticKind::Handshake),
+        ("resolver-evidence ", DiagnosticKind::Resolver),
+        ("runtime-trace ", DiagnosticKind::Runtime),
+    ];
+    if let Some((kind, json)) = known
+        .into_iter()
+        .find_map(|(marker, kind)| line.split_once(marker).map(|(_, json)| (kind, json)))
+    {
+        return serde_json::from_str(json)
+            .map(|value| Some((kind, value)))
+            .map_err(|error| error.to_string());
+    }
+
+    let Some(start) = line.find('{') else {
+        return Ok(None);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&line[start..]) else {
+        return Ok(None);
+    };
+    Ok(value
+        .get("worker_flows")
+        .is_some()
+        .then_some((DiagnosticKind::Stats, value)))
 }
 
 fn socket_evidence_key(record: &Value) -> Option<SocketEvidenceIndexKey> {
@@ -341,86 +362,4 @@ pub fn trace_key(record: &Value) -> Option<TraceKey> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{DiagnosticLogIndex, DiagnosticStream, TraceKey};
-
-    #[test]
-    fn socket_evidence_parser_keeps_generation_key_and_getsockname() {
-        let records = DiagnosticLogIndex::parse(
-            "",
-            r#"[DEBUG] socket-evidence {"diagnostic_schema":2,"diagnostic_sequence":1,"event":"socket_evidence","key":{"process_id":7,"role":"upstream","domain":"ipv4","socket_slot":3,"generation":2},"getsockname":"127.0.0.1:0"}"#,
-        )
-        .expect("valid evidence");
-        let records = records.socket_evidence().collect::<Vec<_>>();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].value["key"]["generation"], 2);
-        assert_eq!(records[0].value["key"]["socket_slot"], 3);
-        assert_eq!(records[0].value["getsockname"], "127.0.0.1:0");
-    }
-
-    #[test]
-    fn diagnostic_index_orders_cross_stream_records_by_production_sequence() {
-        let stdout = r#"[INFO] {"diagnostic_schema":2,"diagnostic_sequence":3,"worker_flows":[]}"#;
-        let stderr = concat!(
-            "[DEBUG] packet-dump {\"diagnostic_schema\":2,\"diagnostic_sequence\":1,\"event\":\"packet_dump\",\"stage\":\"received\",\"worker\":2,\"direction\":\"c2u\",\"packet_id\":9}\n",
-            "[DEBUG] packet-dump {\"diagnostic_schema\":2,\"diagnostic_sequence\":2,\"event\":\"packet_dump\",\"stage\":\"admission\",\"worker\":2,\"direction\":\"c2u\",\"packet_id\":9}\n",
-        );
-        let index = DiagnosticLogIndex::parse(stdout, stderr).expect("valid schema-2 diagnostics");
-        let records = index
-            .packet_records(&TraceKey {
-                worker: 2,
-                direction: "c2u".to_owned(),
-                packet_id: 9,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].sequence, 1);
-        assert_eq!(records[0].stream, DiagnosticStream::Stderr);
-        assert_eq!(index.stats().next().map(|record| record.sequence), Some(3));
-    }
-
-    #[test]
-    fn diagnostic_index_rejects_malformed_known_records() {
-        let error = DiagnosticLogIndex::parse("", "[DEBUG] packet-dump {bad\n")
-            .expect_err("known structured records must not be silently ignored");
-        assert!(error.contains("malformed known diagnostic"));
-    }
-
-    #[test]
-    fn diagnostic_index_ignores_only_an_unterminated_trailing_record() {
-        let stderr = concat!(
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":1,\"transition\":\"begin\"}\n",
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":2"
-        );
-        let index = DiagnosticLogIndex::parse("", stderr)
-            .expect("live log snapshot may end in a partial write");
-        assert_eq!(index.handshakes().count(), 1);
-    }
-
-    #[test]
-    fn completed_handshake_requires_one_ordered_matching_pair() {
-        let stderr = concat!(
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":1,\"transition\":\"begin\",\"expected_ack_destination_id\":40001,\"buffered_len\":5}\n",
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":2,\"transition\":\"ack-matched\",\"expected_ack_destination_id\":40001,\"buffered_len\":5}\n",
-        );
-        let index = DiagnosticLogIndex::parse("", stderr).expect("valid handshake diagnostics");
-        index
-            .require_single_completed_handshake(5)
-            .expect("one ordered handshake pair");
-    }
-
-    #[test]
-    fn completed_handshake_rejects_duplicate_begin_or_terminal_reset() {
-        let stderr = concat!(
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":1,\"transition\":\"begin\",\"expected_ack_destination_id\":40001,\"buffered_len\":5}\n",
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":2,\"transition\":\"begin\",\"expected_ack_destination_id\":40001,\"buffered_len\":6}\n",
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":3,\"transition\":\"ack-matched\",\"expected_ack_destination_id\":40001,\"buffered_len\":5}\n",
-            "[DEBUG] handshake-trace {\"diagnostic_schema\":2,\"diagnostic_sequence\":4,\"transition\":\"reset\"}\n",
-        );
-        let index = DiagnosticLogIndex::parse("", stderr).expect("valid handshake diagnostics");
-        let error = index
-            .require_single_completed_handshake(5)
-            .expect_err("duplicate negotiation must fail the invariant");
-        assert!(error.contains("observed begin=2"), "{error}");
-    }
-}
+mod tests;

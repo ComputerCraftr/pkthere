@@ -58,6 +58,64 @@ fn first_matching_json_record_returns_without_waiting_for_process_exit() {
 }
 
 #[test]
+fn line_cursor_retains_a_second_record_captured_in_the_same_batch() {
+    let mut child = spawn_helper("two-json-records");
+    let mut cursor = OutputCursor::default();
+    for expected in [1, 2] {
+        let sequence = child
+            .wait_for_json_record(
+                &mut cursor,
+                Instant::now() + MAX_WAIT_SECS,
+                "ordered JSON readiness record",
+                |record| record["sequence"].as_u64(),
+            )
+            .expect("matching ordered JSON record");
+        assert_eq!(sequence, expected);
+    }
+    child
+        .terminate_and_reap(Instant::now() + CHILD_CLEANUP_WAIT)
+        .expect("terminate two-record helper");
+}
+
+#[test]
+fn stderr_cursor_retains_ordered_records_without_rescanning_output() {
+    let mut child = spawn_helper("two-json-records");
+    let mut cursor = child.stderr_cursor();
+    for expected in [1, 2] {
+        let sequence = child
+            .wait_for_json_record(
+                &mut cursor,
+                Instant::now() + MAX_WAIT_SECS,
+                "ordered stderr JSON record",
+                |record| record["sequence"].as_u64(),
+            )
+            .expect("matching ordered stderr JSON record");
+        assert_eq!(sequence, expected);
+    }
+    child
+        .terminate_and_reap(Instant::now() + CHILD_CLEANUP_WAIT)
+        .expect("terminate stderr two-record helper");
+}
+
+#[test]
+fn one_shot_output_snapshot_returns_without_waiting_for_a_second_change() {
+    let mut child = spawn_helper("json-record");
+    let started = Instant::now();
+    let output = child
+        .wait_for_output_snapshot(
+            Instant::now() + MAX_WAIT_SECS,
+            "one-shot output",
+            |snapshot| snapshot.stdout_lossy().contains("\"ready\":true"),
+        )
+        .expect("observe one-shot output");
+    assert!(output.stdout_lossy().contains("\"sequence\":7"));
+    assert!(started.elapsed() < MAX_WAIT_SECS);
+    child
+        .terminate_and_reap(Instant::now() + CHILD_CLEANUP_WAIT)
+        .expect("terminate one-shot output helper");
+}
+
+#[test]
 fn line_wait_honors_the_original_deadline() {
     let mut child = spawn_helper("sleep");
     let mut cursor = child.output_cursor_at_end();
@@ -173,7 +231,7 @@ fn process_group_termination_removes_descendants() {
         .terminate_and_reap(Instant::now() + CHILD_CLEANUP_WAIT)
         .expect("terminate process group");
 
-    wait_for_process_absence(descendant);
+    wait_for_process_termination(descendant);
 }
 
 #[cfg(unix)]
@@ -194,12 +252,12 @@ fn capture_timeout_preserves_partial_output_from_a_pipe_holding_descendant() {
         .expect_err("escaped descendant must keep capture incomplete");
     let output = error.output().expect("capture timeout output");
     assert!(output.stdout_lossy().contains("escaped="));
-    wait_for_process_absence(escaped);
+    wait_for_process_termination(escaped);
 }
 
 #[cfg(unix)]
 #[test]
-fn forced_deadline_transfers_child_until_background_reaper_collects_it() {
+fn zero_deadline_cleanup_remains_bounded_and_process_is_reaped() {
     let limits = ChildLimits {
         termination_grace: std::time::Duration::ZERO,
         forced_reap_wait: std::time::Duration::ZERO,
@@ -216,21 +274,61 @@ fn forced_deadline_transfers_child_until_background_reaper_collects_it() {
         )
         .expect("ignored-termination pid");
     let result = child.terminate_and_reap(Instant::now());
-    if let Err(error) = result {
-        assert!(matches!(error, ChildHarnessError::TerminationFailed { .. }));
+    match result {
+        Ok(_) => {}
+        Err(error)
+            if matches!(
+                error,
+                ChildHarnessError::TerminationFailed { .. }
+                    | ChildHarnessError::CaptureIncomplete { .. }
+            ) =>
+        {
+            assert!(
+                error
+                    .output()
+                    .is_some_and(|output| output.stdout_lossy().contains(&format!("pid={pid}"))),
+                "zero-deadline cleanup must preserve the readiness diagnostic: {error:?}"
+            );
+        }
+        Err(error) => panic!("unexpected zero-deadline cleanup result: {error:?}"),
     }
-    wait_for_process_absence(pid);
+    wait_for_process_termination(pid);
 }
 
 #[cfg(unix)]
-fn wait_for_process_absence(pid: i32) {
+fn wait_for_process_termination(pid: i32) {
     let deadline = Instant::now() + MAX_WAIT_SECS;
     loop {
-        let result = unsafe { libc::kill(pid, 0) };
-        if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        if !process_is_running(pid) {
             return;
         }
-        assert!(Instant::now() < deadline, "process {pid} was not reaped");
+        assert!(Instant::now() < deadline, "process {pid} remained alive");
         std::thread::sleep(TEST_POLL_INTERVAL);
     }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_running(pid: i32) -> bool {
+    let stat_path = format!("/proc/{pid}/stat");
+    match std::fs::read_to_string(&stat_path) {
+        Ok(stat) => {
+            let state = stat
+                .rsplit_once(") ")
+                .and_then(|(_, suffix)| suffix.chars().next())
+                .unwrap_or_else(|| panic!("malformed process status in {stat_path}"));
+            // A container without an init process can retain an orphaned
+            // descendant as a zombie. It owns no descriptors and executes no
+            // code, so process-tree termination has completed even though PID
+            // namespace reaping remains PID 1's responsibility.
+            !matches!(state, 'Z' | 'X')
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("read {stat_path}: {error}"),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_is_running(pid: i32) -> bool {
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }

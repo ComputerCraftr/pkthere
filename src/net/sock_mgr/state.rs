@@ -33,6 +33,7 @@ pub(crate) struct UpstreamMetadata {
     pub(crate) parser: ReceiveParserKernel,
 }
 
+#[derive(Clone)]
 pub(super) struct ClientListenState {
     pub(super) sock: ManagedSocket,
     pub(super) metadata: Arc<ListenerMetadata>,
@@ -52,6 +53,7 @@ impl DerefMut for ClientListenState {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct UpstreamState {
     pub(super) sock: ManagedSocket,
     pub(super) metadata: Arc<UpstreamMetadata>,

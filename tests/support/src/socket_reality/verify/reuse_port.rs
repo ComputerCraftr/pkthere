@@ -1,6 +1,7 @@
 use super::implementation::error;
 use super::model::{DerivedFacts, VerificationError};
-use crate::socket_reality::evidence::ReusePortFanoutEvidence;
+use crate::socket_reality::case::RealityCase;
+use crate::socket_reality::evidence::{ListenerOwnerReplacementEvidence, ReusePortFanoutEvidence};
 use pkthere_socket_policy::{
     ListenerWorkerDistribution, SocketCreationPath, listener_socket_setup_policy,
     listener_worker_socket_policy,
@@ -57,5 +58,61 @@ pub(super) fn verify_reuse_port_fanout(
         receiver_count: evidence.receiver_count,
         received_flow_counts: evidence.received_flow_counts.clone(),
         kernel_flow_affinity_required,
+    })
+}
+
+pub(super) fn verify_listener_owner_replacement(
+    _case: RealityCase,
+    evidence: &ListenerOwnerReplacementEvidence,
+) -> Result<DerivedFacts, VerificationError> {
+    if let Some(error_message) = &evidence.error {
+        return Err(error(format!(
+            "listener owner replacement probe failed: {error_message}"
+        )));
+    }
+    if evidence.unsupported.is_some() {
+        return Ok(DerivedFacts::ListenerOwnerReplacement {
+            supported: false,
+            receiver_count: evidence.receiver_count,
+            bound_addr: evidence.bound_addr,
+            relock_owner_peer: evidence.relock_owner_peer,
+        });
+    }
+    if evidence.successful_initial_bind_count != evidence.receiver_count {
+        return Err(error(format!(
+            "listener owner replacement bound {} of {} initial sockets",
+            evidence.successful_initial_bind_count, evidence.receiver_count
+        )));
+    }
+    let bound_addr = evidence
+        .bound_addr
+        .ok_or_else(|| error("replacement evidence omitted the bound address"))?;
+    if !evidence.replacement_bind_succeeded || evidence.replacement_addr != Some(bound_addr) {
+        return Err(error(format!(
+            "replacement did not bind the original address: original={bound_addr}, replacement={:?}",
+            evidence.replacement_addr
+        )));
+    }
+    if evidence.initial_owner_peer.is_none()
+        || !evidence.initial_owner_received
+        || evidence.initial_sibling_received
+    {
+        return Err(error(
+            "connected owner did not exclusively receive its admitted peer flow",
+        ));
+    }
+    let relock_owner_peer = evidence
+        .relock_owner_peer
+        .ok_or_else(|| error("replacement group did not select and reconnect a new owner"))?;
+    if !evidence.relock_owner_received {
+        return Err(error(
+            "new connected owner did not receive traffic after same-bind replacement",
+        ));
+    }
+    Ok(DerivedFacts::ListenerOwnerReplacement {
+        supported: true,
+        receiver_count: evidence.receiver_count,
+        bound_addr: Some(bound_addr),
+        relock_owner_peer: Some(relock_owner_peer),
     })
 }

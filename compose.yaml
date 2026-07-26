@@ -1,5 +1,6 @@
 x-alpine-service: &alpine-service
   image: pkthere-alpine-reality
+  init: true
   user: "0:0"
   cap_drop: ["ALL"]
   env_file: docker/alpine/topology.env

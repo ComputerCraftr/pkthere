@@ -2,9 +2,12 @@
 # will have compiled files and executables
 debug/
 target/
+.freebsd-cache/
 .artifacts/
 cross-artifacts/
 docker-artifacts/
+macos-profile-artifacts/
+*.log
 
 # pkthere ships executables, so Cargo.lock is committed for reproducible native
 # and cross-platform builds.

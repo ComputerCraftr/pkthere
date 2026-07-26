@@ -6,22 +6,37 @@ use pkthere_wire::SupportedProtocol;
 use socket2::Domain;
 use std::net::{SocketAddr, UdpSocket};
 
-pub const ALL_CONNECT_MODES: [bool; 2] = [false, true];
+pub const PRODUCTION_CONNECTION_SCENARIOS: [MatrixConnectionScenario; 1] =
+    [MatrixConnectionScenario::ProductionPolicy];
+pub const FORCED_UNCONNECTED_DEBUG_SCENARIOS: [MatrixConnectionScenario; 1] =
+    [MatrixConnectionScenario::ForcedUnconnectedDebug];
 pub const IPV4_ONLY_FAMILIES: [Domain; 1] = [Domain::IPV4];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixConnectionScenario {
+    ProductionPolicy,
+    ForcedUnconnectedDebug,
+}
+
+impl MatrixConnectionScenario {
+    pub const fn debug_force_unconnected(self) -> bool {
+        matches!(self, Self::ForcedUnconnectedDebug)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MatrixCase {
     pub family: Domain,
     pub proto: SupportedProtocol,
-    pub debug_client_unconnected: bool,
-    pub debug_upstream_unconnected: bool,
+    pub client_connection: MatrixConnectionScenario,
+    pub upstream_connection: MatrixConnectionScenario,
 }
 
 pub fn run_matrix_cases(
     families: &[Domain],
     protos: &[&str],
-    client_unconnected_modes: &[bool],
-    upstream_unconnected_modes: &[bool],
+    client_connection_scenarios: &[MatrixConnectionScenario],
+    upstream_connection_scenarios: &[MatrixConnectionScenario],
     mut run: impl FnMut(MatrixCase),
 ) {
     let cases = families
@@ -36,20 +51,20 @@ pub fn run_matrix_cases(
             })
         })
         .flat_map(|(family, proto)| {
-            client_unconnected_modes
+            client_connection_scenarios
                 .iter()
                 .copied()
-                .map(move |client_unconnected| (family, proto, client_unconnected))
+                .map(move |client_connection| (family, proto, client_connection))
         })
-        .flat_map(|(family, proto, debug_client_unconnected)| {
-            upstream_unconnected_modes
+        .flat_map(|(family, proto, client_connection)| {
+            upstream_connection_scenarios
                 .iter()
                 .copied()
-                .map(move |debug_upstream_unconnected| MatrixCase {
+                .map(move |upstream_connection| MatrixCase {
                     family,
                     proto,
-                    debug_client_unconnected,
-                    debug_upstream_unconnected,
+                    client_connection,
+                    upstream_connection,
                 })
         });
 

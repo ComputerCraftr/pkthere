@@ -80,12 +80,33 @@ pub fn run_cli_args_expect_running_with_stdout(
         }
     }
 
-    let observed = child.output_snapshot();
     let cleanup_deadline = Instant::now() + CHILD_CLEANUP_WAIT;
-    child
+    let completed = child
         .terminate_and_reap(cleanup_deadline)
         .unwrap_or_else(|error| panic!("clean up observed CLI command: {error}"));
-    RunningObservation::Running(observed)
+    RunningObservation::Running(completed.output)
+}
+
+pub fn run_cli_args_wait_for_stdout(
+    args: &[&str],
+    expected_line_fragment: &str,
+    wait: Duration,
+) -> CapturedOutput {
+    let mut child = spawn_cli(args, "CLI startup output");
+    let mut cursor = child.output_cursor();
+    let deadline = Instant::now() + wait;
+    if let Err(error) = child.wait_for_line(&mut cursor, deadline, expected_line_fragment, |line| {
+        line.contains(expected_line_fragment).then_some(())
+    }) {
+        let captured = error.output();
+        let stdout = captured.map_or_else(String::new, CapturedOutput::stdout_lossy);
+        let stderr = captured.map_or_else(String::new, CapturedOutput::stderr_lossy);
+        panic!("CLI startup output was not observed: {error}; stdout: {stdout}; stderr: {stderr}");
+    }
+    child
+        .terminate_and_reap(Instant::now() + CHILD_CLEANUP_WAIT)
+        .unwrap_or_else(|error| panic!("clean up CLI after startup output: {error}"))
+        .output
 }
 
 pub fn render_app_bin_path() -> String {
