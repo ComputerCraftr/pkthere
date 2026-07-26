@@ -176,7 +176,6 @@ fn emit_local_session_control_reply(
         crate::net::session::SendOutcome {
             result: &send_res,
             destination: &route.dest_sa,
-            disconnect: None,
             trace,
             trace_kind: crate::net::session::SendTraceKind::ReplySessionControl,
         },
@@ -238,7 +237,7 @@ mod tests {
     use crate::flow_key::{FlowTuple, SocketLegFlow};
     use crate::net::framing_shim::ReplyIdNegotiation;
     use crate::net::payload::PayloadEvent;
-    use crate::net::sock_mgr::{ListenerMetadata, SocketHandles, UpstreamMetadata};
+    use crate::net::sock_mgr::{ListenerMetadata, SocketHandles, StateVersion, UpstreamMetadata};
     use crate::worker_support::cache::CachedClientState;
     use crate::worker_support::test_support::udp_socket;
     use pkthere_socket_policy::{
@@ -326,7 +325,7 @@ mod tests {
                 .expect("upstream parser"),
             },
             udp_socket(),
-            0,
+            StateVersion::INITIAL,
         )
     }
 

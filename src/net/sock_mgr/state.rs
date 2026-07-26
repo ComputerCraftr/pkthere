@@ -71,12 +71,6 @@ impl DerefMut for UpstreamState {
     }
 }
 
-pub(super) struct ReresolveResult<M> {
-    pub(super) sock: ManagedSocket,
-    pub(super) metadata: Arc<M>,
-    pub(super) update: SocketUpdateKind,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SocketUpdateKind {
     Unchanged,
@@ -112,6 +106,7 @@ pub(super) enum ReresolveAction {
 }
 
 #[inline]
+#[cfg(all(test, not(miri)))]
 pub(super) fn decide_listener_reresolve(
     prev: LogicalEndpoint,
     resolved: SocketAddr,
@@ -132,6 +127,7 @@ pub(super) fn decide_listener_endpoint_update(
 }
 
 #[inline]
+#[cfg(all(test, not(miri)))]
 pub(super) fn decide_upstream_reresolve(
     prev: LogicalEndpoint,
     resolved: SocketAddr,

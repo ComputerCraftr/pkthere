@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dev-dependencies]
+loom = "0.7.2"
 pkthere-test-support = { path = "tests/support" }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"

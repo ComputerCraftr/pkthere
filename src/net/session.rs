@@ -1,6 +1,5 @@
 use crate::net::managed_socket::ManagedSendResult;
 use crate::net::payload::PayloadEvent;
-use crate::net::sock_mgr::{SocketHandles, SocketManager};
 use crate::packet_trace::PacketTraceId;
 use crate::worker_support::PacketContext;
 use crate::worker_support::{PacketDisposition, log_packet_send_disposition};
@@ -9,10 +8,9 @@ use socket2::SockAddr;
 use std::io;
 use std::time::Instant;
 
-pub(crate) struct SendOutcome<'a, 'b> {
+pub(crate) struct SendOutcome<'a> {
     pub(crate) result: &'a io::Result<ManagedSendResult>,
     pub(crate) destination: &'a SockAddr,
-    pub(crate) disconnect: Option<(&'b mut SocketHandles, &'b SocketManager)>,
     pub(crate) trace: Option<PacketTraceId>,
     pub(crate) trace_kind: SendTraceKind,
 }
@@ -33,7 +31,7 @@ pub(crate) fn handle_send_result(
     context: PacketContext<'_>,
     c2u: bool,
     event: &PayloadEvent<'_>,
-    outcome: SendOutcome<'_, '_>,
+    outcome: SendOutcome<'_>,
 ) -> HandledSendOutcome {
     let PacketContext {
         worker_id,
@@ -45,7 +43,6 @@ pub(crate) fn handle_send_result(
     let SendOutcome {
         result: send_res,
         destination: dest_sa,
-        disconnect: disconnect_ctx,
         trace,
         trace_kind,
     } = outcome;
@@ -65,24 +62,11 @@ pub(crate) fn handle_send_result(
                 stats.send_add(c2u, event.payload_len() as u64, t_recv, t_send);
             }
 
-            if res.association_changed()
-                && let Some((handles, sock_mgr)) = disconnect_ctx
-            {
-                let prev_ver = handles.version;
+            if res.association_changed() {
                 log_warn_dir!(
                     worker_id,
                     c2u,
                     "send_payload recovered from EDESTADDRREQ with an unconnected send"
-                );
-                handles.version = sock_mgr.publish_client_association_change();
-                log_debug_dir!(
-                    cfg.debug_logs.handles,
-                    worker_id,
-                    c2u,
-                    "publish managed association change: addr={:?} ver {}->{}",
-                    handles.listener.flow,
-                    prev_ver,
-                    handles.version
                 );
             }
             if let Some(trace) = trace {
@@ -167,7 +151,6 @@ mod tests {
         let outcome = SendOutcome {
             result: &err_res,
             destination: &SockAddr::from(SocketAddr::from_str("127.0.0.1:0").unwrap()),
-            disconnect: None,
             trace: Some(PacketTraceId {
                 worker_id: 1,
                 c2u: true,

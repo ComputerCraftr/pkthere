@@ -6,7 +6,7 @@ use super::{
 use crate::cli::{SupportedProtocol, WorkerFlowMode};
 use crate::net::icmp_sequence::IcmpSequenceCache;
 use crate::net::payload::PayloadEvent;
-use crate::net::sock_mgr::SocketHandles;
+use crate::net::sock_mgr::{ManagerError, SocketHandles};
 use std::time::Instant;
 
 const C2U: bool = false;
@@ -16,7 +16,7 @@ fn update_upstream_peer_ids(
     handles: &mut SocketHandles,
     peer_source_id: u16,
     peer_reply_id: u16,
-) -> bool {
+) -> Result<bool, ManagerError> {
     let changed = handles.upstream.upstream_remote_filter.id() != peer_reply_id
         || handles
             .upstream
@@ -29,7 +29,7 @@ fn update_upstream_peer_ids(
             .outbound
             .is_some_and(|flow| flow.dst.id() != peer_reply_id);
     if context.cfg.upstream_proto != SupportedProtocol::ICMP || !changed {
-        return false;
+        return Ok(false);
     }
 
     log_info!(
@@ -40,24 +40,20 @@ fn update_upstream_peer_ids(
     if context.cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
         for manager in context.all_sock_mgrs {
             let local_manager = std::ptr::eq(manager.as_ref(), context.sock_mgr);
-            let previous_version = if local_manager {
-                handles.version
-            } else {
-                manager.get_version()
-            };
-            let version =
-                manager.set_upstream_peer_ids(peer_source_id, peer_reply_id, previous_version);
+            let update = manager.set_upstream_peer_ids(peer_source_id, peer_reply_id)?;
+            debug_assert_eq!(update.version, update.handles.version);
             if local_manager {
-                handles.version = version;
+                *handles = update.handles;
             }
         }
     } else {
-        handles.version =
-            context
-                .sock_mgr
-                .set_upstream_peer_ids(peer_source_id, peer_reply_id, handles.version);
+        let update = context
+            .sock_mgr
+            .set_upstream_peer_ids(peer_source_id, peer_reply_id)?;
+        debug_assert_eq!(update.version, update.handles.version);
+        *handles = update.handles;
     }
-    true
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -87,7 +83,15 @@ pub(super) fn consume_reply_id_ack(
             peer_reply_id,
             trigger_trace,
         } => {
-            if update_upstream_peer_ids(context, handles, peer_source_id, peer_reply_id) {
+            let updated =
+                match update_upstream_peer_ids(context, handles, peer_source_id, peer_reply_id) {
+                    Ok(updated) => updated,
+                    Err(error) => {
+                        log_error!("upstream peer-ID topology update failed: {}", error);
+                        return true;
+                    }
+                };
+            if updated {
                 *handles = context.sock_mgr.refresh_handles();
                 client_cache.refresh_from_handles(handles);
                 c2u_cache.refresh_from_handles(handles);

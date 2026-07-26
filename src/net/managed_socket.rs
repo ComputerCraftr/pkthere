@@ -213,6 +213,23 @@ impl ManagedSocket {
         self.association().is_connected()
     }
 
+    #[cfg(all(test, not(miri)))]
+    pub(crate) fn poison_association_for_test(&self, operation: AssociationOperation) {
+        let mut state = self.lock_association();
+        let (previous_peer, epoch) = match *state {
+            AssociationState::Unconnected { epoch } => (None, epoch + 1),
+            AssociationState::Connected { peer, epoch } => (Some(peer), epoch + 1),
+            AssociationState::Poisoned { .. } => {
+                panic!("test socket association is already poisoned")
+            }
+        };
+        *state = AssociationState::Poisoned {
+            operation,
+            previous_peer,
+            epoch,
+        };
+    }
+
     pub(crate) fn connect_unconnected(&self, peer: SocketAddr) -> Result<(), ManagedSocketError> {
         let mut state = self.lock_association();
         let epoch = match *state {

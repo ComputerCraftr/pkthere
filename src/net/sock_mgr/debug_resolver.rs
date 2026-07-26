@@ -136,16 +136,15 @@ mod tests {
     use super::{DebugAddressResolver, DebugResolverDecision};
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     fn resolver(contents: &str) -> DebugAddressResolver {
         let path = std::env::temp_dir().join(format!(
             "pkthere-debug-resolver-{}-{}.json",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
+            FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::write(&path, contents).expect("write resolver fixture");
         DebugAddressResolver::new(path)

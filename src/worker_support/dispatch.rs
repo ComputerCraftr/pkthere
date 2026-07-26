@@ -185,7 +185,6 @@ pub(crate) fn send_user_payload_event(
                 crate::net::session::SendOutcome {
                     result: &send_res,
                     destination: &cache.route.dest_sa,
-                    disconnect: None,
                     trace: None,
                     trace_kind: crate::net::session::SendTraceKind::Forward,
                 },
@@ -255,7 +254,6 @@ pub(crate) fn send_payload_event_now(
         crate::net::session::SendOutcome {
             result: &send_res,
             destination: &cache.route.dest_sa,
-            disconnect: None,
             trace,
             trace_kind: crate::net::session::SendTraceKind::Forward,
         },
@@ -373,7 +371,6 @@ pub(crate) fn send_sync_payload_or_cadence(
                 crate::net::session::SendOutcome {
                     result: &send_res,
                     destination: &cache.route.dest_sa,
-                    disconnect: None,
                     trace: None,
                     trace_kind: crate::net::session::SendTraceKind::Forward,
                 },
@@ -415,7 +412,6 @@ pub(crate) fn send_sync_payload_or_cadence(
         crate::net::session::SendOutcome {
             result: &send_res,
             destination: &cache.route.dest_sa,
-            disconnect: None,
             trace,
             trace_kind: crate::net::session::SendTraceKind::Forward,
         },
@@ -681,7 +677,7 @@ mod tests {
     use crate::flow_state::FlowRuntimeState;
     use crate::net::payload::BufferedPayload;
     use crate::net::payload::PayloadEvent;
-    use crate::net::sock_mgr::{ListenerMetadata, SocketHandles, UpstreamMetadata};
+    use crate::net::sock_mgr::{ListenerMetadata, SocketHandles, StateVersion, UpstreamMetadata};
     use crate::worker_support::PacketTraceId;
     use crate::worker_support::admission_test_support::test_config;
     use crate::worker_support::test_support::udp_socket;
@@ -765,7 +761,7 @@ mod tests {
                 .expect("upstream parser"),
             },
             udp_socket(),
-            0,
+            StateVersion::INITIAL,
         )
     }
 

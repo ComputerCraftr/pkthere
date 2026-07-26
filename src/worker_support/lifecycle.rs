@@ -1,9 +1,9 @@
 use crate::cli::{RuntimeConfig, TimeoutAction, WorkerFlowMode};
 use crate::flow_claim::FlowClaimTable;
-use crate::flow_state::FlowRuntimeState;
+use crate::flow_state::{ClientLockTransactionGuard, FlowRuntimeState};
 use crate::net::sock_mgr::{
-    DebugAddressResolver, DebugAddressRevision, DebugResolverDecision, ReresolveSummary,
-    SocketManager, socket_evidence_key_json,
+    DebugAddressResolver, DebugAddressRevision, DebugResolverDecision, ManagerError,
+    ReresolveSummary, SocketManager, socket_evidence_key_json,
 };
 use crate::worker_support::handshake_trace::{log_handshake_reset, log_handshake_timeout};
 use crate::worker_support::packet_dump::{PacketDisposition, log_packet_disposition};
@@ -39,25 +39,18 @@ pub(crate) fn run_reresolve_thread(
             );
             continue;
         }
-        for (worker_pair, sock_mgr) in sock_mgrs.iter().enumerate() {
-            match sock_mgr.reresolve_with_addresses(
-                allow_upstream,
-                allow_listen_rebind,
-                "Periodic re-resolve",
-                None,
-                None,
-            ) {
-                Ok(summary) => apply_listener_rebind_reset(
-                    cfg,
-                    flow_states,
-                    flow_claims,
-                    worker_pair,
-                    &summary,
-                ),
-                Err(err) => {
-                    crate::log_warn!("Periodic re-resolve failed: {}", err);
-                }
-            }
+        if let Err(error) = reresolve_all(
+            cfg,
+            sock_mgrs,
+            flow_states,
+            flow_claims,
+            allow_upstream,
+            allow_listen_rebind,
+            "Periodic re-resolve",
+            None,
+            None,
+        ) {
+            crate::log_warn!("Periodic re-resolve failed: {}", error);
         }
     }
 }
@@ -89,38 +82,30 @@ fn run_debug_reresolve(
             }));
         }
         DebugResolverDecision::Apply(update) => {
-            let mut summaries = Vec::with_capacity(sock_mgrs.len());
-            for (worker_pair, sock_mgr) in sock_mgrs.iter().enumerate() {
-                match sock_mgr.reresolve_with_addresses(
-                    allow_upstream,
-                    allow_listen_rebind,
-                    "Debug revisioned re-resolve",
-                    update.listen_addr,
-                    update.upstream_addr,
-                ) {
-                    Ok(summary) => {
-                        apply_listener_rebind_reset(
-                            cfg,
-                            flow_states,
-                            flow_claims,
-                            worker_pair,
-                            &summary,
-                        );
-                        summaries.push(summary);
-                    }
-                    Err(error) => {
-                        log_resolver_evidence(serde_json::json!({
-                            "revision": update.revision,
-                            "listen_addr": update.listen_addr.map(|addr| addr.to_string()),
-                            "upstream_addr": update.upstream_addr.map(|addr| addr.to_string()),
-                            "parse_result": "valid",
-                            "application_result": "failed",
-                            "reason": error.to_string(),
-                        }));
-                        return;
-                    }
+            let summaries = match reresolve_all(
+                cfg,
+                sock_mgrs,
+                flow_states,
+                flow_claims,
+                allow_upstream,
+                allow_listen_rebind,
+                "Debug revisioned re-resolve",
+                update.listen_addr,
+                update.upstream_addr,
+            ) {
+                Ok(summaries) => summaries,
+                Err(error) => {
+                    log_resolver_evidence(serde_json::json!({
+                        "revision": update.revision,
+                        "listen_addr": update.listen_addr.map(|addr| addr.to_string()),
+                        "upstream_addr": update.upstream_addr.map(|addr| addr.to_string()),
+                        "parse_result": "valid",
+                        "application_result": "failed",
+                        "reason": error.to_string(),
+                    }));
+                    return;
                 }
-            }
+            };
             for summary in &summaries {
                 log_applied_summary(update, summary);
             }
@@ -129,23 +114,83 @@ fn run_debug_reresolve(
     }
 }
 
-fn apply_listener_rebind_reset(
+#[allow(clippy::too_many_arguments)]
+fn reresolve_all(
     cfg: &RuntimeConfig,
+    sock_mgrs: &[Arc<SocketManager>],
     flow_states: &[Arc<FlowRuntimeState>],
     flow_claims: Option<&FlowClaimTable>,
-    worker_pair: usize,
-    summary: &ReresolveSummary,
+    allow_upstream: bool,
+    allow_listen_rebind: bool,
+    context: &str,
+    listen_addr: Option<std::net::SocketAddr>,
+    upstream_addr: Option<std::net::SocketAddr>,
+) -> Result<Vec<ReresolveSummary>, ManagerError> {
+    let mut unique_flow_states = Vec::<&FlowRuntimeState>::new();
+    for state in flow_states {
+        if !unique_flow_states
+            .iter()
+            .any(|existing| std::ptr::eq(*existing, state.as_ref()))
+        {
+            unique_flow_states.push(state.as_ref());
+        }
+    }
+    let flow_transactions = unique_flow_states
+        .iter()
+        .map(|state| state.client_lock_transaction())
+        .collect::<Vec<_>>();
+    let managers = sock_mgrs.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    SocketManager::reresolve_group_with_addresses(
+        &managers,
+        allow_upstream,
+        allow_listen_rebind,
+        context,
+        listen_addr,
+        upstream_addr,
+        |summaries| {
+            apply_listener_rebind_resets(cfg, &flow_transactions, flow_claims, summaries);
+        },
+    )
+}
+
+fn apply_listener_rebind_resets(
+    cfg: &RuntimeConfig,
+    flow_transactions: &[ClientLockTransactionGuard<'_>],
+    flow_claims: Option<&FlowClaimTable>,
+    summaries: &[ReresolveSummary],
 ) {
-    if !summary.listener_replaced() {
+    if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
+        let Some(summary) = summaries.iter().find(|summary| summary.listener_replaced()) else {
+            return;
+        };
+        reset_rebound_flow(cfg, &flow_transactions[0], flow_claims, summary);
         return;
     }
-    let _transaction_guard = flow_states[worker_pair].client_lock_transaction();
-    let reset = flow_states[worker_pair].reset();
+    for summary in summaries
+        .iter()
+        .filter(|summary| summary.listener_replaced())
+    {
+        let worker_pair =
+            usize::try_from(summary.socket_slot).expect("socket slot fits worker index");
+        reset_rebound_flow(cfg, &flow_transactions[worker_pair], flow_claims, summary);
+    }
+}
+
+fn reset_rebound_flow(
+    cfg: &RuntimeConfig,
+    flow_transaction: &ClientLockTransactionGuard<'_>,
+    flow_claims: Option<&FlowClaimTable>,
+    summary: &ReresolveSummary,
+) {
+    let reset = flow_transaction.reset();
     if let Some(trace) = reset.and_then(|payload| payload.buffered_trace) {
         log_packet_disposition(cfg, trace, PacketDisposition::HandshakeResetDrop);
     }
     if let (Some(claims), Some(flow)) = (flow_claims, summary.old_locked_flow) {
-        claims.release(flow, worker_pair);
+        claims.release(
+            flow,
+            usize::try_from(summary.socket_slot).expect("socket slot fits worker index"),
+        );
     }
 }
 
@@ -235,28 +280,34 @@ pub(crate) fn run_watchdog_thread(
                     }
                     let managers_to_clear: Vec<_> =
                         if cfg.worker_flow_mode == WorkerFlowMode::SharedFlow {
-                            sock_mgrs.iter().collect()
+                            sock_mgrs.iter().map(Arc::as_ref).collect()
                         } else {
-                            vec![&sock_mgrs[idx]]
+                            vec![sock_mgrs[idx].as_ref()]
                         };
-                    for mgr in managers_to_clear {
-                        let prev = mgr.get_version();
-                        let ver = match mgr.clear_client_lock() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                log_error!("watchdog client-lock cleanup failed: {}", e);
-                                exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
-                                return;
-                            }
-                        };
+                    let previous_versions = managers_to_clear
+                        .iter()
+                        .map(|manager| manager.current_version())
+                        .collect::<Vec<_>>();
+                    let cleared = match SocketManager::clear_client_flow_group(
+                        &managers_to_clear,
+                        &_transaction_guard,
+                    ) {
+                        Ok(cleared) => cleared,
+                        Err(e) => {
+                            log_error!("watchdog client-lock cleanup failed: {}", e);
+                            exit_code_set.store((1 << 31) | 1, AtomOrdering::Relaxed);
+                            return;
+                        }
+                    };
+                    for (prev, update) in previous_versions.iter().zip(&cleared.updates) {
                         log_debug!(
                             cfg.debug_logs.handles,
                             "watchdog publish disconnect: ver {}->{}",
                             prev,
-                            ver
+                            update.version
                         );
                     }
-                    let reset_payload = flow_state.reset();
+                    let reset_payload = cleared.dropped_handshake;
                     if let Some(dropped) = reset_payload
                         && let Some(trace) = dropped.buffered_trace
                     {

@@ -1,7 +1,5 @@
 use super::client::ClientWorkerContext;
-use super::client_lock::{
-    ClientLockTransactionError, accept_pending_negotiation, publish_client_lock,
-};
+use super::client_lock::{accept_pending_negotiation, publish_client_lock};
 use super::packet_admission::AdmittedWirePacket;
 use super::{
     BufferedSyncUpdate, CachedClientState, PacketContext, PacketDisposition, PacketTraceId,
@@ -11,7 +9,7 @@ use super::{
 use crate::cli::SupportedProtocol;
 use crate::net::icmp_sequence::IcmpSequenceCache;
 use crate::net::payload::{BufferedPayload, PayloadEvent};
-use crate::net::sock_mgr::SocketHandles;
+use crate::net::sock_mgr::{ManagerError, SocketHandles};
 use std::time::Instant;
 
 const C2U: bool = true;
@@ -153,7 +151,7 @@ pub(super) fn process_client_packet(
     upstream_side_cache: &mut IcmpSequenceCache,
     was_locked: &mut bool,
     admitted: AdmittedWirePacket<'_>,
-) -> Result<(), ClientLockTransactionError> {
+) -> Result<(), ManagerError> {
     let trace = admitted.trace.expect("received packet trace");
     let received_at = Instant::now();
     if context.flow_state.is_locked() {

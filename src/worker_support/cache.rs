@@ -193,8 +193,8 @@ impl CachedClientState {
         sock_mgr: &SocketManager,
         handles: &mut SocketHandles,
     ) {
-        if handles.version != sock_mgr.get_version() {
-            let prev_ver = handles.version;
+        if handles.version != sock_mgr.current_version() {
+            let previous_version = handles.version;
             *handles = sock_mgr.refresh_handles();
             self.refresh_from_handles(handles);
             log_debug_dir!(
@@ -202,7 +202,7 @@ impl CachedClientState {
                 self.worker_id,
                 self.c2u,
                 "refresh_handles_and_cache: stale={}, new_ver={}, listener_flow={:?}, listen_kernel_addr={}, listener_connected={}, upstream_remote_filter={}, upstream_connected={}",
-                prev_ver,
+                previous_version,
                 handles.version,
                 handles.listener.listener_flow,
                 handles.listener.listen_local_kernel_addr,
@@ -223,7 +223,7 @@ mod tests {
     };
     use crate::endpoint::LogicalEndpoint;
     use crate::flow_key::{ClientFlowKey, FlowTuple, SocketLegFlow};
-    use crate::net::sock_mgr::{ListenerMetadata, UpstreamMetadata};
+    use crate::net::sock_mgr::{ListenerMetadata, StateVersion, UpstreamMetadata};
     use crate::worker_support::test_support::udp_socket;
     use pkthere_socket_policy::{
         IcmpPolicyIntent, SocketRole, resolve_socket_policy_with_icmp_intent,
@@ -348,7 +348,7 @@ mod tests {
                 .expect("upstream parser"),
             },
             udp_socket(),
-            0,
+            StateVersion::INITIAL,
         )
     }
 

@@ -15,6 +15,8 @@ use socket2::{Domain, Type};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 
+mod transaction_tests;
+
 fn make_mgr() -> SocketManager {
     make_mgr_with_slot(0)
 }
@@ -43,7 +45,7 @@ fn make_mgr_with_slot(socket_slot: u32) -> SocketManager {
         listen_local_filter: actual_listen,
         listen_local_kernel_addr,
         listen_sock_type,
-        listen_target: actual_listen.to_socket_addr().to_string(),
+        listen_target: listen_addr.to_string(),
         listen_proto: SupportedProtocol::UDP,
         listen_policy,
         listen_worker_socket_policy: listener_worker_socket_policy(1, false),
@@ -114,9 +116,9 @@ fn refresh_notices_raced_updates() {
     .expect("establish client flow");
     mgr.clear_client_lock().expect("clear client flow");
 
-    assert_ne!(cached.version, mgr.get_version());
+    assert_ne!(cached.version, mgr.current_version());
     cached = mgr.refresh_handles();
-    assert_eq!(cached.version, mgr.get_version());
+    assert_eq!(cached.version, mgr.current_version());
     assert_eq!(cached.listener.flow, None);
     assert!(!cached.listener_connected());
 }
@@ -166,7 +168,7 @@ fn listener_reresolve_uses_logical_endpoint_refresh_rules() {
 #[test]
 fn unconnected_client_flow_publishes_metadata_without_socket_association() {
     let mgr = make_mgr();
-    let before = mgr.get_version();
+    let before = mgr.current_version();
     let client = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33334);
     let key = ClientFlowKey::Udp(LogicalEndpoint::from_socket_addr(client));
 
@@ -175,7 +177,7 @@ fn unconnected_client_flow_publishes_metadata_without_socket_association() {
         .expect("establish an explicitly unconnected client flow");
     let handles = mgr.refresh_handles();
 
-    assert_eq!(published, before + 1);
+    assert_eq!(published.get(), before.get() + 1);
     assert_eq!(handles.listener.flow, Some(key));
     assert!(!handles.listener_connected());
 }
@@ -253,7 +255,7 @@ fn snapshot_preserves_role_specific_identity_names() {
 #[test]
 fn upstream_peer_update_applies_source_id_when_reply_id_is_unchanged() {
     let mgr = make_mgr();
-    let v0 = mgr.get_version();
+    let v0 = mgr.current_version();
     let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     {
         let mut up = mgr.upstream_state.lock().unwrap();
@@ -270,7 +272,11 @@ fn upstream_peer_update_applies_source_id_when_reply_id_is_unchanged() {
         );
     }
 
-    mgr.set_upstream_peer_ids(7777, 9999, v0);
+    let update = mgr
+        .set_upstream_peer_ids(7777, 9999)
+        .expect("publish upstream peer IDs");
+    assert_eq!(update.version, update.handles.version);
+    assert_ne!(update.version, v0);
     let handles = mgr.refresh_handles();
     assert_eq!(handles.upstream.upstream_remote_filter.id(), 9999);
     assert_eq!(
@@ -292,6 +298,31 @@ fn upstream_peer_update_applies_source_id_when_reply_id_is_unchanged() {
             .dst
             .id(),
         9999
+    );
+}
+
+#[test]
+fn upstream_peer_id_no_op_returns_one_coherent_snapshot_without_incrementing() {
+    let mgr = make_mgr();
+    let before = mgr.refresh_handles();
+    let source_id = before
+        .upstream
+        .upstream_flow
+        .inbound
+        .expect("initial inbound flow")
+        .src
+        .id();
+    let reply_id = before.upstream.upstream_remote_filter.id();
+
+    let update = mgr
+        .set_upstream_peer_ids(source_id, reply_id)
+        .expect("no-op upstream peer IDs");
+
+    assert_eq!(update.version, before.version);
+    assert_eq!(update.version, update.handles.version);
+    assert_eq!(
+        update.handles.upstream.upstream_remote_filter,
+        before.upstream.upstream_remote_filter
     );
 }
 

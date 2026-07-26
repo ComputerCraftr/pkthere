@@ -1,4 +1,5 @@
 use super::{PolicyFinding, PolicyKind, line};
+use quote::ToTokens;
 use std::collections::BTreeSet;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
@@ -80,6 +81,22 @@ pub(super) fn analyze_function(
     block: &syn::Block,
 ) -> Vec<PolicyFinding> {
     let mut findings = Vec::new();
+    if path == "src/net/sock_mgr/manager.rs"
+        && function == "publish_prechecked"
+        && !inputs
+            .to_token_stream()
+            .to_string()
+            .contains("ManagerTransactionGuard")
+    {
+        findings.push(PolicyFinding {
+            kind: PolicyKind::ManagerVersionAuthority,
+            path: path.to_string(),
+            line: line(block.brace_token.span.open()),
+            item: format!("{function}()"),
+            cfg_domain: cfg_domain.clone(),
+            detail: "manager publication requires a typed transaction guard".to_string(),
+        });
+    }
     if path.starts_with("src/")
         && !is_test
         && function == "disconnect_socket"
@@ -112,6 +129,34 @@ pub(super) fn analyze_function(
         );
     }
     visitor.findings
+}
+
+pub(super) fn analyze_struct(
+    path: &str,
+    cfg_domain: String,
+    item: &syn::ItemStruct,
+) -> Vec<PolicyFinding> {
+    if !path.starts_with("src/net/sock_mgr/") || path == "src/net/sock_mgr/version.rs" {
+        return Vec::new();
+    }
+    item.fields
+        .iter()
+        .filter(|field| {
+            field
+                .ident
+                .as_ref()
+                .is_some_and(|ident| ident.to_string().contains("version"))
+                && field.ty.to_token_stream().to_string().contains("AtomicU64")
+        })
+        .map(|field| PolicyFinding {
+            kind: PolicyKind::ManagerVersionAuthority,
+            path: path.to_string(),
+            line: line(field.span()),
+            item: item.ident.to_string(),
+            cfg_domain: cfg_domain.clone(),
+            detail: "manager version atomics belong to the version clock".to_string(),
+        })
+        .collect()
 }
 
 fn connection_bool_parameters(
@@ -166,8 +211,61 @@ impl SocketAuthorityVisitor<'_> {
 }
 
 impl<'ast> Visit<'ast> for SocketAuthorityVisitor<'_> {
+    fn visit_ident(&mut self, ident: &'ast syn::Ident) {
+        if self.path.starts_with("src/net/sock_mgr/") && ident == "prev_ver" {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::ManagerVersionAuthority,
+                path: self.path.to_string(),
+                line: line(ident.span()),
+                item: ident.to_string(),
+                cfg_domain: self.cfg_domain.clone(),
+                detail: "manager versions are allocated by VersionClock, never by callers"
+                    .to_string(),
+            });
+        }
+        syn::visit::visit_ident(self, ident);
+    }
+
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let production_source = self.path.starts_with("src/");
+        if self.path.starts_with("src/net/sock_mgr/")
+            && self.path != "src/net/sock_mgr/version.rs"
+            && call.method == "fetch_update"
+            && call
+                .receiver
+                .to_token_stream()
+                .to_string()
+                .contains("version")
+        {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::ManagerVersionAuthority,
+                path: self.path.to_string(),
+                line: line(call.method.span()),
+                item: format!("{}()", self.function),
+                cfg_domain: self.cfg_domain.clone(),
+                detail: "direct manager version allocation belongs to VersionClock".to_string(),
+            });
+        }
+        if self.path.starts_with("src/net/sock_mgr/")
+            && self.path != "src/net/sock_mgr/version.rs"
+            && self.function != "publish_prechecked"
+            && call.method == "publish_prechecked"
+            && call
+                .receiver
+                .to_token_stream()
+                .to_string()
+                .contains("version")
+        {
+            self.findings.push(PolicyFinding {
+                kind: PolicyKind::ManagerVersionAuthority,
+                path: self.path.to_string(),
+                line: line(call.method.span()),
+                item: format!("{}()", self.function),
+                cfg_domain: self.cfg_domain.clone(),
+                detail: "manager publication must pass through its transaction-guarded wrapper"
+                    .to_string(),
+            });
+        }
         if production_source && !self.is_test && call.method == "try_clone" {
             self.record(
                 call.method.span(),

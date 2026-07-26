@@ -42,6 +42,7 @@ pub(crate) enum PolicyKind {
     UnconditionalDebug,
     RetiredEndpointAuthority,
     SocketLifecycleAuthority,
+    ManagerVersionAuthority,
 }
 
 impl PolicyKind {
@@ -54,6 +55,7 @@ impl PolicyKind {
             Self::UnconditionalDebug => "unconditional debug emission",
             Self::RetiredEndpointAuthority => "retired endpoint authority",
             Self::SocketLifecycleAuthority => "socket lifecycle authority violation",
+            Self::ManagerVersionAuthority => "socket-manager version authority violation",
         }
     }
 }
@@ -207,6 +209,10 @@ pub fn assert_endpoint_and_socket_authority_is_centralized() {
         PolicyKind::RetiredEndpointAuthority,
         PolicyKind::SocketLifecycleAuthority,
     ]);
+}
+
+pub fn assert_manager_version_authority_is_transactional() {
+    assert_no_findings(&[PolicyKind::ManagerVersionAuthority]);
 }
 
 pub fn assert_legacy_text_scanners_are_forbidden() {
@@ -516,6 +522,12 @@ impl<'ast> Visit<'ast> for AstCollector<'_> {
                 }
             }
         }
+        self.findings
+            .extend(socket_authority_policy::analyze_struct(
+                self.path,
+                self.cfg_domain(),
+                item,
+            ));
         syn::visit::visit_item_struct(self, item);
     }
 

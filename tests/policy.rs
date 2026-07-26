@@ -61,6 +61,11 @@ fn endpoint_and_socket_authority_is_centralized() {
 }
 
 #[test]
+fn manager_version_authority_is_transactional() {
+    policy::assert_manager_version_authority_is_transactional();
+}
+
+#[test]
 fn test_harness_lifecycle_boundaries_are_centralized() {
     harness_policy::assert_test_harness_lifecycle_boundaries();
 }

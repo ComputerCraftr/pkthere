@@ -1,12 +1,14 @@
 use crate::cli::{IcmpReplyIdRequest, SupportedProtocol, TimeoutAction};
 use crate::endpoint::LogicalEndpoint;
 use crate::flow_key::{ClientFlowKey, SocketLegFlow};
+use crate::flow_state::DroppedReplyIdHandshake;
 use crate::net::managed_socket::ManagedSocket;
 use pkthere_socket_policy::{ListenerWorkerSocketPolicy, ResolvedSocketPolicy, SocketEvidenceKey};
 use socket2::Type;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use super::StateVersion;
 use super::state::{ListenerMetadata, UpstreamMetadata};
 
 /// Snapshot of sockets and destination used by worker threads.
@@ -15,7 +17,7 @@ pub(crate) struct SocketHandles {
     pub client_sock: ManagedSocket,
     pub upstream: Arc<UpstreamMetadata>,
     pub upstream_sock: ManagedSocket,
-    pub version: u64,
+    pub version: StateVersion,
 }
 
 impl SocketHandles {
@@ -35,7 +37,7 @@ impl SocketHandles {
         client_sock: ManagedSocket,
         upstream: UpstreamMetadata,
         upstream_sock: ManagedSocket,
-        version: u64,
+        version: StateVersion,
     ) -> Self {
         Self {
             listener: Arc::new(listener),
@@ -43,6 +45,25 @@ impl SocketHandles {
             upstream: Arc::new(upstream),
             upstream_sock,
             version,
+        }
+    }
+}
+
+pub(crate) struct PublishedUpdate {
+    pub(crate) version: StateVersion,
+    pub(crate) handles: SocketHandles,
+}
+
+pub(crate) struct ClearedClientFlow {
+    pub(crate) updates: Vec<PublishedUpdate>,
+    pub(crate) dropped_handshake: Option<DroppedReplyIdHandshake>,
+}
+
+impl PublishedUpdate {
+    pub(crate) fn new(handles: SocketHandles) -> Self {
+        Self {
+            version: handles.version,
+            handles,
         }
     }
 }

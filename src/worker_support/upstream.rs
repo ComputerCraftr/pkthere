@@ -237,7 +237,6 @@ pub(crate) fn run_upstream_to_client_thread(context: UpstreamWorkerContext<'_>) 
                         SendOutcome {
                             result: &send_res,
                             destination: &cache.route.dest_sa,
-                            disconnect: Some((&mut handles, sock_mgr)),
                             trace: Some(trace),
                             trace_kind: crate::net::session::SendTraceKind::Forward,
                         },

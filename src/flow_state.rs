@@ -14,6 +14,28 @@ pub(crate) struct FlowRuntimeState {
     client_lock_transaction: Mutex<()>,
 }
 
+pub(crate) struct ClientLockTransactionGuard<'a> {
+    state: &'a FlowRuntimeState,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl ClientLockTransactionGuard<'_> {
+    #[inline]
+    pub(crate) fn is_locked(&self) -> bool {
+        self.state.is_locked()
+    }
+
+    #[inline]
+    pub(crate) fn publish_locked(&self) {
+        self.state.set_locked(true);
+    }
+
+    #[inline]
+    pub(crate) fn reset(&self) -> Option<DroppedReplyIdHandshake> {
+        self.state.reset()
+    }
+}
+
 impl FlowRuntimeState {
     pub fn new() -> Self {
         Self {
@@ -28,12 +50,12 @@ impl FlowRuntimeState {
 
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.locked.load(AtomOrdering::Relaxed)
+        self.locked.load(AtomOrdering::Acquire)
     }
 
     #[inline]
     pub fn set_locked(&self, locked: bool) {
-        self.locked.store(locked, AtomOrdering::Relaxed);
+        self.locked.store(locked, AtomOrdering::Release);
         if !locked {
             self.last_seen_s.store(0, AtomOrdering::Relaxed);
             self.upstream_reply_id_acked
@@ -48,8 +70,11 @@ impl FlowRuntimeState {
     /// Shared-flow worker pairs use the same `FlowRuntimeState`, so this guard
     /// prevents two workers from interleaving their manager transactions.
     #[inline]
-    pub(crate) fn client_lock_transaction(&self) -> MutexGuard<'_, ()> {
-        self.client_lock_transaction.lock().unwrap()
+    pub(crate) fn client_lock_transaction(&self) -> ClientLockTransactionGuard<'_> {
+        ClientLockTransactionGuard {
+            state: self,
+            _guard: self.client_lock_transaction.lock().unwrap(),
+        }
     }
 
     #[inline]

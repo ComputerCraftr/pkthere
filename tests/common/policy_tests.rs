@@ -78,6 +78,51 @@ fn socket_authority_rejects_boolean_send_selection() {
 }
 
 #[test]
+fn manager_version_policy_rejects_cached_arithmetic_and_direct_atomic_allocation() {
+    let source = r#"
+        struct Manager {
+            version_counter: AtomicU64,
+        }
+        impl Manager {
+            fn publish(&self, prev_ver: u64) -> u64 {
+                self.version_counter.fetch_update(Ordering::Release, Ordering::Relaxed, |value| value.checked_add(1)).unwrap();
+                self.version.publish_prechecked(capacity);
+                prev_ver + 1
+            }
+        }
+    "#;
+    assert!(
+        findings_at(
+            "src/net/sock_mgr/fixture.rs",
+            source,
+            PolicyKind::ManagerVersionAuthority,
+        )
+        .len()
+            >= 4
+    );
+}
+
+#[test]
+fn manager_publication_requires_typed_transaction_guard() {
+    let source = r#"
+        impl SocketManager {
+            fn publish_prechecked(&self, capacity: VersionCapacityGuard) -> StateVersion {
+                self.version.publish_prechecked(capacity)
+            }
+        }
+    "#;
+    assert_eq!(
+        findings_at(
+            "src/net/sock_mgr/manager.rs",
+            source,
+            PolicyKind::ManagerVersionAuthority,
+        )
+        .len(),
+        1
+    );
+}
+
+#[test]
 fn syntactic_recursion_finds_supported_shapes() {
     let source = r#"
         fn free() { free(); }
